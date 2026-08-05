@@ -225,11 +225,11 @@ export default function ValuesPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-4xl font-bold tracking-tight gradient-text">Player Values</h1>
-        <p className="text-muted-foreground mt-2 text-lg">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Player Values</h1>
+        <p className="text-muted-foreground mt-2 text-base sm:text-lg">
           Dynasty values from FantasyCalc based on ~1M real trades
         </p>
-        <div className="mt-4 flex items-center gap-4 text-sm text-muted-foreground">
+        <div className="mt-4 flex flex-wrap items-center gap-3 sm:gap-4 text-xs sm:text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
             <BarChart3 className="h-4 w-4" />
             <span>{allPlayers.length} players</span>
@@ -268,7 +268,7 @@ export default function ValuesPage() {
           </div>
           
           {/* Position Filter */}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             {["all", "QB", "RB", "WR", "TE"].map((pos) => (
               <button
                 key={pos}
@@ -324,7 +324,9 @@ export default function ValuesPage() {
       {/* Player List */}
       <Card className="modern-card">
         <CardContent className="p-0">
-          <div className="px-6 py-3 border-b border-border grid grid-cols-[auto_auto_1fr_auto_auto_auto] gap-4 text-xs text-muted-foreground font-medium">
+          {/* Mobile: Add horizontal scroll */}
+          <div className="overflow-x-auto">
+          <div className="px-4 sm:px-6 py-3 border-b border-border grid grid-cols-[auto_auto_1fr_auto_auto_auto] gap-2 sm:gap-4 text-xs text-muted-foreground font-medium min-w-[600px]">
             <div className="w-12">Rank</div>
             <div className="w-12">Pos</div>
             <div>
@@ -389,7 +391,7 @@ export default function ValuesPage() {
               return (
                 <div
                   key={player.id}
-                  className="px-6 py-3 border-b border-border/50 grid grid-cols-[auto_auto_1fr_auto_auto_auto] gap-4 items-center hover:bg-muted/50 transition-colors"
+                  className="px-4 sm:px-6 py-3 border-b border-border/50 grid grid-cols-[auto_auto_1fr_auto_auto_auto] gap-2 sm:gap-4 items-center hover:bg-muted/50 transition-colors min-w-[600px]"
                 >
                   <div className="w-12 text-sm text-muted-foreground font-medium">
                     #{idx + 1}
@@ -459,6 +461,7 @@ export default function ValuesPage() {
                 No players found matching your filters
               </div>
             )}
+          </div>
           </div>
         </CardContent>
       </Card>

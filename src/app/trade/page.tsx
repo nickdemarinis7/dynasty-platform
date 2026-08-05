@@ -230,22 +230,22 @@ function TradePageContent() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
+      <div className="flex flex-col sm:flex-row items-start justify-between gap-4">
         <div>
-          <h1 className="text-4xl font-bold tracking-tight gradient-text">Trade Simulator</h1>
-          <p className="text-muted-foreground mt-2 text-lg">
+          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Trade Simulator</h1>
+          <p className="text-muted-foreground mt-2 text-base sm:text-lg">
             Analyze trades with your personal values
           </p>
         </div>
-        <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={handleReset}>
-            <RotateCcw className="h-4 w-4 mr-2" />
-            Reset
+        <div className="flex gap-2 w-full sm:w-auto">
+          <Button variant="outline" size="sm" onClick={handleReset} className="flex-1 sm:flex-none">
+            <RotateCcw className="h-4 w-4 sm:mr-2" />
+            <span className="hidden sm:inline">Reset</span>
           </Button>
           {analysis && (
-            <Button size="sm" onClick={handleSaveTrade}>
-              <Save className="h-4 w-4 mr-2" />
-              Save Trade
+            <Button size="sm" onClick={handleSaveTrade} className="flex-1 sm:flex-none">
+              <Save className="h-4 w-4 sm:mr-2" />
+              <span className="hidden sm:inline">Save Trade</span>
             </Button>
           )}
         </div>
@@ -260,33 +260,33 @@ function TradePageContent() {
           analysis.verdictForA.tone === "bad" && "border-l-red-500",
         )}>
           <CardContent className="py-6 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <Sparkles className={cn("h-8 w-8",
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3 sm:gap-4">
+                <Sparkles className={cn("h-6 w-6 sm:h-8 sm:w-8 shrink-0",
                   analysis.verdictForA.tone === "good" && "text-green-400",
                   analysis.verdictForA.tone === "fair" && "text-blue-400",
                   analysis.verdictForA.tone === "bad" && "text-red-400",
                 )} />
                 <div>
-                  <p className={cn("font-bold text-xl",
+                  <p className={cn("font-bold text-lg sm:text-xl",
                     analysis.verdictForA.tone === "good" && "text-green-400",
                     analysis.verdictForA.tone === "fair" && "text-blue-400",
                     analysis.verdictForA.tone === "bad" && "text-red-400",
                   )}>{analysis.verdictForA.label}</p>
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-xs sm:text-sm text-muted-foreground">
                     From {rosterName(teamAId)}&apos;s perspective
                   </p>
                 </div>
               </div>
-              <div className="text-right">
-                <p className="text-3xl font-bold font-mono">
+              <div className="text-left sm:text-right w-full sm:w-auto">
+                <p className="text-2xl sm:text-3xl font-bold font-mono">
                   {analysis.marketFairness >= 0 ? "+" : ""}{analysis.marketFairness.toFixed(0)}%
                 </p>
-                <p className="text-sm text-muted-foreground">market value edge</p>
+                <p className="text-xs sm:text-sm text-muted-foreground">market value edge</p>
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
               <div className="rounded-lg bg-muted/50 p-4">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Market (give ↔ get)</p>
                 <p className="text-lg font-medium font-mono">
