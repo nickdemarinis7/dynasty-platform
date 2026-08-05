@@ -1402,11 +1402,11 @@ export default function RecommendationsPage() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h1 className="text-4xl font-bold tracking-tight gradient-text">Trade Finder</h1>
-        <p className="text-muted-foreground mt-2 text-lg">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Trade Finder</h1>
+        <p className="text-muted-foreground mt-2 text-base sm:text-lg">
           AI-powered trade recommendations based on roster needs, value gaps, and league dynamics
         </p>
-        <div className="mt-4 flex items-center gap-6 text-sm">
+        <div className="mt-4 flex flex-wrap items-center gap-3 sm:gap-6 text-xs sm:text-sm">
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-green-500"></div>
             <span className="text-muted-foreground"><span className="font-semibold text-foreground">Acceptance %</span> = Likelihood opponent accepts</span>
@@ -1430,7 +1430,7 @@ export default function RecommendationsPage() {
               <Zap className="h-5 w-5 text-primary" />
               <h2 className="text-xl font-bold">Plan of Attack</h2>
             </div>
-            <div className="flex items-center gap-3 text-sm flex-wrap">
+            <div className="flex items-center gap-2 sm:gap-3 text-xs sm:text-sm flex-wrap">
               <span className={`font-medium ${strategicPlan.teamSummary.windowColor}`}>
                 {strategicPlan.teamSummary.window}
               </span>

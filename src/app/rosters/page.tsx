@@ -62,8 +62,8 @@ export default function RostersPage() {
     return (
       <div className="space-y-8">
         <div>
-          <h1 className="text-4xl font-bold tracking-tight gradient-text">Rosters</h1>
-          <p className="text-muted-foreground mt-2 text-lg">
+          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Rosters</h1>
+          <p className="text-muted-foreground mt-2 text-base sm:text-lg">
             Connect your league first to view rosters
           </p>
         </div>
@@ -81,8 +81,8 @@ export default function RostersPage() {
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-4xl font-bold tracking-tight gradient-text">Rosters</h1>
-          <p className="text-muted-foreground mt-2 text-lg">
+          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Rosters</h1>
+          <p className="text-muted-foreground mt-2 text-base sm:text-lg">
             View all teams and their dynasty values
           </p>
         </div>

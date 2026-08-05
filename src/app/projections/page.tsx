@@ -141,8 +141,8 @@ export default function ProjectionsPage() {
     return (
       <div className="space-y-8">
         <div>
-          <h1 className="text-4xl font-bold tracking-tight gradient-text">Edge Intelligence</h1>
-          <p className="text-muted-foreground mt-2 text-lg">Proprietary player projections powered by trajectory + production + team fit</p>
+          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Edge Intelligence</h1>
+          <p className="text-muted-foreground mt-2 text-base sm:text-lg">Proprietary player projections powered by trajectory + production + team fit</p>
         </div>
         <Card className="border-dashed">
           <CardContent className="flex flex-col items-center justify-center py-16">
@@ -282,7 +282,8 @@ export default function ProjectionsPage() {
       </div>
 
       {/* Column headers */}
-      <div className="grid grid-cols-12 gap-2 px-4 py-2 text-xs font-semibold bg-muted/30 rounded-lg border border-border/50">
+      <div className="overflow-x-auto">
+      <div className="grid grid-cols-12 gap-2 px-4 py-2 text-xs font-semibold bg-muted/30 rounded-lg border border-border/50 min-w-[800px]">
         <div className="col-span-4 text-muted-foreground">PLAYER</div>
         <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort("edgeDelta")} title="Value vs market consensus">
           EDGE Δ {sortKey === "edgeDelta" ? (sortDesc ? "↓" : "↑") : ""}
@@ -301,7 +302,7 @@ export default function ProjectionsPage() {
       </div>
 
       {/* Player rows */}
-      <div className="space-y-1.5">
+      <div className="space-y-1.5 min-w-[800px]">
         {sorted.map(([id, proj]) => {
           const player = playerById[id];
           if (!player) return null;
@@ -476,6 +477,7 @@ export default function ProjectionsPage() {
             </CardContent>
           </Card>
         )}
+      </div>
       </div>
     </div>
   );
