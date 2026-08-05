@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { useAppStore } from "@/store";
 import type { SavedTrade } from "@/store";
@@ -39,7 +39,7 @@ function pickLabel(pick: DraftPick): string {
   return `${pick.year} ${r}`;
 }
 
-export default function TradePage() {
+function TradePageContent() {
   const searchParams = useSearchParams();
   const { rosters, myTeamId, personalValues, leagueSettings, addSavedTrade } = useAppStore();
 
@@ -585,3 +585,10 @@ export default function TradePage() {
   );
 }
 
+export default function TradePage() {
+  return (
+    <Suspense fallback={<div className="p-8">Loading trade simulator...</div>}>
+      <TradePageContent />
+    </Suspense>
+  );
+}
