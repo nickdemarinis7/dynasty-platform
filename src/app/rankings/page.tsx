@@ -202,8 +202,8 @@ export default function RankingsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-4xl font-bold tracking-tight gradient-text">Power Rankings</h1>
-        <p className="text-muted-foreground mt-2 text-lg">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Power Rankings</h1>
+        <p className="text-muted-foreground mt-2 text-base sm:text-lg">
           Dynasty rankings based on roster value and weekly projections
         </p>
         {myTeam && (
@@ -364,8 +364,8 @@ export default function RankingsPage() {
                   </span>
                 </div>
 
-                <div className="col-span-3">
-                  <div className="flex items-center gap-2">
+                <div className="col-span-3 md:col-span-3 lg:col-span-3 xl:col-span-3 2xl:col-span-3">
+                  <div className="flex flex-wrap items-center gap-2 md:flex-nowrap lg:flex-nowrap xl:flex-nowrap 2xl:flex-nowrap">
                     <div className="flex-1">
                       <p className="text-sm font-semibold flex items-center gap-1.5">
                         {team.roster.teamName}
