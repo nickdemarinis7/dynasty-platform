@@ -15,8 +15,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Dynasty Trade Simulator",
+  title: "Dynasty Trade Analyzer",
   description: "Fantasy football dynasty trade simulator and recommendation platform",
+  viewport: "width=device-width, initial-scale=1, maximum-scale=1",
 };
 
 export default function RootLayout({
@@ -32,7 +33,7 @@ export default function RootLayout({
       <body className="min-h-full flex bg-background text-foreground">
         <ToastProvider>
           <Sidebar />
-          <main className="flex-1 ml-64 p-8 overflow-auto">{children}</main>
+          <main className="flex-1 lg:ml-64 p-4 sm:p-6 lg:p-8 overflow-auto pt-16 lg:pt-8">{children}</main>
         </ToastProvider>
       </body>
     </html>
