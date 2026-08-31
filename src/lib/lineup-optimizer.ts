@@ -64,29 +64,35 @@ function getProjectedPoints(
     return Math.round(points * 10) / 10;
   }
   
-  // Fallback: Dynasty value is 0-100 scale
-  // Convert to weekly points estimate (rough approximation)
+  // Fallback: Dynasty value is 0-100 scale (age + production + future potential).
+  // Dynasty value inflates young/developmental players — discount by age factor
+  // so a 22yo backup with value 60 doesn't project the same weekly pts as a
+  // 28yo starter with value 60 who actually produces more NOW.
+  const dynastyVal = player.dynastyValue || 0;
+  // Age discount: young players' dynasty value is partly future potential, not current production
+  const ageDiscount = player.age <= 22 ? 0.70 : player.age <= 24 ? 0.85 : player.age <= 27 ? 1.0 : player.age <= 30 ? 1.05 : 0.90;
+  const adjustedVal = dynastyVal * ageDiscount;
   let basePoints = 0;
   
   switch (player.position) {
     case "QB":
-      // QB: 60 value ≈ 20 ppg, 100 value ≈ 28 ppg
-      basePoints = 12 + (player.dynastyValue / 100) * 16;
+      // QB: value 60 ≈ 18 ppg, value 100 ≈ 26 ppg
+      basePoints = 10 + (adjustedVal / 100) * 16;
       break;
     case "RB":
-      // RB: 60 value ≈ 15 ppg, 100 value ≈ 22 ppg
-      basePoints = 8 + (player.dynastyValue / 100) * 14;
+      // RB: value 60 ≈ 13 ppg, value 100 ≈ 20 ppg
+      basePoints = 6 + (adjustedVal / 100) * 14;
       break;
     case "WR":
-      // WR: 60 value ≈ 14 ppg, 100 value ≈ 20 ppg
-      basePoints = 7 + (player.dynastyValue / 100) * 13;
+      // WR: value 60 ≈ 12 ppg, value 100 ≈ 18 ppg
+      basePoints = 5 + (adjustedVal / 100) * 13;
       break;
     case "TE":
-      // TE: 60 value ≈ 10 ppg, 100 value ≈ 16 ppg
-      basePoints = 5 + (player.dynastyValue / 100) * 11;
+      // TE: value 60 ≈ 9 ppg, value 100 ≈ 14 ppg
+      basePoints = 4 + (adjustedVal / 100) * 10;
       break;
     default:
-      basePoints = player.dynastyValue / 10;
+      basePoints = adjustedVal / 10;
   }
   
   // Apply injury/suspension adjustments

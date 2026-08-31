@@ -145,6 +145,7 @@ export default function RecommendationsPage() {
   const [sleeperProjections, setSleeperProjections] = useState<Record<string, SleeperProjection>>({});
   const [projectionsLoading, setProjectionsLoading] = useState(true);
   const [currentWeek, setCurrentWeek] = useState<{ season: number; week: number; isPlayoffs: boolean } | null>(null);
+  const [needsTeamId, setNeedsTeamId] = useState<string>("mine");
 
   const myRoster = rosters.find((r) => r.teamId === myTeamId);
   
@@ -425,7 +426,9 @@ export default function RecommendationsPage() {
             if (!ourSurplus || ourSurplus.length <= 1) continue;
 
             const expendable = ourSurplus.filter((p) => {
-              const offerValue = getPlayerValue(p) * getPosMultiplier(p.position);
+              // Use raw value for offer comparison — the target already has pos multiplier applied.
+              // Applying multiplier to BOTH sides cancels same-pos and distorts cross-pos trades.
+              const offerValue = getPlayerValue(p);
               return offerValue >= targetValue * 0.5 && offerValue <= targetValue * 1.5;
             });
 
@@ -436,7 +439,7 @@ export default function RecommendationsPage() {
               // Anchor protection: never offer untouchable franchise assets
               if (myCtx.anchorPlayerIds.includes(offerPlayer.id)) continue;
 
-              const offerValue = getPlayerValue(offerPlayer) * getPosMultiplier(offerPlayer.position);
+              const offerValue = getPlayerValue(offerPlayer);
               const diff = offerValue - targetValue;
               if (Math.abs(diff) < targetValue * 0.25) {
                 // Raw-value sanity check: projection adjustments can lower a player's effective value
@@ -1627,30 +1630,58 @@ export default function RecommendationsPage() {
       {/* Positional needs */}
       <Card className="modern-card">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Target className="h-5 w-5" />
-            Your Positional Needs
+          <CardTitle className="text-base flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Target className="h-5 w-5" />
+              Positional Needs
+            </div>
+            <select
+              value={needsTeamId}
+              onChange={(e) => setNeedsTeamId(e.target.value)}
+              className="text-xs px-2 py-1 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/50 font-normal"
+            >
+              <option value="mine">Your Team</option>
+              {rosters.map((r) => (
+                <option key={r.teamId} value={r.teamId}>
+                  {r.teamName || `Team ${r.teamId}`} {r.teamId === myTeamId ? "(You)" : ""}
+                </option>
+              ))}
+            </select>
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-4 gap-4">
-            {Object.entries(myNeeds).map(([pos, need]) => (
-              <div key={pos} className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <Badge variant="outline" className={positionColors[pos] || ""}>{pos}</Badge>
-                  <span className={`text-xs font-medium ${need > 40 ? "text-red-400" : need > 20 ? "text-yellow-400" : "text-green-400"}`}>
-                    {need > 40 ? "High Need" : need > 20 ? "Moderate" : "Stacked"}
-                  </span>
-                </div>
-                <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all ${need > 40 ? "bg-red-500" : need > 20 ? "bg-yellow-500" : "bg-green-500"}`}
-                    style={{ width: `${Math.min(need, 100)}%` }}
-                  />
-                </div>
+          {(() => {
+            const selectedRoster = needsTeamId === "mine"
+              ? myRoster
+              : rosters.find((r) => r.teamId === needsTeamId);
+            if (!selectedRoster) return null;
+            const selectedNeeds = calculatePositionalNeed(
+              selectedRoster.players,
+              leagueSettings?.rosterSlots || [],
+              leagueSettings?.superflex || false,
+              needsTeamId === "mine" ? personalValues : {}
+            );
+            return (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                {Object.entries(selectedNeeds).map(([pos, need]) => (
+                  <div key={pos} className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <Badge variant="outline" className={positionColors[pos] || ""}>{pos}</Badge>
+                      <span className={`text-xs font-medium ${need > 40 ? "text-red-400" : need > 20 ? "text-yellow-400" : need > 8 ? "text-blue-400" : "text-green-400"}`}>
+                        {need > 40 ? "High Need" : need > 20 ? "Moderate" : need > 8 ? "Solid" : "Elite"}
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all ${need > 40 ? "bg-red-500" : need > 20 ? "bg-yellow-500" : "bg-green-500"}`}
+                        style={{ width: `${Math.min(need, 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
+            );
+          })()}
         </CardContent>
       </Card>
 

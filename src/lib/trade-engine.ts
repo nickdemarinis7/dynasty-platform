@@ -1,5 +1,6 @@
 import type { Player, TeamRoster, LeagueSettings, DraftPick } from "@/types";
 import { getPlayerValue, calculatePositionalNeed } from "@/lib/player-values";
+import { evaluateTradeLineupImpact } from "@/lib/lineup-optimizer";
 
 // ============================================================================
 // Asset time profiles — how an asset's value splits between "win now" (next
@@ -20,7 +21,7 @@ interface PositionCurve {
 
 const POSITION_CURVES: Record<string, PositionCurve> = {
   QB: { peakStart: 26, peakEnd: 33, declinePerYear: 0.06, shelfYears: 12 },
-  RB: { peakStart: 22, peakEnd: 25, declinePerYear: 0.17, shelfYears: 5 },
+  RB: { peakStart: 23, peakEnd: 27, declinePerYear: 0.14, shelfYears: 5 },
   WR: { peakStart: 24, peakEnd: 27, declinePerYear: 0.10, shelfYears: 8 },
   TE: { peakStart: 25, peakEnd: 30, declinePerYear: 0.08, shelfYears: 9 },
 };
@@ -120,6 +121,7 @@ function computeStarterValue(
   leagueSettings: LeagueSettings,
   value: (p: Player) => number
 ): number {
+  // Clone and sort each position group (non-destructive)
   const byPos: Record<string, Player[]> = { QB: [], RB: [], WR: [], TE: [] };
   for (const p of roster) {
     if (byPos[p.position]) byPos[p.position].push(p);
@@ -128,37 +130,58 @@ function computeStarterValue(
     byPos[pos].sort((a, b) => value(b) - value(a));
   }
 
+  // Track how many we've used from each position via index (no mutation)
+  const taken: Record<string, number> = { QB: 0, RB: 0, WR: 0, TE: 0 };
+  const usedIds = new Set<string>();
   let total = 0;
-  const flexPool: Player[] = [];
-  const sfPool: Player[] = [];
 
+  // Fill mandatory position slots first
   for (const slot of leagueSettings.rosterSlots) {
+    if (!byPos[slot.type]) continue; // skip FLEX/SUPERFLEX here
     const n = slot.count;
-    if (byPos[slot.type]) {
-      const taken = byPos[slot.type].splice(0, n);
-      total += taken.reduce((s, p) => s + value(p), 0);
+    for (let i = 0; i < n; i++) {
+      const idx = taken[slot.type];
+      if (idx < byPos[slot.type].length) {
+        const p = byPos[slot.type][idx];
+        total += value(p);
+        usedIds.add(p.id);
+        taken[slot.type]++;
+      }
     }
   }
-  // Remaining players feed flex/superflex
-  for (const pos of ["RB", "WR", "TE"]) flexPool.push(...byPos[pos]);
-  for (const pos of ["QB", "RB", "WR", "TE"]) sfPool.push(...byPos[pos]);
+
+  // Build flex pool: remaining RB/WR/TE not yet started
+  const flexPool: Player[] = [];
+  for (const pos of ["RB", "WR", "TE"]) {
+    for (let i = taken[pos]; i < byPos[pos].length; i++) {
+      flexPool.push(byPos[pos][i]);
+    }
+  }
   flexPool.sort((a, b) => value(b) - value(a));
 
   const flexCount =
     leagueSettings.rosterSlots.find((s) => s.type === "FLEX")?.count ?? 0;
+  for (let i = 0; i < Math.min(flexCount, flexPool.length); i++) {
+    total += value(flexPool[i]);
+    usedIds.add(flexPool[i].id);
+  }
+
+  // Superflex: remaining QB/RB/WR/TE not yet used, including bench QBs
   const sfCount =
     leagueSettings.rosterSlots.find((s) => s.type === "SUPERFLEX")?.count ?? 0;
-
-  const flexTaken = flexPool.splice(0, flexCount);
-  total += flexTaken.reduce((s, p) => s + value(p), 0);
-
-  // Superflex draws from remaining (incl. QB)
-  const remainingIds = new Set(flexPool.map((p) => p.id));
-  const sfAvail = sfPool
-    .filter((p) => remainingIds.has(p.id) || p.position === "QB")
-    .sort((a, b) => value(b) - value(a));
-  const sfTaken = sfAvail.splice(0, sfCount);
-  total += sfTaken.reduce((s, p) => s + value(p), 0);
+  if (sfCount > 0) {
+    const sfPool: Player[] = [];
+    for (const pos of ["QB", "RB", "WR", "TE"]) {
+      for (const p of byPos[pos]) {
+        if (!usedIds.has(p.id)) sfPool.push(p);
+      }
+    }
+    sfPool.sort((a, b) => value(b) - value(a));
+    for (let i = 0; i < Math.min(sfCount, sfPool.length); i++) {
+      total += value(sfPool[i]);
+      usedIds.add(sfPool[i].id);
+    }
+  }
 
   return total;
 }
@@ -456,15 +479,14 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
   const fitBPct = (fitB / Math.max(teamBCtx.totalValue, 1)) * 100;
 
   // Acceptance likelihood for Team B: driven by their net (market + fit).
-  // Combine raw market delta for B (B receiving more raw value is good for them)
-  // with their contextual fit.
-  // Base lowered from 50 to 25 for more realistic expectations (real acceptance ~15-25%)
+  // Base of 15: real dynasty trade acceptance on cold offers is 5-15%.
+  // Market edge weighted 60% (value matters most), fit 40% (context helps but less).
+  // Fit scaled 2x (not 4x) — a 5% roster improvement shouldn't add 20 points.
   const bMarketEdge = (-marketDiff / marketMax) * 100; // positive = B gets more raw
-  const bScore = 0.5 * bMarketEdge + 0.5 * fitBPct * 4; // scale fit% up
-  const acceptanceLikelihood = Math.max(0, Math.min(100, 25 + bScore));
+  const bScore = 0.6 * bMarketEdge + 0.4 * fitBPct * 2;
+  const acceptanceLikelihood = Math.max(0, Math.min(100, 15 + bScore));
 
   // Needs after trade
-  const aRosterAfter = (teamRoster: Player[]) => teamRoster;
   const needsAfterA = computeNeedsAfter(
     teamACtx,
     aGivesPlayers,
@@ -479,7 +501,7 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
   );
 
   // Verdict for A: blend market fairness and contextual fit.
-  const aCombined = 0.5 * marketFairness + 0.5 * fitAPct * 4;
+  const aCombined = 0.6 * marketFairness + 0.4 * fitAPct * 2;
   let verdictForA: SmartTradeResult["verdictForA"];
   if (aCombined > 12) verdictForA = { label: "Great for You", tone: "good" };
   else if (aCombined > 4) verdictForA = { label: "Favorable", tone: "good" };
@@ -508,7 +530,6 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
   let lineupImpactB: SmartTradeResult["lineupImpactB"];
   
   if (teamARoster && leagueSettings) {
-    const { evaluateTradeLineupImpact } = require("@/lib/lineup-optimizer");
     const impact = evaluateTradeLineupImpact(
       teamARoster,
       aGivesPlayers,
@@ -523,7 +544,6 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
   }
   
   if (teamBRoster && leagueSettings) {
-    const { evaluateTradeLineupImpact } = require("@/lib/lineup-optimizer");
     const impact = evaluateTradeLineupImpact(
       teamBRoster,
       bGivesPlayers,
@@ -560,19 +580,25 @@ function computeNeedsAfter(
   ctx: TeamContext,
   given: Player[],
   received: Player[],
-  _personalValues: Record<string, number>
+  personalValues: Record<string, number>
 ): Record<string, number> {
-  // Adjust the context's position needs by removing given / adding received.
-  const counts: Record<string, number> = { QB: 0, RB: 0, WR: 0, TE: 0 };
-  // Reconstruct approx from needs is lossy; instead nudge needs directly.
+  // Scale need adjustment by player value: losing a stud (value 80+) hurts much
+  // more than losing a depth piece (value 15). Impact ranges from ~5 to ~25.
   const needs = { ...ctx.positionNeeds };
   for (const p of given) {
-    if (needs[p.position] !== undefined) needs[p.position] = Math.min(100, needs[p.position] + 12);
+    if (needs[p.position] !== undefined) {
+      const v = getPlayerValue(p, personalValues);
+      const impact = Math.max(5, Math.min(25, Math.round(v / 4)));
+      needs[p.position] = Math.min(100, needs[p.position] + impact);
+    }
   }
   for (const p of received) {
-    if (needs[p.position] !== undefined) needs[p.position] = Math.max(0, needs[p.position] - 12);
+    if (needs[p.position] !== undefined) {
+      const v = getPlayerValue(p, personalValues);
+      const impact = Math.max(5, Math.min(25, Math.round(v / 4)));
+      needs[p.position] = Math.max(0, needs[p.position] - impact);
+    }
   }
-  void counts;
   return needs;
 }
 
@@ -637,7 +663,7 @@ function buildReasoning(i: ReasoningInput): string[] {
     }
     const agingIncoming = aReceives.filter((p) => getAssetTimeProfile(p.position, p.age).futureFactor < 0.6);
     if (agingIncoming.length > 0) {
-      out.push(`${agingIncoming.map((p) => p.name).join(", ")} are aging — they won't be at peak when you're ready to compete.`);
+      out.push(`${agingIncoming.map((p) => p.name).join(", ")} ${agingIncoming.length === 1 ? "is" : "are"} aging — won't be at peak when you're ready to compete.`);
     }
     if (i.aGivesPlayers.some((p) => p.age >= 28)) {
       out.push(`Selling aging veterans (${i.aGivesPlayers.filter((p) => p.age >= 28).map((p) => p.name).join(", ")}) for future value is the right move while rebuilding.`);

@@ -584,12 +584,15 @@ export function computeEdgeScore(
     signals.push(`⏳ 3-yr projection: -${Math.round(((current - v3) / current) * 100)}% value decay`);
   }
 
-  // Recommendation logic
+  // Recommendation logic — tightened thresholds to reduce noise.
+  // STRONG_BUY requires a large edge (25+) AND the player must have meaningful value (≥15).
+  // This prevents random bench players from showing as Strong Buy just because their
+  // edge score exceeds a low market score.
   let recommendation: PlayerProjection["recommendation"];
-  if (edgeDelta >= 18) recommendation = "STRONG_BUY";
-  else if (edgeDelta >= 8) recommendation = "BUY";
-  else if (edgeDelta <= -18 || (trajectoryLabel === "DECLINING" && edgeDelta < -8)) recommendation = "STRONG_SELL";
-  else if (edgeDelta <= -8 || trajectoryLabel === "DECLINING") recommendation = "SELL";
+  if (edgeDelta >= 25 && current >= 15) recommendation = "STRONG_BUY";
+  else if (edgeDelta >= 12) recommendation = "BUY";
+  else if (edgeDelta <= -25 || (trajectoryLabel === "DECLINING" && edgeDelta < -12)) recommendation = "STRONG_SELL";
+  else if (edgeDelta <= -12 || trajectoryLabel === "DECLINING") recommendation = "SELL";
   else recommendation = "HOLD";
 
   return {

@@ -229,11 +229,13 @@ export const DEFAULT_DYNASTY_VALUES: Record<string, number> = {
 
 export function getPlayerValue(
   player: Player,
-  personalValues: Record<string, number>
+  personalValues: Record<string, number> = {}
 ): number {
   if (personalValues[player.id]) return personalValues[player.id];
   if (player.personalValue !== undefined) return player.personalValue;
-  return player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
+  const raw = player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
+  // Safety: if value is on old 0-10000 FantasyCalc scale, normalize to 0-100
+  return raw > 150 ? Math.min(100, Math.round(raw / 100)) : raw;
 }
 
 export function getPickValue(
@@ -301,10 +303,13 @@ export function calculatePositionalNeed(
   // "Stacked" means your starters average at or above this threshold.
   // SF QB is raised to 68: second/third-tier SF QBs normalise to ~30-50 and should
   // register as genuine need, not show as "stacked."
+  // Minimum average normalised value PER STARTER to be considered "solid" at that position.
+  // Raising RB/WR thresholds: having a couple mid-tier starters (value ~40-50) shouldn't
+  // register as "stacked"; only genuinely elite cores (avg 55+) should clear the bar.
   const starterThreshold: Record<string, number> = {
     QB: superflex ? 68 : 40,
-    RB: 47,
-    WR: 50,
+    RB: 55,
+    WR: 53,
     TE: 33,
   };
 
