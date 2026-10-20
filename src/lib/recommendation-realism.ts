@@ -110,6 +110,7 @@ export function calculateLeagueVelocity(
   recentTrades: RecentTrade[],
   teamCount: number
 ): LeagueTradeVelocity {
+  void teamCount;
   const now = Date.now();
   const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000);
   const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);

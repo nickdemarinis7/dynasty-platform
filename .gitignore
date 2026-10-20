@@ -12,6 +12,10 @@
 
 # testing
 /coverage
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
 
 # next.js
 /.next/
@@ -35,6 +39,9 @@ yarn-error.log*
 
 # vercel
 .vercel
+
+# streamlit
+.streamlit/secrets.toml
 
 # typescript
 *.tsbuildinfo

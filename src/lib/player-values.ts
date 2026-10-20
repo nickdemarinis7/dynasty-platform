@@ -231,7 +231,7 @@ export function getPlayerValue(
   player: Player,
   personalValues: Record<string, number> = {}
 ): number {
-  if (personalValues[player.id]) return personalValues[player.id];
+  if (personalValues[player.id] !== undefined) return personalValues[player.id];
   if (player.personalValue !== undefined) return player.personalValue;
   const raw = player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
   // Safety: if value is on old 0-10000 FantasyCalc scale, normalize to 0-100
@@ -262,7 +262,7 @@ export function calculatePositionalNeed(
   const byPosition: Record<string, number[]> = { QB: [], RB: [], WR: [], TE: [] };
   for (const p of roster) {
     if (byPosition[p.position] !== undefined) {
-      const raw = personalValues[p.id] || p.dynastyValue || DEFAULT_DYNASTY_VALUES[p.name] || 0;
+      const raw = personalValues[p.id] ?? p.personalValue ?? (p.dynastyValue || DEFAULT_DYNASTY_VALUES[p.name] || 0);
       byPosition[p.position].push(norm(raw));
     }
   }

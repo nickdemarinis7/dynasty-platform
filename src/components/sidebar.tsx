@@ -4,107 +4,114 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  BarChart3,
-  Users,
-  ArrowRightLeft,
-  Lightbulb,
-  Settings,
-  Sliders,
-  Trophy,
-  History,
-  ClipboardList,
-  TrendingUp,
-  Zap,
-  Menu,
-  X,
+  ArrowRightLeft, BarChart3, ClipboardList, History, Lightbulb, Menu,
+  Settings, Sliders, TrendingUp, Trophy, Users, Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useAppStore } from "@/store";
+import {
+  Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle,
+} from "@/components/ui/sheet";
 
 const navItems = [
-  { href: "/", label: "Dashboard", icon: BarChart3 },
-  { href: "/league", label: "League Setup", icon: Settings },
-  { href: "/draft", label: "Live Draft", icon: ClipboardList },
-  { href: "/rosters", label: "Rosters", icon: Users },
-  { href: "/rankings", label: "Power Rankings", icon: Trophy },
-  { href: "/values", label: "Player Values", icon: Sliders },
-  { href: "/trade", label: "Trade Simulator", icon: ArrowRightLeft },
-  { href: "/recommendations", label: "Recommendations", icon: Lightbulb },
-  { href: "/projections", label: "Edge Intelligence", icon: TrendingUp },
-  { href: "/trade/history", label: "Trade History", icon: History },
-];
+  { href: "/", label: "Dashboard", shortLabel: "Home", icon: BarChart3 },
+  { href: "/league", label: "League Setup", shortLabel: "League", icon: Settings },
+  { href: "/draft", label: "Live Draft", shortLabel: "Draft", icon: ClipboardList },
+  { href: "/rosters", label: "Rosters", shortLabel: "Rosters", icon: Users },
+  { href: "/rankings", label: "Power Rankings", shortLabel: "Ranks", icon: Trophy },
+  { href: "/values", label: "Player Values", shortLabel: "Values", icon: Sliders },
+  { href: "/trade", label: "Trade Simulator", shortLabel: "Trade", icon: ArrowRightLeft },
+  { href: "/recommendations", label: "Recommendations", shortLabel: "Ideas", icon: Lightbulb },
+  { href: "/projections", label: "Edge Intelligence", shortLabel: "Edge", icon: TrendingUp },
+  { href: "/trade/history", label: "Trade History", shortLabel: "History", icon: History },
+] as const;
+
+const mobilePrimaryHrefs = new Set(["/", "/rosters", "/trade", "/rankings"]);
+
+function isRouteActive(pathname: string, href: string) {
+  return pathname === href ||
+    (href !== "/" && href !== "/trade" && pathname.startsWith(href)) ||
+    (href === "/trade" && pathname === "/trade");
+}
 
 export function Sidebar() {
+  const leagueMode = useAppStore((state) => state.leagueSettings?.mode);
   const pathname = usePathname();
-  const [isOpen, setIsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const primaryItems = navItems.filter((item) => mobilePrimaryHrefs.has(item.href));
+  const moreItems = navItems.filter((item) => !mobilePrimaryHrefs.has(item.href));
+  const moreIsActive = moreItems.some((item) => isRouteActive(pathname, item.href));
 
   return (
     <>
-      {/* Mobile menu button */}
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="lg:hidden fixed top-4 left-4 z-50 p-2 rounded-lg bg-card border border-border shadow-lg"
-        aria-label="Toggle menu"
-      >
-        {isOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
-      </button>
-
-      {/* Overlay for mobile */}
-      {isOpen && (
-        <div
-          className="lg:hidden fixed inset-0 bg-black/50 z-40"
-          onClick={() => setIsOpen(false)}
-        />
-      )}
-
-      {/* Sidebar */}
-      <aside className={cn(
-        "fixed left-0 top-0 h-full w-64 border-r border-border bg-card flex flex-col z-50 transition-transform duration-300",
-        "lg:translate-x-0",
-        isOpen ? "translate-x-0" : "-translate-x-full"
-      )}>
-      <div className="px-5 py-4 border-b border-border">
-        <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-xl bg-primary flex items-center justify-center flex-shrink-0 shadow-md shadow-primary/30">
-            <Zap className="h-5 w-5 text-primary-foreground" />
-          </div>
-          <div>
-            <h1 className="font-bold text-[15px] leading-none tracking-tight">Dynasty</h1>
-            <p className="text-[11px] text-muted-foreground mt-1 leading-none">Trade Intelligence</p>
+      <aside className="fixed inset-y-0 left-0 z-40 hidden w-64 flex-col border-r border-border bg-card lg:flex">
+        <div className="border-b border-border px-5 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary shadow-md shadow-primary/30">
+              <Zap className="h-5 w-5 text-primary-foreground" />
+            </div>
+            <div>
+              <h1 className="text-[15px] font-bold leading-none tracking-tight">Fantasy GM</h1>
+              <p className="mt-1 text-[11px] leading-none text-muted-foreground">Trade Intelligence</p>
+            </div>
           </div>
         </div>
-      </div>
+        <nav className="flex-1 space-y-1 overflow-y-auto p-4" aria-label="Primary navigation">
+          {navItems.map((item) => {
+            const active = isRouteActive(pathname, item.href);
+            return (
+              <Link key={item.href} href={item.href} aria-current={active ? "page" : undefined}
+                className={cn(
+                  "flex min-h-11 items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+                  active ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}>
+                <item.icon className="h-4 w-4" />{item.label}
+              </Link>
+            );
+          })}
+        </nav>
+        <div className="border-t border-border p-4">
+          <p className="text-center text-xs text-muted-foreground">
+            {leagueMode ? `${leagueMode[0].toUpperCase()}${leagueMode.slice(1)} League` : "Dynasty + Redraft"}
+          </p>
+        </div>
+      </aside>
 
-      <nav className="flex-1 p-4 space-y-1">
-        {navItems.map((item) => {
-          const isActive =
-            pathname === item.href ||
-            (item.href !== "/" && item.href !== "/trade" && pathname.startsWith(item.href)) ||
-            (item.href === "/trade" && pathname === "/trade");
+      <nav className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 border-t border-border bg-card/95 px-1 backdrop-blur-xl lg:hidden" aria-label="Mobile navigation">
+        {primaryItems.map((item) => {
+          const active = isRouteActive(pathname, item.href);
           return (
-            <Link
-              key={item.href}
-              href={item.href}
-              onClick={() => setIsOpen(false)}
-              className={cn(
-                "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors",
-                isActive
-                  ? "bg-primary/10 text-primary"
-                  : "text-muted-foreground hover:text-foreground hover:bg-muted"
-              )}
-            >
-              <item.icon className="h-4 w-4" />
-              {item.label}
+            <Link key={item.href} href={item.href} aria-current={active ? "page" : undefined}
+              className={cn("flex min-h-14 flex-col items-center justify-center gap-1 rounded-lg px-1 text-[10px] font-medium", active ? "text-primary" : "text-muted-foreground")}>
+              <item.icon className="h-5 w-5" /><span>{item.shortLabel}</span>
             </Link>
           );
         })}
+        <button type="button" onClick={() => setMoreOpen(true)} aria-expanded={moreOpen}
+          className={cn("flex min-h-14 flex-col items-center justify-center gap-1 rounded-lg px-1 text-[10px] font-medium", moreIsActive ? "text-primary" : "text-muted-foreground")}>
+          <Menu className="h-5 w-5" /><span>More</span>
+        </button>
       </nav>
 
-      <div className="p-4 border-t border-border">
-        <p className="text-xs text-muted-foreground text-center">
-          SF + TEP Dynasty
-        </p>
-      </div>
-    </aside>
+      <Sheet open={moreOpen} onOpenChange={setMoreOpen}>
+        <SheetContent side="bottom" className="max-h-[82dvh] rounded-t-3xl pb-[max(1rem,env(safe-area-inset-bottom))] lg:hidden">
+          <SheetHeader className="border-b border-border">
+            <SheetTitle>More tools</SheetTitle>
+            <SheetDescription>{leagueMode ? `${leagueMode} league workspace` : "Dynasty and redraft workspace"}</SheetDescription>
+          </SheetHeader>
+          <nav className="grid grid-cols-2 gap-2 overflow-y-auto px-4 pb-2" aria-label="Additional navigation">
+            {moreItems.map((item) => {
+              const active = isRouteActive(pathname, item.href);
+              return (
+                <Link key={item.href} href={item.href} onClick={() => setMoreOpen(false)}
+                  className={cn("flex min-h-16 items-center gap-3 rounded-2xl border border-border p-3 text-sm font-medium", active ? "bg-primary/10 text-primary" : "bg-muted/30 text-foreground")}>
+                  <item.icon className="h-5 w-5 shrink-0" />{item.label}
+                </Link>
+              );
+            })}
+          </nav>
+        </SheetContent>
+      </Sheet>
     </>
   );
 }

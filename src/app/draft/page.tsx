@@ -24,7 +24,7 @@ const positionColors: Record<string, string> = {
 };
 
 interface DraftData {
-  draft: { id: string; status: string; type: string; season: string; rounds: number; teams: number };
+  draft: { id: string; status: string; type: string; season: string; rounds: number; teams: number; leagueMode: "dynasty" | "keeper" | "redraft" };
   meta: { totalPicks: number; picksMade: number; isComplete: boolean; currentPickNo: number | null; currentRound: number | null; lastPicked: number | null };
   onClock: { rosterId: number; teamName: string; isMine: boolean } | null;
   me: { rosterId: number | null; teamName: string | null; nextPickNo: number | null; picksUntilMyTurn: number | null; upcomingPicks: number[]; positionCounts: Record<string, number> };
@@ -56,14 +56,16 @@ export default function DraftPage() {
       if (!res.ok) throw new Error(json.error || "Failed to load draft");
       setData(json);
       setLastUpdated(new Date());
-    } catch (err: any) {
-      setError(err.message);
+    } catch (error: unknown) {
+      setError(error instanceof Error ? error.message : "Failed to load draft");
     } finally {
       setLoading(false);
     }
   }, [sleeperLeagueId, sleeperUsername]);
 
   useEffect(() => {
+    // Loading remote data on mount is the synchronization this effect owns.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchDraft();
   }, [fetchDraft]);
 

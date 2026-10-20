@@ -6,32 +6,39 @@ import {
   getSleeperPlayers,
   getSleeperTradedPicks,
   getSleeperDrafts,
+  findSleeperRosterForUser,
+  getSleeperLeagueMode,
   mapSleeperPositions,
+  type SleeperTradedPick,
 } from "@/lib/sleeper-api";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
 import {
-  getFantasyCalcValues,
-  getFantasyCalcPickValues,
+  getFantasyCalcData,
   valuePick,
   applyTePremium,
   normalizeName,
 } from "@/lib/fantasycalc";
 import { analyzeHistoricalTrades } from "@/lib/trade-analysis";
 import { NextRequest } from "next/server";
-import type { Player, TeamRoster, LeagueSettings, RosterSlot, DraftPick, HistoricalTradeAnalysis } from "@/types";
+import type { Player, TeamRoster, LeagueSettings, RosterSlot, DraftPick, SleeperUser } from "@/types";
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unexpected import error";
+}
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const leagueId = searchParams.get("leagueId");
   const username = searchParams.get("username");
 
-  console.log(`[Import] Starting import for league ${leagueId}, user ${username}`);
-
   if (!leagueId || !username) {
     return Response.json(
       { error: "leagueId and username are required" },
       { status: 400 }
     );
+  }
+  if (!/^\d+$/.test(leagueId) || username.length > 50) {
+    return Response.json({ error: "Invalid leagueId or username" }, { status: 400 });
   }
 
   try {
@@ -45,14 +52,25 @@ export async function GET(request: NextRequest) {
         getSleeperDrafts(leagueId).catch(() => []),
       ]);
 
-    console.log(`[Import] Fetched basic data`);
+    // Never guess which roster belongs to the importing user. A stale league
+    // selection or changed ownership would otherwise make the first team in
+    // the response become "My Team" and corrupt every downstream analysis.
+    const mySleeperRoster = findSleeperRosterForUser(rosterData, user.user_id);
+    if (!mySleeperRoster) {
+      return Response.json(
+        { error: `Sleeper user "${user.username}" does not own a roster in this league` },
+        { status: 403 },
+      );
+    }
 
-    let tradedPicks: any[] = [];
+    let tradedPicks: SleeperTradedPick[] = [];
     try {
       tradedPicks = await getSleeperTradedPicks(leagueId);
     } catch {
       // traded picks may not be available
     }
+
+    const leagueMode = getSleeperLeagueMode(league);
 
     // Map roster positions
     const { superflex, rosterSlots } = mapSleeperPositions(
@@ -78,6 +96,7 @@ export async function GET(request: NextRequest) {
       id: league.league_id,
       name: league.name,
       platform: "sleeper",
+      mode: leagueMode,
       teamCount: league.total_rosters,
       rosterSlots: rosterSlots as RosterSlot[],
       scoringType: ppr >= 1 ? "ppr" : ppr >= 0.5 ? "half_ppr" : "standard",
@@ -90,18 +109,14 @@ export async function GET(request: NextRequest) {
 
     // Fetch real dynasty values + pick values from FantasyCalc, tuned to format
     const fcParams = {
-      isDynasty: true,
+      isDynasty: leagueMode !== "redraft",
       numQbs: superflex ? 2 : 1,
       numTeams: league.total_rosters || 12,
       ppr,
     };
-    let fcValues: Awaited<ReturnType<typeof getFantasyCalcValues>> | null = null;
-    let pickLookup: Awaited<ReturnType<typeof getFantasyCalcPickValues>> | null = null;
+    let fcData: Awaited<ReturnType<typeof getFantasyCalcData>> | null = null;
     try {
-      [fcValues, pickLookup] = await Promise.all([
-        getFantasyCalcValues(fcParams),
-        getFantasyCalcPickValues(fcParams),
-      ]);
+      fcData = await getFantasyCalcData(fcParams);
     } catch (e) {
       console.error("FantasyCalc fetch failed, falling back to defaults:", e);
     }
@@ -117,8 +132,8 @@ export async function GET(request: NextRequest) {
 
       let dynastyValue = 0;
       const fcEntry =
-        fcValues?.bySleeperId[id] ||
-        fcValues?.byName[normalizeName(fullName)];
+        fcData?.bySleeperId[id] ||
+        fcData?.byName[normalizeName(fullName)];
       if (fcEntry) {
         dynastyValue = applyTePremium(fcEntry.value, position, tePremiumBonus);
       } else {
@@ -137,7 +152,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Build rosters
-    const userMap = new Map<string, any>();
+    const userMap = new Map<string, SleeperUser>();
     for (const u of leagueUsers) {
       userMap.set(u.user_id, u);
     }
@@ -156,7 +171,7 @@ export async function GET(request: NextRequest) {
     // Project each team's draft slot from roster strength (weakest picks first).
     // strengthScore = sum of top-12 player values (rough starter proxy).
     const strengthRanked = rosterData
-      .map((r: any) => {
+      .map((r) => {
         const vals = (r.players || [])
           .map((pid: string) => players[pid]?.dynastyValue || 0)
           .sort((a: number, b: number) => b - a)
@@ -180,8 +195,8 @@ export async function GET(request: NextRequest) {
     }
     const makePick = (year: number, round: number, originalOwner: number, currentOwner: number): DraftPick => {
       const projectedSlotPct = slotPctByRoster.get(originalOwner) ?? 0.5;
-      const estimatedValue = pickLookup
-        ? valuePick(pickLookup, year, round, { projectedSlotPct, teams: teamCount })
+      const estimatedValue = fcData
+        ? valuePick(fcData.picks, year, round, { projectedSlotPct, teams: teamCount })
         : round === 1 ? 30 : round === 2 ? 15 : 10;
       return {
         year,
@@ -201,14 +216,17 @@ export async function GET(request: NextRequest) {
       tradedOwner.set(`${year}-${tp.round}-${tp.roster_id}`, tp.owner_id);
     }
 
-    for (const year of futureYears) {
-      for (let round = 1; round <= draftRounds; round++) {
-        for (const r of rosterData) {
-          const originalOwner = r.roster_id;
-          const overrideOwner = tradedOwner.get(`${year}-${round}-${originalOwner}`);
-          const currentOwner = overrideOwner ?? originalOwner;
-          const pick = makePick(year, round, originalOwner, currentOwner);
-          pickCapital.get(currentOwner)?.push(pick);
+    // Redraft leagues reset annually, so future rookie picks are not trade assets.
+    if (leagueMode !== "redraft") {
+      for (const year of futureYears) {
+        for (let round = 1; round <= draftRounds; round++) {
+          for (const r of rosterData) {
+            const originalOwner = r.roster_id;
+            const overrideOwner = tradedOwner.get(`${year}-${round}-${originalOwner}`);
+            const currentOwner = overrideOwner ?? originalOwner;
+            const pick = makePick(year, round, originalOwner, currentOwner);
+            pickCapital.get(currentOwner)?.push(pick);
+          }
         }
       }
     }
@@ -217,8 +235,8 @@ export async function GET(request: NextRequest) {
       picks.sort((a, b) => a.year - b.year || a.round - b.round);
     }
 
-    const rosters: TeamRoster[] = rosterData.map((r: any) => {
-      const owner = userMap.get(r.owner_id);
+    const rosters: TeamRoster[] = rosterData.map((r) => {
+      const owner = r.owner_id ? userMap.get(r.owner_id) : undefined;
       const rosterPlayers: Player[] = (r.players || [])
         .filter((pid: string) => players[pid])
         .map((pid: string) => players[pid]);
@@ -233,20 +251,17 @@ export async function GET(request: NextRequest) {
     });
 
     // Find user's team
-    const myRoster = rosterData.find((r: any) => r.owner_id === user.user_id);
-    const myTeamId = myRoster ? String(myRoster.roster_id) : rosters[0]?.teamId || "";
+    const myTeamId = String(mySleeperRoster.roster_id);
 
     // Build roster name map for trade analysis
     const rosterNames = new Map<string, string>();
     for (const r of rosterData) {
-      const owner = userMap.get(r.owner_id);
+      const owner = r.owner_id ? userMap.get(r.owner_id) : undefined;
       rosterNames.set(String(r.roster_id), owner?.metadata?.team_name || owner?.display_name || `Team ${r.roster_id}`);
     }
 
-    console.log("Starting historical trade analysis...");
     // Analyze historical trades
     const tradeAnalysis = await analyzeHistoricalTrades(leagueId, players, rosterNames);
-    console.log("Trade analysis complete:", JSON.stringify(tradeAnalysis, null, 2));
 
     return Response.json({
       leagueSettings,
@@ -254,8 +269,13 @@ export async function GET(request: NextRequest) {
       players,
       myTeamId,
       tradeAnalysis,
+      freshness: {
+        leagueImportedAt: Date.now(),
+        fantasyCalcFetchedAt: fcData?.fetchedAt ?? null,
+        fantasyCalcStatus: fcData ? "live" : "fallback",
+      },
     });
-  } catch (err: any) {
-    return Response.json({ error: err.message }, { status: 500 });
+  } catch (error: unknown) {
+    return Response.json({ error: errorMessage(error) }, { status: 500 });
   }
 }

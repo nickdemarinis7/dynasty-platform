@@ -30,6 +30,13 @@ export interface HistoricalTradeAnalysis {
   mostCommonTradeTypes: string[];
 }
 
+const analysisCache = new Map<string, { expiresAt: number; value: HistoricalTradeAnalysis }>();
+const ANALYSIS_CACHE_TTL_MS = 15 * 60 * 1000;
+
+function emptyAnalysis(): HistoricalTradeAnalysis {
+  return { patterns: [], teamStyles: {}, avgValueDiffForAcceptedTrades: 0, mostCommonTradeTypes: [] };
+}
+
 /**
  * Analyzes historical transactions to extract trade patterns and team tendencies.
  * This helps predict what trades are likely to be accepted.
@@ -39,6 +46,9 @@ export async function analyzeHistoricalTrades(
   players: Record<string, Player>,
   rosterNames: Map<string, string>
 ): Promise<HistoricalTradeAnalysis> {
+  const cached = analysisCache.get(leagueId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
   try {
     // Walk through league history using previous_league_id chain
     const allTransactions: SleeperTransaction[] = [];
@@ -49,47 +59,32 @@ export async function analyzeHistoricalTrades(
     while (currentLeagueId && seasonCount < maxSeasons) {
       try {
         const leagueInfo = await getSleeperLeagueInfo(currentLeagueId);
-        console.log(`Processing season ${leagueInfo.season} (league: ${currentLeagueId})`);
-        
         // Fetch transactions for each week (1-18) of this season
-        const seasonTransactions: SleeperTransaction[] = [];
-        for (let week = 1; week <= 18; week++) {
-          const weekTransactions = await getSleeperTransactions(currentLeagueId, week);
-          if (weekTransactions.length > 0) {
-            seasonTransactions.push(...weekTransactions);
-          }
+        const weeklyTransactions: SleeperTransaction[][] = [];
+        const weeks = Array.from({ length: 18 }, (_, week) => week + 1);
+        // Limit upstream concurrency to avoid bursty imports and Sleeper throttling.
+        for (let index = 0; index < weeks.length; index += 6) {
+          const batch = weeks.slice(index, index + 6);
+          weeklyTransactions.push(...await Promise.all(
+            batch.map((week) => getSleeperTransactions(currentLeagueId!, week))
+          ));
         }
+        const seasonTransactions = weeklyTransactions.flat();
         
-        console.log(`Fetched ${seasonTransactions.length} transactions for season ${leagueInfo.season}`);
         allTransactions.push(...seasonTransactions);
         
         // Move to previous season
         currentLeagueId = leagueInfo.previous_league_id;
         seasonCount++;
-      } catch (e) {
-        console.log(`Failed to fetch data for league ${currentLeagueId}, stopping chain`);
+      } catch {
         break;
       }
     }
-
-    console.log(`Fetched ${allTransactions.length} total transactions across ${seasonCount} seasons`);
     
     if (allTransactions.length === 0) {
-      console.log("No transactions found for any season");
-      return {
-        patterns: [],
-        teamStyles: {},
-        avgValueDiffForAcceptedTrades: 0,
-        mostCommonTradeTypes: [],
-      };
-    }
-    
-    // Log date range of all transactions
-    const timestamps = allTransactions.map((t: SleeperTransaction) => t.created).filter((t: number | undefined) => t);
-    if (timestamps.length > 0) {
-      const oldest = new Date(Math.min(...timestamps));
-      const newest = new Date(Math.max(...timestamps));
-      console.log(`Transaction date range: ${oldest.toISOString()} to ${newest.toISOString()}`);
+      const result = emptyAnalysis();
+      analysisCache.set(leagueId, { expiresAt: Date.now() + ANALYSIS_CACHE_TTL_MS, value: result });
+      return result;
     }
     
     // Filter for trades using type: "trade" as per Sleeper API documentation
@@ -99,18 +94,9 @@ export async function analyzeHistoricalTrades(
         t.status === "complete" &&
         t.roster_ids.length === 2 && // 2 teams involved
         t.adds && // Ensure adds exists
-        (Object.keys(t.adds).length > 0 || Object.keys(t.draft_picks || {}).length > 0)
+        (Object.keys(t.adds).length > 0 || (t.draft_picks?.length ?? 0) > 0)
     );
 
-    console.log(`Filtered to ${trades.length} trades (type=trade, status=complete, 2 teams)`);
-    
-    // Log date range of filtered trades
-    const tradeTimestamps = trades.map(t => t.created).filter(t => t);
-    if (tradeTimestamps.length > 0) {
-      const oldest = new Date(Math.min(...tradeTimestamps));
-      const newest = new Date(Math.max(...tradeTimestamps));
-      console.log(`Trade date range: ${oldest.toISOString()} to ${newest.toISOString()}`);
-    }
 
     const patterns: Record<string, { valueDiffs: number[]; ageDiffs: number[] }> = {};
     const allTradeValueDiffs: number[] = []; // Track actual value diff for each trade
@@ -132,7 +118,7 @@ export async function analyzeHistoricalTrades(
       const teamBId = String(rosterB);
 
       // Initialize team data if needed
-      for (const [teamId, otherTeamId] of [[teamAId, teamBId], [teamBId, teamAId]]) {
+      for (const teamId of [teamAId, teamBId]) {
         if (!teamStyles[teamId]) {
           teamStyles[teamId] = {
             totalTrades: 0,
@@ -149,12 +135,20 @@ export async function analyzeHistoricalTrades(
       }
 
       // Analyze players traded
-      const playersA = Object.entries(trade.adds).filter(([_, roster]) => roster === rosterA).map(([pid]) => players[pid]);
-      const playersB = Object.entries(trade.adds).filter(([_, roster]) => roster === rosterB).map(([pid]) => players[pid]);
+      const playersA = Object.entries(trade.adds).filter((entry) => entry[1] === rosterA).map(([pid]) => players[pid]);
+      const playersB = Object.entries(trade.adds).filter((entry) => entry[1] === rosterB).map(([pid]) => players[pid]);
+
+      const pickValue = (round: number) => round === 1 ? 30 : round === 2 ? 15 : round === 3 ? 10 : 6;
+      const pickValueA = (trade.draft_picks || [])
+        .filter((pick) => pick.owner_id === rosterA)
+        .reduce((sum, pick) => sum + pickValue(pick.round), 0);
+      const pickValueB = (trade.draft_picks || [])
+        .filter((pick) => pick.owner_id === rosterB)
+        .reduce((sum, pick) => sum + pickValue(pick.round), 0);
 
       // Calculate value differences
-      const valueA = playersA.reduce((sum, p) => sum + (p?.dynastyValue || 0), 0);
-      const valueB = playersB.reduce((sum, p) => sum + (p?.dynastyValue || 0), 0);
+      const valueA = playersA.reduce((sum, p) => sum + (p?.dynastyValue || 0), 0) + pickValueA;
+      const valueB = playersB.reduce((sum, p) => sum + (p?.dynastyValue || 0), 0) + pickValueB;
       const valueDiff = valueB - valueA;
       allTradeValueDiffs.push(valueDiff); // Track for overall average
 
@@ -199,17 +193,18 @@ export async function analyzeHistoricalTrades(
       styleA.totalTrades++;
       styleB.totalTrades++;
 
-      styleA.positionsTradedAway.push(...playersA.map(p => p?.position || "UNK"));
-      styleA.positionsAcquired.push(...playersB.map(p => p?.position || "UNK"));
-      styleA.valueSent.push(valueA);
-      styleA.valueReceived.push(valueB);
-      styleA.agesReceived.push(...playersB.map(p => p?.age || 0));
+      // Sleeper's `adds` map points to the roster receiving each player.
+      styleA.positionsAcquired.push(...playersA.map(p => p?.position || "UNK"));
+      styleA.positionsTradedAway.push(...playersB.map(p => p?.position || "UNK"));
+      styleA.valueReceived.push(valueA);
+      styleA.valueSent.push(valueB);
+      styleA.agesReceived.push(...playersA.map(p => p?.age || 0));
 
-      styleB.positionsTradedAway.push(...playersB.map(p => p?.position || "UNK"));
-      styleB.positionsAcquired.push(...playersA.map(p => p?.position || "UNK"));
-      styleB.valueSent.push(valueB);
-      styleB.valueReceived.push(valueA);
-      styleB.agesReceived.push(...playersA.map(p => p?.age || 0));
+      styleB.positionsAcquired.push(...playersB.map(p => p?.position || "UNK"));
+      styleB.positionsTradedAway.push(...playersA.map(p => p?.position || "UNK"));
+      styleB.valueReceived.push(valueB);
+      styleB.valueSent.push(valueA);
+      styleB.agesReceived.push(...playersB.map(p => p?.age || 0));
     }
 
     // Convert patterns to final format
@@ -273,20 +268,16 @@ export async function analyzeHistoricalTrades(
 
     const mostCommonTradeTypes = patternArray.slice(0, 5).map(p => p.positionSwap);
 
-    return {
+    const result = {
       patterns: patternArray,
       teamStyles: teamStyleMap,
       avgValueDiffForAcceptedTrades,
       mostCommonTradeTypes,
     };
+    analysisCache.set(leagueId, { expiresAt: Date.now() + ANALYSIS_CACHE_TTL_MS, value: result });
+    return result;
   } catch (error) {
     console.error("Failed to analyze historical trades:", error);
-    // Return empty analysis on error
-    return {
-      patterns: [],
-      teamStyles: {},
-      avgValueDiffForAcceptedTrades: 0,
-      mostCommonTradeTypes: [],
-    };
+    return emptyAnalysis();
   }
 }

@@ -5,7 +5,7 @@
  * Used to evaluate if a trade actually improves your starting lineup.
  */
 
-import type { Player, LeagueSettings, RosterSlot } from "@/types";
+import type { Player, LeagueSettings } from "@/types";
 import type { PlayerProjection } from "./projections-api";
 
 export interface OptimizedLineup {
@@ -36,11 +36,14 @@ export interface LineupSlot {
  */
 function getProjectedPoints(
   player: Player, 
-  isPlayoffs: boolean = false, 
+  _isPlayoffs: boolean = false,
   currentWeek?: number,
   projections?: Record<string, PlayerProjection>,
-  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr"
+  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr",
+  pointEstimates?: Record<string, number>,
+  leagueMode: LeagueSettings["mode"] = "dynasty",
 ): number {
+  void _isPlayoffs;
   // Check if player is on bye this week
   if (currentWeek && player.byeWeek && player.byeWeek === currentWeek) {
     return 0;  // Player on bye - can't play
@@ -54,14 +57,14 @@ function getProjectedPoints(
                         "pts_std";
     
     // Access stats from nested stats object
-    let points = projection.stats?.[pointsField] || 0;
-    
-    // Apply playoff boost if needed (projections might not have this built in)
-    if (isPlayoffs && points > 0) {
-      points *= 1.2;
-    }
+    const points = projection.stats?.[pointsField] || 0;
     
     return Math.round(points * 10) / 10;
+  }
+
+  const pointEstimate = pointEstimates?.[player.id];
+  if (pointEstimate !== undefined && Number.isFinite(pointEstimate)) {
+    return Math.max(0, Math.round(pointEstimate * 10) / 10);
   }
   
   // Fallback: Dynasty value is 0-100 scale (age + production + future potential).
@@ -69,8 +72,11 @@ function getProjectedPoints(
   // so a 22yo backup with value 60 doesn't project the same weekly pts as a
   // 28yo starter with value 60 who actually produces more NOW.
   const dynastyVal = player.dynastyValue || 0;
+  if (dynastyVal <= 0) return 0;
   // Age discount: young players' dynasty value is partly future potential, not current production
-  const ageDiscount = player.age <= 22 ? 0.70 : player.age <= 24 ? 0.85 : player.age <= 27 ? 1.0 : player.age <= 30 ? 1.05 : 0.90;
+  const ageDiscount = leagueMode === "redraft"
+    ? 1
+    : player.age <= 22 ? 0.70 : player.age <= 24 ? 0.85 : player.age <= 27 ? 1.0 : player.age <= 30 ? 1.05 : 0.90;
   const adjustedVal = dynastyVal * ageDiscount;
   let basePoints = 0;
   
@@ -122,11 +128,6 @@ function getProjectedPoints(
     }
   }
   
-  // Playoff boost (weeks 15-17)
-  if (isPlayoffs) {
-    basePoints *= 1.2;
-  }
-  
   return Math.round(basePoints * 10) / 10; // Round to 1 decimal
 }
 
@@ -146,12 +147,13 @@ export function optimizeLineup(
   isPlayoffs: boolean = false,
   currentWeek?: number,
   projections?: Record<string, PlayerProjection>,
-  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr"
+  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr",
+  pointEstimates?: Record<string, number>,
 ): OptimizedLineup {
   const starters: Player[] = [];
   const availablePlayers = [...players].sort((a, b) => 
-    getProjectedPoints(b, isPlayoffs, currentWeek, projections, scoringType) - 
-    getProjectedPoints(a, isPlayoffs, currentWeek, projections, scoringType)
+    getProjectedPoints(b, isPlayoffs, currentWeek, projections, scoringType, pointEstimates, leagueSettings.mode) -
+    getProjectedPoints(a, isPlayoffs, currentWeek, projections, scoringType, pointEstimates, leagueSettings.mode)
   );
   
   // Build required slots from roster settings
@@ -212,7 +214,7 @@ export function optimizeLineup(
   
   // Calculate total projected points
   const totalProjectedPoints = starters.reduce(
-    (sum, p) => sum + getProjectedPoints(p, isPlayoffs, currentWeek, projections, scoringType),
+    (sum, p) => sum + getProjectedPoints(p, isPlayoffs, currentWeek, projections, scoringType, pointEstimates, leagueSettings.mode),
     0
   );
   
@@ -273,20 +275,23 @@ export function evaluateTradeLineupImpact(
   isPlayoffs: boolean = false,
   currentWeek?: number,
   projections?: Record<string, PlayerProjection>,
-  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr"
+  scoringType: "ppr" | "half_ppr" | "std" = "half_ppr",
+  pointEstimates?: Record<string, number>,
 ): TradeLineupImpact {
   // Before trade
-  const beforeLineup = optimizeLineup(currentRoster, leagueSettings, isPlayoffs, currentWeek, projections, scoringType);
+  const beforeLineup = optimizeLineup(currentRoster, leagueSettings, isPlayoffs, currentWeek, projections, scoringType, pointEstimates);
   
   // After trade
   const afterRoster = currentRoster
     .filter(p => !playersGiven.some(gp => gp.id === p.id))
     .concat(playersReceived);
-  const afterLineup = optimizeLineup(afterRoster, leagueSettings, isPlayoffs, currentWeek, projections, scoringType);
+  const afterLineup = optimizeLineup(afterRoster, leagueSettings, isPlayoffs, currentWeek, projections, scoringType, pointEstimates);
   
   // Calculate impact
   const pointsGained = afterLineup.totalProjectedPoints - beforeLineup.totalProjectedPoints;
-  const percentGain = (pointsGained / beforeLineup.totalProjectedPoints) * 100;
+  const percentGain = beforeLineup.totalProjectedPoints > 0
+    ? (pointsGained / beforeLineup.totalProjectedPoints) * 100
+    : 0;
   
   // Check if received player(s) start
   const receivedPlayerStarts = playersReceived.some(p => 
@@ -369,6 +374,18 @@ export function getLineupDisplay(
 ): LineupSlot[] {
   const optimized = optimizeLineup(players, leagueSettings);
   const slots: LineupSlot[] = [];
+  const assigned = new Set<string>();
+  const basePlayers = new Map<string, Player[]>();
+
+  for (const slotConfig of leagueSettings.rosterSlots) {
+    if (["BN", "IR", "FLEX", "SUPERFLEX"].includes(slotConfig.type)) continue;
+    const playersAtPosition = (optimized.positionBreakdown[slotConfig.type] || [])
+      .slice(0, slotConfig.count);
+    basePlayers.set(slotConfig.type, playersAtPosition);
+    playersAtPosition.forEach((player) => assigned.add(player.id));
+  }
+
+  const remainingStarters = optimized.starters.filter((player) => !assigned.has(player.id));
   
   // Build slots from roster settings
   for (const slotConfig of leagueSettings.rosterSlots) {
@@ -378,23 +395,24 @@ export function getLineupDisplay(
       let player: Player | null = null;
       
       if (slotConfig.type === "FLEX") {
-        player = optimized.flexPlayers[i] || null;
+        player = remainingStarters.find((candidate) =>
+          !assigned.has(candidate.id) && ["RB", "WR", "TE"].includes(candidate.position)
+        ) || null;
       } else if (slotConfig.type === "SUPERFLEX") {
-        // Get superflex players (after QB slots filled)
-        const sfPlayers = optimized.starters.filter(p => 
-          optimized.flexPlayers.includes(p) || 
-          (p.position === "QB" && optimized.positionBreakdown["QB"]?.indexOf(p) >= 1)
-        );
-        player = sfPlayers[i] || null;
+        player = remainingStarters.find((candidate) =>
+          !assigned.has(candidate.id) && ["QB", "RB", "WR", "TE"].includes(candidate.position)
+        ) || null;
       } else {
-        const posPlayers = optimized.positionBreakdown[slotConfig.type] || [];
+        const posPlayers = basePlayers.get(slotConfig.type) || [];
         player = posPlayers[i] || null;
       }
+
+      if (player) assigned.add(player.id);
       
       slots.push({
         position: slotConfig.type,
         player,
-        projectedPoints: player ? getProjectedPoints(player, false, undefined) : 0,
+        projectedPoints: player ? getProjectedPoints(player, false, undefined, undefined, "half_ppr", undefined, leagueSettings.mode) : 0,
       });
     }
   }

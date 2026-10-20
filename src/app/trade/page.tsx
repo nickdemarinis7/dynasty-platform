@@ -1,13 +1,15 @@
 "use client";
 
-import { useState, useMemo, useEffect, Suspense } from "react";
+import { useState, useMemo, useEffect, useCallback, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
+import Link from "next/link";
 import { useAppStore } from "@/store";
 import type { SavedTrade } from "@/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { useToast } from "@/components/ui/toast";
 import {
   Select,
   SelectContent,
@@ -16,13 +18,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
-import { buildLeagueContext, evaluateTrade } from "@/lib/trade-engine";
+import { buildLeagueContext, evaluateTrade } from "@/lib/analytics";
+import { getAuthoritativeNFLWeek, getCachedProjections, getCurrentNFLWeek, type CurrentNFLWeek } from "@/lib/projections-cache";
+import type { PlayerProjection } from "@/lib/projections-api";
 import type { Player, DraftPick } from "@/types";
 import {
   ArrowRightLeft,
   X,
   Save,
   RotateCcw,
+  Search,
   Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -34,13 +39,29 @@ const positionColors: Record<string, string> = {
   TE: "text-orange-400 border-orange-500/30",
 };
 
+type AssetFilter = "ALL" | "QB" | "RB" | "WR" | "TE";
+const ASSET_FILTERS: AssetFilter[] = ["ALL", "QB", "RB", "WR", "TE"];
+
 function pickLabel(pick: DraftPick): string {
   const r = pick.round === 1 ? "1st" : pick.round === 2 ? "2nd" : pick.round === 3 ? "3rd" : `${pick.round}th`;
   return `${pick.year} ${r}`;
 }
 
+function renderReasoning(text: string) {
+  return text.split(/(\*\*.*?\*\*)/g).map((part, index) =>
+    part.startsWith("**") && part.endsWith("**") ? (
+      <span key={index} className="text-foreground font-medium">
+        {part.slice(2, -2)}
+      </span>
+    ) : (
+      part
+    )
+  );
+}
+
 function TradePageContent() {
   const searchParams = useSearchParams();
+  const { addToast } = useToast();
   const { rosters, myTeamId, personalValues, leagueSettings, addSavedTrade } = useAppStore();
 
   // Default Team B to the first team that's not Team A
@@ -58,6 +79,19 @@ function TradePageContent() {
   const [teamBPicks, setTeamBPicks] = useState<DraftPick[]>([]);
   const [searchA, setSearchA] = useState("");
   const [searchB, setSearchB] = useState("");
+  const [positionA, setPositionA] = useState<AssetFilter>("ALL");
+  const [positionB, setPositionB] = useState<AssetFilter>("ALL");
+  const [weeklyProjections, setWeeklyProjections] = useState<Record<string, PlayerProjection>>({});
+  const [nflWeek, setNflWeek] = useState<CurrentNFLWeek>(() => ({
+    ...getCurrentNFLWeek(), seasonType: "regular", source: "calendar_fallback",
+  }));
+
+  useEffect(() => {
+    getAuthoritativeNFLWeek().then((current) => {
+      setNflWeek(current);
+      return getCachedProjections(current.season, current.week, current.seasonType);
+    }).then(setWeeklyProjections).catch(() => setWeeklyProjections({}));
+  }, []);
 
   // Handle URL params for pre-filled trade from recommendations
   useEffect(() => {
@@ -66,7 +100,11 @@ function TradePageContent() {
     const playersA = searchParams.get("playersA");
     const playersB = searchParams.get("playersB");
     const picksA = searchParams.get("picksA");
+    const picksB = searchParams.get("picksB");
 
+    // URL parameters and persisted rosters hydrate independently, so this effect
+    // intentionally synchronizes the controlled builder state once both exist.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (teamAParam) setTeamAId(teamAParam);
     if (teamBParam) setTeamBId(teamBParam);
 
@@ -105,15 +143,29 @@ function TradePageContent() {
         setTeamAPicks(picks);
       }
     }
+
+    if (picksB && teamBParam) {
+      const teamB = rosters.find((r) => r.teamId === teamBParam);
+      if (teamB) {
+        const pickSpecs = picksB.split(",");
+        const picks = pickSpecs
+          .map((spec) => {
+            const [year, round] = spec.split("-").map(Number);
+            return teamB.draftPicks.find(p => p.year === year && p.round === round);
+          })
+          .filter((p): p is DraftPick => p !== undefined);
+        setTeamBPicks(picks);
+      }
+    }
   }, [searchParams, rosters]);
 
   const teamA = rosters.find((r) => r.teamId === teamAId);
   const teamB = rosters.find((r) => r.teamId === teamBId);
 
-  const getPlayerValue = (player: Player) => {
-    if (personalValues[player.id]) return personalValues[player.id];
+  const getPlayerValue = useCallback((player: Player) => {
+    if (personalValues[player.id] !== undefined) return personalValues[player.id];
     return player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 10;
-  };
+  }, [personalValues]);
 
   const rosterName = (id: string) => rosters.find((r) => r.teamId === id)?.teamName || `Team ${id}`;
 
@@ -131,17 +183,19 @@ function TradePageContent() {
     if (!teamA) return [];
     return teamA.players
       .filter((p) => !teamAPlayers.find((tp) => tp.id === p.id))
+      .filter((p) => positionA === "ALL" || p.position === positionA)
       .filter((p) => !searchA || p.name.toLowerCase().includes(searchA.toLowerCase()))
       .sort((a, b) => getPlayerValue(b) - getPlayerValue(a));
-  }, [teamA, teamAPlayers, searchA, personalValues]);
+  }, [teamA, teamAPlayers, positionA, searchA, getPlayerValue]);
 
   const teamBAvailable = useMemo(() => {
     if (!teamB) return [];
     return teamB.players
       .filter((p) => !teamBPlayers.find((tp) => tp.id === p.id))
+      .filter((p) => positionB === "ALL" || p.position === positionB)
       .filter((p) => !searchB || p.name.toLowerCase().includes(searchB.toLowerCase()))
       .sort((a, b) => getPlayerValue(b) - getPlayerValue(a));
-  }, [teamB, teamBPlayers, searchB, personalValues]);
+  }, [teamB, teamBPlayers, positionB, searchB, getPlayerValue]);
 
   const pickKey = (p: DraftPick) => `${p.year}-${p.round}-${p.originalOwner}`;
 
@@ -155,13 +209,13 @@ function TradePageContent() {
     return teamB.draftPicks.filter((p) => !teamBPicks.find((tp) => pickKey(tp) === pickKey(p)));
   }, [teamB, teamBPicks]);
 
+  const teamAHasAssets = teamAPlayers.length > 0 || teamAPicks.length > 0;
+  const teamBHasAssets = teamBPlayers.length > 0 || teamBPicks.length > 0;
+
   // Smart trade analysis via engine
   const analysis = useMemo(() => {
     if (!teamACtx || !teamBCtx) return null;
-    if (teamAPlayers.length === 0 && teamAPicks.length === 0 &&
-        teamBPlayers.length === 0 && teamBPicks.length === 0) {
-      return null;
-    }
+    if (!teamAHasAssets || !teamBHasAssets) return null;
     return evaluateTrade({
       teamACtx,
       teamBCtx,
@@ -170,8 +224,14 @@ function TradePageContent() {
       bGivesPlayers: teamBPlayers,
       bGivesPicks: teamBPicks,
       personalValues,
+      teamARoster: teamA?.players,
+      teamBRoster: teamB?.players,
+      leagueSettings: leagueSettings ?? undefined,
+      projections: weeklyProjections,
+      currentWeek: nflWeek.week,
+      isPlayoffs: nflWeek.isPlayoffs,
     });
-  }, [teamACtx, teamBCtx, teamAPlayers, teamAPicks, teamBPlayers, teamBPicks, personalValues]);
+  }, [teamACtx, teamBCtx, teamAPlayers, teamAPicks, teamBPlayers, teamBPicks, teamAHasAssets, teamBHasAssets, personalValues, teamA, teamB, leagueSettings, weeklyProjections, nflWeek]);
 
   function addPickToSide(side: "A" | "B", pick: DraftPick) {
     if (side === "A") setTeamAPicks([...teamAPicks, pick]);
@@ -190,13 +250,18 @@ function TradePageContent() {
       timestamp: Date.now(),
       teamAId,
       teamAPlayers,
-      teamAPickValues: teamAPicks.map((p) => p.estimatedValue),
+      teamAPicks,
       teamBId,
       teamBPlayers,
-      teamBPickValues: teamBPicks.map((p) => p.estimatedValue),
+      teamBPicks,
       fairnessScore: analysis.marketFairness,
     };
     addSavedTrade(trade);
+    addToast({
+      type: "success",
+      title: "Trade saved",
+      description: "You can revisit it from Trade History.",
+    });
   }
 
   function handleReset() {
@@ -206,6 +271,32 @@ function TradePageContent() {
     setTeamBPicks([]);
     setSearchA("");
     setSearchB("");
+    setPositionA("ALL");
+    setPositionB("ALL");
+  }
+
+  function changeTeamA(nextTeamId: string) {
+    setTeamAId(nextTeamId);
+    setTeamAPlayers([]);
+    setTeamAPicks([]);
+    setSearchA("");
+    setPositionA("ALL");
+    if (nextTeamId === teamBId) {
+      const replacement = rosters.find((roster) => roster.teamId !== nextTeamId);
+      setTeamBId(replacement?.teamId ?? "");
+      setTeamBPlayers([]);
+      setTeamBPicks([]);
+      setSearchB("");
+      setPositionB("ALL");
+    }
+  }
+
+  function changeTeamB(nextTeamId: string) {
+    setTeamBId(nextTeamId);
+    setTeamBPlayers([]);
+    setTeamBPicks([]);
+    setSearchB("");
+    setPositionB("ALL");
   }
 
   if (rosters.length === 0) {
@@ -251,6 +342,27 @@ function TradePageContent() {
         </div>
       </div>
 
+      {searchParams.get("source") === "recommendation" && (
+        <div className="flex flex-col gap-2 rounded-lg border border-primary/25 bg-primary/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-sm font-semibold text-primary">Loaded from Trade Finder</p>
+            <p className="text-xs text-muted-foreground">The recommended teams and assets are preselected. Adjust the package to test alternatives.</p>
+          </div>
+          <Link href="/recommendations" className={cn(buttonVariants({ variant: "ghost", size: "sm" }), "self-start sm:self-auto")}>
+            Back to recommendations
+          </Link>
+        </div>
+      )}
+
+      {teamAHasAssets !== teamBHasAssets && (
+        <div className="rounded-lg border border-dashed border-yellow-500/30 bg-yellow-500/5 px-4 py-3 text-sm">
+          <span className="font-semibold text-yellow-400">Trade package incomplete. </span>
+          <span className="text-muted-foreground">
+            Add at least one player or pick from {teamAHasAssets ? rosterName(teamBId) : rosterName(teamAId)} to calculate a meaningful evaluation.
+          </span>
+        </div>
+      )}
+
       {/* Smart Analysis */}
       {analysis && teamACtx && teamBCtx && (
         <Card className={cn(
@@ -286,7 +398,7 @@ function TradePageContent() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4">
               <div className="rounded-lg bg-muted/50 p-4">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Market (give ↔ get)</p>
                 <p className="text-lg font-medium font-mono">
@@ -300,10 +412,27 @@ function TradePageContent() {
                 </p>
               </div>
               <div className="rounded-lg bg-muted/50 p-4">
-                <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">{rosterName(teamBId)} accepts</p>
+                <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">Opponent offer fit</p>
                 <p className={cn("text-lg font-medium",
                   analysis.acceptanceLikelihood >= 60 ? "text-green-400" : analysis.acceptanceLikelihood <= 40 ? "text-red-400" : "text-yellow-400"
-                )}>{analysis.acceptanceLikelihood.toFixed(0)}% likely</p>
+                )}>{analysis.acceptanceLikelihood.toFixed(0)}/100</p>
+              </div>
+              <div className="rounded-lg bg-muted/50 p-4">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground mb-1">
+                  {analysis.lineupImpactA?.source === "weekly_projection" ? "Lineup impact" : "Est. lineup impact"}
+                </p>
+                <p className={cn(
+                  "text-lg font-medium",
+                  (analysis.lineupImpactA?.pointsGained ?? 0) > 0
+                    ? "text-green-400"
+                    : (analysis.lineupImpactA?.pointsGained ?? 0) < 0
+                      ? "text-red-400"
+                      : "text-muted-foreground"
+                )}>
+                  {analysis.lineupImpactA
+                    ? `${analysis.lineupImpactA.pointsGained > 0 ? "+" : ""}${analysis.lineupImpactA.pointsGained.toFixed(1)} PPG`
+                    : "Not available"}
+                </p>
               </div>
             </div>
 
@@ -311,7 +440,7 @@ function TradePageContent() {
               {analysis.reasoning.map((r, i) => (
                 <div key={i} className="flex gap-2 text-sm text-muted-foreground">
                   <span className="text-primary mt-0.5">•</span>
-                  <span dangerouslySetInnerHTML={{ __html: r.replace(/\*\*(.+?)\*\*/g, '<span class="text-foreground font-medium">$1</span>') }} />
+                  <span>{renderReasoning(r)}</span>
                 </div>
               ))}
             </div>
@@ -325,7 +454,7 @@ function TradePageContent() {
         <div className="space-y-4">
           <select
             value={teamAId}
-            onChange={(e) => { setTeamAId(e.target.value); setTeamAPlayers([]); setTeamAPicks([]); }}
+            onChange={(e) => changeTeamA(e.target.value)}
             className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/50"
           >
             <option value="">Select team giving...</option>
@@ -420,13 +549,24 @@ function TradePageContent() {
                   </SelectContent>
                 </Select>
 
-                <input
-                  type="text"
-                  placeholder="Search players to add..."
-                  value={searchA}
-                  onChange={(e) => setSearchA(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
+                <div className="flex flex-wrap gap-1.5">
+                  {ASSET_FILTERS.map((position) => (
+                    <button key={position} type="button" onClick={() => setPositionA(position)} className={cn(
+                      "rounded-md px-2 py-1 text-xs font-medium transition-colors",
+                      positionA === position ? "bg-primary text-primary-foreground" : "bg-muted/60 text-muted-foreground hover:text-foreground"
+                    )}>{position === "ALL" ? "All" : position}</button>
+                  ))}
+                </div>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="text"
+                    placeholder="Search players to add..."
+                    value={searchA}
+                    onChange={(e) => setSearchA(e.target.value)}
+                    className="w-full rounded-lg border border-border bg-background py-2 pl-9 pr-3 focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  />
+                </div>
                 <div className="space-y-1">
                   {teamAAvailable.slice(0, 20).map((p) => (
                     <button
@@ -455,7 +595,7 @@ function TradePageContent() {
         <div className="space-y-4">
           <select
             value={teamBId}
-            onChange={(e) => { setTeamBId(e.target.value); setTeamBPlayers([]); setTeamBPicks([]); }}
+            onChange={(e) => changeTeamB(e.target.value)}
             className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/50"
           >
             <option value="">Select team receiving from...</option>
@@ -550,13 +690,24 @@ function TradePageContent() {
                   </SelectContent>
                 </Select>
 
-                <input
-                  type="text"
-                  placeholder="Search players to add..."
-                  value={searchB}
-                  onChange={(e) => setSearchB(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
+                <div className="flex flex-wrap gap-1.5">
+                  {ASSET_FILTERS.map((position) => (
+                    <button key={position} type="button" onClick={() => setPositionB(position)} className={cn(
+                      "rounded-md px-2 py-1 text-xs font-medium transition-colors",
+                      positionB === position ? "bg-primary text-primary-foreground" : "bg-muted/60 text-muted-foreground hover:text-foreground"
+                    )}>{position === "ALL" ? "All" : position}</button>
+                  ))}
+                </div>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="text"
+                    placeholder="Search players to add..."
+                    value={searchB}
+                    onChange={(e) => setSearchB(e.target.value)}
+                    className="w-full rounded-lg border border-border bg-background py-2 pl-9 pr-3 focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  />
+                </div>
                 <div className="space-y-1">
                   {teamBAvailable.slice(0, 20).map((p) => (
                     <button

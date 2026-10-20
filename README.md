@@ -1,6 +1,6 @@
 # Dynasty Trade Analyzer
 
-A comprehensive fantasy football dynasty trade analysis platform built for Sleeper leagues. Get AI-powered trade recommendations, advanced player projections, and deep roster analytics.
+A mobile-first fantasy football management platform for dynasty and redraft Sleeper leagues. Get trade recommendations, player projections, and roster analytics from an installable web app.
 
 ## ✨ Features
 
@@ -44,6 +44,19 @@ A comprehensive fantasy football dynasty trade analysis platform built for Sleep
 
 ## 🚀 Quick Start
 
+### Streamlit application
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+Open [http://localhost:8501](http://localhost:8501). The Python rewrite currently includes live Sleeper league import, FantasyCalc market and pick values, traded-pick ownership, weekly and season production data, optimized lineups, a contextual player-and-pick Trade Simulator, recommendation-to-simulator handoff, session trade history with CSV export, a quality-gated Trade Finder, a 15-second Sleeper live-draft board, mobile Edge Intelligence, rosters, power rankings, and player values. Durable database storage is the primary remaining platform milestone.
+
+### Legacy Next.js application
+
 ### Prerequisites
 - Node.js 18+ 
 - npm or yarn
@@ -74,7 +87,7 @@ Open [http://localhost:3000](http://localhost:3000) to view the app.
 
 ## 🏗️ Tech Stack
 
-- **Framework:** Next.js 15 (App Router)
+- **Framework:** Next.js 16 (App Router)
 - **Language:** TypeScript
 - **Styling:** Tailwind CSS v4
 - **UI Components:** shadcn/ui (base-ui)
@@ -144,34 +157,42 @@ The app automatically detects your league settings:
 - Roster slots
 
 ### Data Storage
-All data is stored locally in your browser:
-- No backend database required
-- Data persists between sessions
-- Each user has independent data
+
+Without cloud credentials, imported league data and saved trades remain in the Streamlit session and can be exported as CSV. Production deployments can enable native OIDC authentication and user-scoped Supabase trade history. The application automatically selects durable storage when those secrets are present.
 
 ## 🚢 Deployment
 
-### Deploy to Vercel (Recommended)
+### Deploy to Streamlit Community Cloud
+
+1. Push this repository to GitHub.
+2. In Streamlit Community Cloud, create an app from the repository.
+3. Set the main file path to `streamlit_app.py`.
+4. Deploy. Public Sleeper and FantasyCalc data do not require secrets.
 
 ```bash
-# Install Vercel CLI
-npm i -g vercel
-
-# Deploy
-vercel
+# Local production-equivalent check
+streamlit run streamlit_app.py
 ```
 
-Or connect your GitHub repo to Vercel for automatic deployments.
+Each push to the selected branch will redeploy the Streamlit app.
 
-### Deploy to Netlify
+### Optional production accounts and storage
 
-```bash
-# Install Netlify CLI
-npm i -g netlify-cli
+1. Create an OIDC application with Google, Microsoft, Auth0, or another compatible provider. Its callback URL is `<your-app-url>/oauth2callback`.
+2. Create a Supabase project and execute [supabase.sql](docs/deployment/supabase.sql).
+3. Copy `.streamlit/secrets.example.toml` to `.streamlit/secrets.toml` for local development and replace every placeholder.
+4. In Streamlit Community Cloud, paste the same settings into the app's **Secrets** configuration, changing `redirect_uri` to the deployed callback URL.
 
-# Deploy
-netlify deploy --prod
-```
+`service_role_key` is a server-only credential. Never commit it, place it in browser code, or substitute it with a public example value. The real `secrets.toml` is ignored by Git.
+
+### Install on iPhone
+
+1. Open the deployed site in Safari.
+2. Tap **Share**.
+3. Choose **Add to Home Screen**.
+4. Launch **Fantasy GM** from the new home-screen icon.
+
+The Streamlit layout is mobile-first and can be saved as a Safari home-screen shortcut. Streamlit does not currently provide the same full PWA shell as the legacy Next.js version, so it will still behave as a hosted web application.
 
 ## 📝 License
 

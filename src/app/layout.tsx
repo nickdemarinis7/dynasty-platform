@@ -1,23 +1,23 @@
-import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
 import { Sidebar } from "@/components/sidebar";
 import { ToastProvider } from "@/components/ui/toast";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "Dynasty Trade Analyzer",
-  description: "Fantasy football dynasty trade simulator and recommendation platform",
-  viewport: "width=device-width, initial-scale=1, maximum-scale=1",
+  applicationName: "Fantasy GM",
+  title: { default: "Fantasy GM", template: "%s · Fantasy GM" },
+  description: "Fantasy football trade simulator and recommendation platform for dynasty and redraft leagues",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: { capable: true, statusBarStyle: "black-translucent", title: "Fantasy GM" },
+  formatDetection: { telephone: false },
+  icons: { icon: "/favicon.ico", apple: "/favicon.ico" },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: "#17191d",
 };
 
 export default function RootLayout({
@@ -28,12 +28,12 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
+      className="h-full antialiased dark"
     >
-      <body className="min-h-full flex bg-background text-foreground">
+      <body className="min-h-full bg-background text-foreground">
         <ToastProvider>
           <Sidebar />
-          <main className="flex-1 lg:ml-64 p-4 sm:p-6 lg:p-8 overflow-auto pt-16 lg:pt-8">{children}</main>
+          <main className="app-main min-w-0 p-4 pb-24 sm:p-6 sm:pb-24 lg:ml-64 lg:p-8">{children}</main>
         </ToastProvider>
       </body>
     </html>

@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useAppStore } from "@/store";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { arePlayerStatsStale, useAppStore } from "@/store";
+import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { computeAllProjections, AVG_FPPG } from "@/lib/projections";
+import { computeAllProjections, AVG_FPPG } from "@/lib/analytics";
+import { getCurrentNFLWeek } from "@/lib/projections-cache";
 import type { PlayerProjection } from "@/types";
 import {
   TrendingUp,
@@ -13,9 +14,6 @@ import {
   Minus,
   RefreshCw,
   Zap,
-  Target,
-  BarChart2,
-  Users,
   AlertCircle,
   ChevronDown,
   ChevronUp,
@@ -62,13 +60,23 @@ function MiniBar({ value, max = 100, color }: { value: number; max?: number; col
 }
 
 export default function ProjectionsPage() {
-  const { rosters, leagueSettings, playerStats, statsLoading, statsLastFetched, loadPlayerStats } = useAppStore();
+  const { rosters, leagueSettings, playerStats, statsLoading, statsError, statsLastFetched, loadPlayerStats } = useAppStore();
 
   const [posFilter,  setPosFilter]  = useState<PosFilter>("ALL");
   const [recFilter,  setRecFilter]  = useState<RecFilter>("ALL");
   const [sortKey,    setSortKey]    = useState<SortKey>("edgeDelta");
   const [sortDesc,   setSortDesc]   = useState(true);
   const [expanded,   setExpanded]   = useState<string | null>(null);
+  const statsRequestLeagueRef = useRef<string | null>(null);
+  const currentSeason = getCurrentNFLWeek().season;
+  const isRedraft = leagueSettings?.mode === "redraft";
+
+  useEffect(() => {
+    if (!leagueSettings || rosters.length === 0 || !arePlayerStatsStale(statsLastFetched)) return;
+    if (statsRequestLeagueRef.current === leagueSettings.id) return;
+    statsRequestLeagueRef.current = leagueSettings.id;
+    void loadPlayerStats(String(currentSeason));
+  }, [leagueSettings, rosters.length, statsLastFetched, loadPlayerStats, currentSeason]);
 
   const allRosteredPlayers = useMemo(() =>
     rosters.flatMap((r) => r.players), [rosters]
@@ -142,7 +150,7 @@ export default function ProjectionsPage() {
       <div className="space-y-8">
         <div>
           <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Edge Intelligence</h1>
-          <p className="text-muted-foreground mt-2 text-base sm:text-lg">Proprietary player projections powered by trajectory + production + team fit</p>
+          <p className="text-muted-foreground mt-2 text-base sm:text-lg">Player intelligence for dynasty and redraft leagues</p>
         </div>
         <Card className="border-dashed">
           <CardContent className="flex flex-col items-center justify-center py-16">
@@ -163,7 +171,9 @@ export default function ProjectionsPage() {
           <div>
             <h1 className="text-4xl font-bold tracking-tight gradient-text">Edge Intelligence</h1>
             <p className="text-muted-foreground mt-2 text-lg">
-              Proprietary projections — trajectory curves · production efficiency · team fit · composite Edge Score
+              {isRedraft
+                ? "Rest-of-season intelligence — current production · usage · team role · market value"
+                : "Proprietary projections — trajectory curves · production efficiency · team fit · composite Edge Score"}
             </p>
           </div>
           <div className="flex items-center gap-3 pt-1">
@@ -171,12 +181,12 @@ export default function ProjectionsPage() {
               <span className="text-xs text-muted-foreground">Stats: {lastFetchedStr}</span>
             )}
             <button
-              onClick={() => loadPlayerStats("2025")}
+              onClick={() => loadPlayerStats(String(currentSeason))}
               disabled={statsLoading}
               className="flex items-center gap-2 px-3 py-2 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-colors text-sm font-medium disabled:opacity-50"
             >
               <RefreshCw className={`h-4 w-4 ${statsLoading ? "animate-spin" : ""}`} />
-              {statsLoading ? "Loading…" : lastFetchedStr ? "Refresh Stats" : "Load 2025 Stats"}
+              {statsLoading ? "Loading…" : lastFetchedStr ? "Refresh Stats" : `Load ${currentSeason} Stats`}
             </button>
           </div>
         </div>
@@ -187,7 +197,7 @@ export default function ProjectionsPage() {
             <div className="w-2 h-2 rounded-full bg-green-500 mt-1 shrink-0"></div>
             <div>
               <span className="font-semibold text-foreground">Edge Δ</span>
-              <p className="text-muted-foreground">Value vs market consensus</p>
+              <p className="text-muted-foreground">{isRedraft ? "Season form vs market" : "Value vs market consensus"}</p>
             </div>
           </div>
           <div className="flex items-start gap-2">
@@ -200,8 +210,8 @@ export default function ProjectionsPage() {
           <div className="flex items-start gap-2">
             <div className="w-2 h-2 rounded-full bg-yellow-500 mt-1 shrink-0"></div>
             <div>
-              <span className="font-semibold text-foreground">1yr Δ</span>
-              <p className="text-muted-foreground">Projected value change</p>
+              <span className="font-semibold text-foreground">{isRedraft ? "ROS Value" : "1yr Δ"}</span>
+              <p className="text-muted-foreground">{isRedraft ? "Rest-of-season market" : "Projected value change"}</p>
             </div>
           </div>
           <div className="flex items-start gap-2">
@@ -214,8 +224,8 @@ export default function ProjectionsPage() {
           <div className="flex items-start gap-2">
             <div className="w-2 h-2 rounded-full bg-orange-500 mt-1 shrink-0"></div>
             <div>
-              <span className="font-semibold text-foreground">Traj/Fit</span>
-              <p className="text-muted-foreground">Career + team situation</p>
+              <span className="font-semibold text-foreground">{isRedraft ? "Prod/Role" : "Traj/Fit"}</span>
+              <p className="text-muted-foreground">{isRedraft ? "Production + opportunity" : "Career + team situation"}</p>
             </div>
           </div>
           <div className="flex items-start gap-2">
@@ -234,7 +244,22 @@ export default function ProjectionsPage() {
           <CardContent className="py-3 flex items-center gap-3">
             <AlertCircle className="h-4 w-4 text-yellow-400 shrink-0" />
             <p className="text-sm text-yellow-300">
-              Showing <strong>Tier 1 trajectory-only projections</strong> — load 2025 stats to unlock production scoring and team fit analysis.
+              {isRedraft ? (
+                <>Showing <strong>market-only season estimates</strong> — load {currentSeason} stats to unlock production, usage, and role analysis.</>
+              ) : (
+                <>Showing <strong>Tier 1 trajectory-only projections</strong> — load {currentSeason} stats to unlock production scoring and team fit analysis.</>
+              )}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {statsError && (
+        <Card className="border-orange-500/30 bg-orange-500/5">
+          <CardContent className="py-3 flex items-center gap-3">
+            <AlertCircle className="h-4 w-4 text-orange-400 shrink-0" />
+            <p className="text-sm text-orange-300">
+              {statsError}. {Object.keys(playerStats).length > 0 ? "Existing cached data remains available." : "Market-only estimates remain available."}
             </p>
           </CardContent>
         </Card>
@@ -242,7 +267,7 @@ export default function ProjectionsPage() {
 
       {/* Summary row */}
       {summaryStats && (
-        <div className="grid grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5 sm:gap-3">
           {[
             { label: "Strong Buy", val: summaryStats.strongBuy, color: "text-emerald-400" },
             { label: "Buy",        val: summaryStats.buy,       color: "text-green-400" },
@@ -261,8 +286,8 @@ export default function ProjectionsPage() {
       )}
 
       {/* Filters + sort controls */}
-      <div className="flex items-center gap-4 flex-wrap">
-        <div className="flex items-center gap-1.5">
+      <div className="space-y-2 sm:flex sm:flex-wrap sm:items-center sm:gap-4 sm:space-y-0">
+        <div className="flex gap-1.5 overflow-x-auto pb-1">
           {(["ALL", "QB", "RB", "WR", "TE"] as PosFilter[]).map((p) => (
             <button key={p} onClick={() => setPosFilter(p)}
               className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${posFilter === p ? "bg-primary text-primary-foreground" : "bg-muted/50 text-muted-foreground hover:bg-muted"}`}>
@@ -270,8 +295,8 @@ export default function ProjectionsPage() {
             </button>
           ))}
         </div>
-        <Separator orientation="vertical" className="h-6" />
-        <div className="flex items-center gap-1.5">
+        <Separator orientation="vertical" className="hidden h-6 sm:block" />
+        <div className="flex gap-1.5 overflow-x-auto pb-1">
           {(["ALL", "STRONG_BUY", "BUY", "HOLD", "SELL", "STRONG_SELL"] as RecFilter[]).map((r) => (
             <button key={r} onClick={() => setRecFilter(r)}
               className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${recFilter === r ? "bg-primary text-primary-foreground" : "bg-muted/50 text-muted-foreground hover:bg-muted"}`}>
@@ -281,8 +306,43 @@ export default function ProjectionsPage() {
         </div>
       </div>
 
+      <div className="space-y-2 md:hidden">
+        {sorted.map(([id, proj]) => {
+          const player = playerById[id];
+          if (!player) return null;
+          const cfg = recConfig[proj.recommendation];
+          const isExpanded = expanded === id;
+          return (
+            <Card key={id} className={`modern-card border-border/50 ${isExpanded ? "border-primary/30" : ""}`} onClick={() => setExpanded(isExpanded ? null : id)}>
+              <CardContent className="space-y-3 py-3">
+                <div className="flex items-start gap-2">
+                  <Badge variant="outline" className={`shrink-0 text-xs ${posColors[player.position] ?? ""}`}>{player.position}</Badge>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold">{player.name}</p>
+                    <p className="text-xs text-muted-foreground">{isRedraft ? player.team : `${player.team} · Age ${player.age}`}</p>
+                  </div>
+                  <Badge variant="outline" className={`shrink-0 text-xs ${cfg?.color} ${cfg?.bg}`}>{cfg?.label}</Badge>
+                </div>
+                <div className="grid grid-cols-4 gap-2 rounded-lg bg-muted/30 p-2 text-center">
+                  <div><p className="text-[10px] uppercase text-muted-foreground">Edge</p><EdgeDeltaBadge delta={proj.edgeDelta} /></div>
+                  <div><p className="text-[10px] uppercase text-muted-foreground">Score</p><p className="text-sm font-bold">{proj.edgeScore}</p></div>
+                  <div><p className="text-[10px] uppercase text-muted-foreground">{isRedraft ? "ROS" : "1yr"}</p><p className="text-sm font-bold">{isRedraft ? Math.round(proj.currentValue) : `${proj.valueDelta1yr >= 0 ? "+" : ""}${Math.round(proj.valueDelta1yr * 100)}%`}</p></div>
+                  <div><p className="text-[10px] uppercase text-muted-foreground">FPPG</p><p className="text-sm font-bold">{proj.fppg?.toFixed(1) ?? "—"}</p></div>
+                </div>
+                {isExpanded && (
+                  <div className="border-t border-border/40 pt-3">
+                    <p className="mb-1 text-xs font-medium text-muted-foreground">Signals</p>
+                    {proj.signals.length ? proj.signals.map((signal, index) => <p key={index} className="text-xs text-foreground/80">{signal}</p>) : <p className="text-xs text-muted-foreground">No strong signals</p>}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          );
+        })}
+      </div>
+
       {/* Column headers */}
-      <div className="overflow-x-auto">
+      <div className="hidden overflow-x-auto md:block">
       <div className="grid grid-cols-12 gap-2 px-4 py-2 text-xs font-semibold bg-muted/30 rounded-lg border border-border/50 min-w-[800px]">
         <div className="col-span-4 text-muted-foreground">PLAYER</div>
         <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort("edgeDelta")} title="Value vs market consensus">
@@ -291,13 +351,13 @@ export default function ProjectionsPage() {
         <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort("edgeScore")} title="Overall edge rating (0-100)">
           SCORE {sortKey === "edgeScore" ? (sortDesc ? "↓" : "↑") : ""}
         </div>
-        <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort("valueDelta1yr")} title="Projected value change in 1 year">
-          1YR Δ {sortKey === "valueDelta1yr" ? (sortDesc ? "↓" : "↑") : ""}
+        <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort(isRedraft ? "currentValue" : "valueDelta1yr")} title={isRedraft ? "Rest-of-season market value" : "Projected value change in 1 year"}>
+          {isRedraft ? "ROS VAL" : "1YR Δ"} {sortKey === (isRedraft ? "currentValue" : "valueDelta1yr") ? (sortDesc ? "↓" : "↑") : ""}
         </div>
         <div className="col-span-1 text-center cursor-pointer hover:text-foreground transition-colors text-muted-foreground" onClick={() => toggleSort("fppg")} title="Fantasy points per game">
           FPPG {sortKey === "fppg" ? (sortDesc ? "↓" : "↑") : ""}
         </div>
-        <div className="col-span-2 text-center text-muted-foreground" title="Career trajectory & team fit scores">TRAJ / FIT</div>
+        <div className="col-span-2 text-center text-muted-foreground" title={isRedraft ? "Production and team-role scores" : "Career trajectory and team-fit scores"}>{isRedraft ? "PROD / ROLE" : "TRAJ / FIT"}</div>
         <div className="col-span-2 text-right text-muted-foreground" title="Buy/Sell recommendation">SIGNAL</div>
       </div>
 
@@ -326,7 +386,10 @@ export default function ProjectionsPage() {
                     </Badge>
                     <div className="min-w-0">
                       <p className="text-sm font-semibold truncate">{player.name}</p>
-                      <p className="text-xs text-muted-foreground">{player.team} · Age {player.age}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {isRedraft ? player.team : `${player.team} · Age ${player.age}`}
+                        {player.injuryStatus && player.injuryStatus !== "active" ? ` · ${player.injuryStatus.toUpperCase()}` : ""}
+                      </p>
                     </div>
                   </div>
 
@@ -341,11 +404,15 @@ export default function ProjectionsPage() {
                     <MiniBar value={proj.edgeScore} color={proj.edgeScore >= 60 ? "bg-green-500" : proj.edgeScore >= 40 ? "bg-yellow-500" : "bg-red-500"} />
                   </div>
 
-                  {/* 1yr value delta */}
+                  {/* Future delta (dynasty) or rest-of-season value (redraft) */}
                   <div className="col-span-1 text-center">
-                    <span className={`text-xs font-medium ${proj.valueDelta1yr >= 0.05 ? "text-green-400" : proj.valueDelta1yr <= -0.10 ? "text-red-400" : "text-muted-foreground"}`}>
-                      {deltaSign}{Math.round(proj.valueDelta1yr * 100)}%
-                    </span>
+                    {isRedraft ? (
+                      <span className="text-xs font-semibold font-mono">{Math.round(proj.currentValue)}</span>
+                    ) : (
+                      <span className={`text-xs font-medium ${proj.valueDelta1yr >= 0.05 ? "text-green-400" : proj.valueDelta1yr <= -0.10 ? "text-red-400" : "text-muted-foreground"}`}>
+                        {deltaSign}{Math.round(proj.valueDelta1yr * 100)}%
+                      </span>
+                    )}
                   </div>
 
                   {/* FPPG */}
@@ -364,9 +431,9 @@ export default function ProjectionsPage() {
                     )}
                   </div>
 
-                  {/* Trajectory + team fit mini bars */}
+                  {/* Production/role bars, plus dynasty trajectory icon */}
                   <div className="col-span-2 flex items-center gap-2">
-                    <TrajectoryIcon label={proj.trajectoryLabel} />
+                    {!isRedraft && <TrajectoryIcon label={proj.trajectoryLabel} />}
                     <div className="flex-1 space-y-0.5">
                       <div className="flex items-center gap-1">
                         <span className="text-xs text-muted-foreground w-4">P</span>
@@ -407,27 +474,43 @@ export default function ProjectionsPage() {
                       </ul>
                     </div>
 
-                    {/* Value trajectory */}
+                    {/* Value trajectory or redraft season snapshot */}
                     <div>
-                      <p className="text-xs font-medium text-muted-foreground mb-2">Value Trajectory</p>
-                      <div className="space-y-1.5">
-                        {[
-                          { label: "Now",   value: proj.currentValue },
-                          { label: "+1yr",  value: proj.projectedValue1yr },
-                          { label: "+3yr",  value: proj.projectedValue3yr },
-                        ].map(({ label, value }) => (
-                          <div key={label} className="flex items-center gap-2">
-                            <span className="text-xs text-muted-foreground w-8">{label}</span>
-                            <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                              <div
-                                className="h-full bg-primary/60 rounded-full"
-                                style={{ width: `${Math.min(100, value / 100)}%` }}
-                              />
-                            </div>
-                            <span className="text-xs font-mono text-muted-foreground w-12 text-right">{value.toLocaleString()}</span>
+                      <p className="text-xs font-medium text-muted-foreground mb-2">{isRedraft ? "Season Snapshot" : "Value Trajectory"}</p>
+                      {isRedraft ? (
+                        <div className="grid grid-cols-3 gap-2">
+                          <div className="rounded-md bg-muted/30 p-2">
+                            <p className="text-[10px] uppercase text-muted-foreground">ROS value</p>
+                            <p className="text-sm font-bold font-mono">{Math.round(proj.currentValue)}</p>
                           </div>
-                        ))}
-                      </div>
+                          <div className="rounded-md bg-muted/30 p-2">
+                            <p className="text-[10px] uppercase text-muted-foreground">FPPG</p>
+                            <p className="text-sm font-bold font-mono">{proj.fppg?.toFixed(1) ?? "—"}</p>
+                          </div>
+                          <div className="rounded-md bg-muted/30 p-2">
+                            <p className="text-[10px] uppercase text-muted-foreground">Vs pos avg</p>
+                            <p className={`text-sm font-bold font-mono ${fppgVsAvg !== null && fppgVsAvg > 0 ? "text-green-400" : fppgVsAvg !== null && fppgVsAvg < 0 ? "text-orange-400" : ""}`}>
+                              {fppgVsAvg === null ? "—" : `${fppgVsAvg > 0 ? "+" : ""}${fppgVsAvg}%`}
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5">
+                          {[
+                            { label: "Now", value: proj.currentValue },
+                            { label: "+1yr", value: proj.projectedValue1yr },
+                            { label: "+3yr", value: proj.projectedValue3yr },
+                          ].map(({ label, value }) => (
+                            <div key={label} className="flex items-center gap-2">
+                              <span className="text-xs text-muted-foreground w-8">{label}</span>
+                              <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                                <div className="h-full bg-primary/60 rounded-full" style={{ width: `${Math.min(100, value / 100)}%` }} />
+                              </div>
+                              <span className="text-xs font-mono text-muted-foreground w-12 text-right">{value.toLocaleString()}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
 
                       <div className="mt-2 flex items-center gap-2">
                         <span className="text-xs text-muted-foreground">On</span>

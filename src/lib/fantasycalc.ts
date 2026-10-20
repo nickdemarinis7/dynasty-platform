@@ -41,38 +41,65 @@ export interface FetchValuesParams {
   ppr?: number; // 0 = standard, 0.5 = half, 1 = full
 }
 
-/**
- * Fetches current dynasty values from FantasyCalc.
- * Returns a map keyed by Sleeper player ID for direct roster mapping,
- * plus a fallback map keyed by lowercased player name.
- */
-export async function getFantasyCalcValues(
-  params: FetchValuesParams = {}
-): Promise<{
+export interface FantasyCalcData {
   bySleeperId: Record<string, FantasyCalcValueEntry>;
   byName: Record<string, FantasyCalcValueEntry>;
-}> {
-  const {
-    isDynasty = true,
-    numQbs = 2,
-    numTeams = 12,
-    ppr = 1,
-  } = params;
+  picks: PickValueLookup;
+  fetchedAt: number;
+}
 
+export function isFantasyCalcPlayer(value: unknown): value is FantasyCalcPlayer {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  if (!item.player || typeof item.player !== "object" || typeof item.value !== "number" || !Number.isFinite(item.value)) return false;
+  const player = item.player as Record<string, unknown>;
+  return typeof player.name === "string" && player.name.length > 0 &&
+    typeof player.position === "string" && player.position.length > 0 &&
+    typeof item.overallRank === "number" && Number.isFinite(item.overallRank) &&
+    typeof item.positionRank === "number" && Number.isFinite(item.positionRank) &&
+    typeof item.trend30Day === "number" && Number.isFinite(item.trend30Day) &&
+    typeof item.redraftValue === "number" && Number.isFinite(item.redraftValue);
+}
+
+export function parseFantasyCalcResponse(payload: unknown): FantasyCalcPlayer[] {
+  if (!Array.isArray(payload)) throw new Error("FantasyCalc returned an invalid response");
+  const valid = payload.filter(isFantasyCalcPlayer);
+  if (valid.length === 0) throw new Error("FantasyCalc returned no valid values");
+  return valid;
+}
+
+async function fetchFantasyCalc(params: FetchValuesParams): Promise<FantasyCalcPlayer[]> {
+  const { isDynasty = true, numQbs = 2, numTeams = 12, ppr = 1 } = params;
   const url = `${FANTASYCALC_BASE_URL}?isDynasty=${isDynasty}&numQbs=${numQbs}&numTeams=${numTeams}&ppr=${ppr}`;
-
   const res = await fetch(url, { next: { revalidate: 3600 } });
-  if (!res.ok) {
-    throw new Error(`FantasyCalc API error: ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`FantasyCalc API error: ${res.status}`);
+  return parseFantasyCalcResponse(await res.json());
+}
 
-  const data: FantasyCalcPlayer[] = await res.json();
-
+export async function getFantasyCalcData(params: FetchValuesParams = {}): Promise<FantasyCalcData> {
+  const data = await fetchFantasyCalc(params);
   const bySleeperId: Record<string, FantasyCalcValueEntry> = {};
   const byName: Record<string, FantasyCalcValueEntry> = {};
+  const named: Record<string, number> = {};
+  const generic: Record<string, number> = {};
 
   for (const item of data) {
-    // Convert FantasyCalc values from 0-10000 scale to 0-100 scale
+    if (item.player.position === "PICK") {
+      const convertedValue = Math.round(item.value / 100);
+      const namedMatch = item.player.name.match(/^(\d{4})\s+Pick\s+(\d+)\.(\d+)$/);
+      if (namedMatch) {
+        const [, year, round, slot] = namedMatch;
+        named[`${year}-${Number(round)}-${Number(slot)}`] = convertedValue;
+      }
+      const genericMatch = item.player.name.match(/^(\d{4})\s+(1st|2nd|3rd|4th)$/);
+      if (genericMatch) {
+        const [, year, suffix] = genericMatch;
+        const round = Object.entries(ROUND_SUFFIX).find(([, candidate]) => candidate === suffix)?.[0];
+        if (round) generic[`${year}-${round}`] = convertedValue;
+      }
+      continue;
+    }
+
     const entry: FantasyCalcValueEntry = {
       value: Math.round(item.value / 100),
       overallRank: item.overallRank,
@@ -85,13 +112,25 @@ export async function getFantasyCalcValues(
       age: item.player.maybeAge,
       team: item.player.maybeTeam,
     };
-
-    if (item.player.sleeperId) {
-      bySleeperId[item.player.sleeperId] = entry;
-    }
+    if (item.player.sleeperId) bySleeperId[item.player.sleeperId] = entry;
     byName[normalizeName(item.player.name)] = entry;
   }
 
+  return { bySleeperId, byName, picks: { named, generic }, fetchedAt: Date.now() };
+}
+
+/**
+ * Fetches current dynasty values from FantasyCalc.
+ * Returns a map keyed by Sleeper player ID for direct roster mapping,
+ * plus a fallback map keyed by lowercased player name.
+ */
+export async function getFantasyCalcValues(
+  params: FetchValuesParams = {}
+): Promise<{
+  bySleeperId: Record<string, FantasyCalcValueEntry>;
+  byName: Record<string, FantasyCalcValueEntry>;
+}> {
+  const { bySleeperId, byName } = await getFantasyCalcData(params);
   return { bySleeperId, byName };
 }
 
@@ -128,37 +167,7 @@ const ROUND_SUFFIX: Record<number, string> = { 1: "1st", 2: "2nd", 3: "3rd", 4: 
 export async function getFantasyCalcPickValues(
   params: FetchValuesParams = {}
 ): Promise<PickValueLookup> {
-  const { isDynasty = true, numQbs = 2, numTeams = 12, ppr = 1 } = params;
-  const url = `${FANTASYCALC_BASE_URL}?isDynasty=${isDynasty}&numQbs=${numQbs}&numTeams=${numTeams}&ppr=${ppr}`;
-  const res = await fetch(url, { next: { revalidate: 3600 } });
-  if (!res.ok) throw new Error(`FantasyCalc API error: ${res.status}`);
-  const data: FantasyCalcPlayer[] = await res.json();
-
-  const named: Record<string, number> = {};
-  const generic: Record<string, number> = {};
-
-  for (const item of data) {
-    if (item.player.position !== "PICK") continue;
-    const name = item.player.name;
-    // Convert pick values from 0-10000 to 0-100 scale
-    const convertedValue = Math.round(item.value / 100);
-    // Named: "2026 Pick 1.03"
-    const namedMatch = name.match(/^(\d{4})\s+Pick\s+(\d+)\.(\d+)$/);
-    if (namedMatch) {
-      const [, year, round, slot] = namedMatch;
-      named[`${year}-${parseInt(round)}-${parseInt(slot)}`] = convertedValue;
-      continue;
-    }
-    // Generic: "2027 1st"
-    const genericMatch = name.match(/^(\d{4})\s+(1st|2nd|3rd|4th)$/);
-    if (genericMatch) {
-      const [, year, suffix] = genericMatch;
-      const round = Object.entries(ROUND_SUFFIX).find(([, s]) => s === suffix)?.[0];
-      if (round) generic[`${year}-${round}`] = convertedValue;
-    }
-  }
-
-  return { named, generic };
+  return (await getFantasyCalcData(params)).picks;
 }
 
 /**

@@ -8,32 +8,20 @@ import {
   getSleeperDraft,
   getSleeperDraftPicks,
   getSleeperTradedPicks,
-  type SleeperDraft,
+  findSleeperRosterForUser,
+  getSleeperLeagueMode,
 } from "@/lib/sleeper-api";
+import { buildDraftPickOrder, selectRelevantDraft } from "@/lib/draft-utils";
 import {
   getFantasyCalcValues,
   applyTePremium,
   normalizeName,
 } from "@/lib/fantasycalc";
 import { NextRequest } from "next/server";
+import type { SleeperUser } from "@/types";
 
-// Build a flat array of roster_ids indexed by (pick_no - 1).
-function buildPickOrder(draft: SleeperDraft): number[] {
-  const teams = draft.settings.teams;
-  const rounds = draft.settings.rounds;
-  const slotToRoster = draft.slot_to_roster_id || {};
-  const isSnake = draft.type === "snake";
-  const order: number[] = [];
-
-  for (let r = 1; r <= rounds; r++) {
-    const slots: number[] = [];
-    for (let s = 1; s <= teams; s++) slots.push(s);
-    if (isSnake && r % 2 === 0) slots.reverse();
-    for (const s of slots) {
-      order.push(slotToRoster[String(s)]);
-    }
-  }
-  return order;
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unexpected draft error";
 }
 
 export async function GET(request: NextRequest) {
@@ -47,27 +35,39 @@ export async function GET(request: NextRequest) {
       { status: 400 }
     );
   }
+  if (!/^\d+$/.test(leagueId) || username.length > 50) {
+    return Response.json({ error: "Invalid leagueId or username" }, { status: 400 });
+  }
 
   try {
-    const [user, league, leagueUsers, rosterData, allPlayers, drafts] =
+    const [user, league, leagueUsers, rosterData, drafts] =
       await Promise.all([
         getSleeperUser(username),
         getSleeperLeague(leagueId),
         getSleeperLeagueUsers(leagueId),
         getSleeperRosters(leagueId),
-        getSleeperPlayers(),
         getSleeperDrafts(leagueId),
       ]);
 
-    if (!drafts || drafts.length === 0) {
+    const myRoster = findSleeperRosterForUser(rosterData, user.user_id);
+    if (!myRoster) {
+      return Response.json(
+        { error: `Sleeper user "${user.username}" does not own a roster in this league` },
+        { status: 403 },
+      );
+    }
+
+    const selectedDraft = selectRelevantDraft(drafts, league.season);
+    if (!selectedDraft) {
       return Response.json({ error: "No draft found for this league" }, { status: 404 });
     }
 
-    const draftId = drafts[0].draft_id;
-    const [draft, picks, tradedPicks] = await Promise.all([
+    const draftId = selectedDraft.draft_id;
+    const [draft, picks, tradedPicks, allPlayers] = await Promise.all([
       getSleeperDraft(draftId),
       getSleeperDraftPicks(draftId),
       getSleeperTradedPicks(leagueId),
+      getSleeperPlayers(),
     ]);
 
     // League format for value tuning
@@ -80,10 +80,11 @@ export async function GET(request: NextRequest) {
           ? 0.5
           : 0;
 
+    const leagueMode = getSleeperLeagueMode(league);
     let fcValues: Awaited<ReturnType<typeof getFantasyCalcValues>> | null = null;
     try {
       fcValues = await getFantasyCalcValues({
-        isDynasty: true,
+        isDynasty: leagueMode !== "redraft",
         numQbs: superflex ? 2 : 1,
         numTeams: league.total_rosters || 12,
         ppr,
@@ -101,22 +102,21 @@ export async function GET(request: NextRequest) {
     };
 
     // Team name lookup
-    const userMap = new Map<string, any>();
+    const userMap = new Map<string, SleeperUser>();
     for (const u of leagueUsers) userMap.set(u.user_id, u);
-    const rosterToOwner = new Map<number, any>();
+    const rosterToOwner = new Map<number, SleeperUser | undefined>();
     for (const r of rosterData) {
-      rosterToOwner.set(r.roster_id, userMap.get(r.owner_id));
+      rosterToOwner.set(r.roster_id, r.owner_id ? userMap.get(r.owner_id) : undefined);
     }
     const teamName = (rosterId: number): string => {
       const owner = rosterToOwner.get(rosterId);
       return owner?.metadata?.team_name || owner?.display_name || `Team ${rosterId}`;
     };
 
-    const myRoster = rosterData.find((r: any) => r.owner_id === user.user_id);
-    const myRosterId = myRoster?.roster_id ?? null;
+    const myRosterId = myRoster.roster_id;
 
     // Draft order + pick math
-    const pickOrder = buildPickOrder(draft);
+    const pickOrder = buildDraftPickOrder(draft);
     const totalPicks = pickOrder.length;
     const picksMade = picks.length;
     const isComplete = draft.status === "complete" || picksMade >= totalPicks;
@@ -230,6 +230,7 @@ export async function GET(request: NextRequest) {
         season: draft.season,
         rounds: draft.settings.rounds,
         teams: draft.settings.teams,
+        leagueMode,
       },
       meta: {
         totalPicks,
@@ -253,7 +254,7 @@ export async function GET(request: NextRequest) {
       recentPicks,
       bestAvailable,
     });
-  } catch (err: any) {
-    return Response.json({ error: err.message }, { status: 500 });
+  } catch (error: unknown) {
+    return Response.json({ error: errorMessage(error) }, { status: 500 });
   }
 }

@@ -9,12 +9,10 @@
  * - League context
  */
 
-import type { Player } from "@/types";
-
 export interface ScoringFactors {
   valueGain: number;          // -100 to +100 (normalized value difference)
   positionalFit: number;      // 0-100 (how well it addresses roster needs)
-  acceptanceLikelihood: number; // 0-100 (probability opponent accepts)
+  acceptanceLikelihood: number; // 0-100 heuristic opponent-fit score
   windowAlignment: number;    // 0-100 (timeline compatibility)
   urgency: number;            // 0-100 (how critical this trade is)
 }
@@ -35,8 +33,17 @@ export interface ScoredRecommendation {
  * - Window alignment: 15% (timeline compatibility)
  * - Urgency: 10% (how critical the need is)
  */
-export function scoreRecommendation(factors: ScoringFactors): ScoredRecommendation {
-  const weights = {
+export function scoreRecommendation(
+  factors: ScoringFactors,
+  mode: "dynasty" | "keeper" | "redraft" = "dynasty",
+): ScoredRecommendation {
+  const weights = mode === "redraft" ? {
+    acceptanceLikelihood: 0.30,
+    positionalFit: 0.30,
+    valueGain: 0.20,
+    windowAlignment: 0,
+    urgency: 0.20,
+  } : {
     acceptanceLikelihood: 0.30,
     positionalFit: 0.25,
     valueGain: 0.20,
@@ -57,7 +64,7 @@ export function scoreRecommendation(factors: ScoringFactors): ScoredRecommendati
     factors.urgency * weights.urgency
   );
 
-  const explanation = buildExplanation(factors, weights, normalizedValueGain);
+  const explanation = buildExplanation(factors, mode);
 
   return {
     compositeScore: Math.max(0, Math.min(100, compositeScore)),
@@ -68,8 +75,7 @@ export function scoreRecommendation(factors: ScoringFactors): ScoredRecommendati
 
 function buildExplanation(
   factors: ScoringFactors,
-  weights: Record<string, number>,
-  normalizedValueGain: number
+  mode: "dynasty" | "keeper" | "redraft",
 ): string {
   const parts: string[] = [];
 
@@ -93,15 +99,15 @@ function buildExplanation(
 
   // Acceptance likelihood
   if (factors.acceptanceLikelihood >= 65) {
-    parts.push(`✓ Likely accepted (${Math.round(factors.acceptanceLikelihood)}%)`);
+    parts.push(`✓ Strong opponent fit (${Math.round(factors.acceptanceLikelihood)}/100)`);
   } else if (factors.acceptanceLikelihood >= 45) {
-    parts.push(`≈ Possible (${Math.round(factors.acceptanceLikelihood)}%)`);
+    parts.push(`≈ Moderate opponent fit (${Math.round(factors.acceptanceLikelihood)}/100)`);
   } else {
-    parts.push(`✗ Unlikely (${Math.round(factors.acceptanceLikelihood)}%)`);
+    parts.push(`✗ Weak opponent fit (${Math.round(factors.acceptanceLikelihood)}/100)`);
   }
 
   // Window alignment
-  if (factors.windowAlignment >= 70) {
+  if (mode !== "redraft" && factors.windowAlignment >= 70) {
     parts.push(`✓ Timelines align`);
   }
 

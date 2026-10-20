@@ -6,17 +6,24 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { Trash2, Clock, TrendingUp, Filter, Target, Shield, AlertTriangle, Trophy, Award, TrendingDown, Calendar, ArrowUpDown, BarChart3 } from "lucide-react";
+import { Trash2, Clock, TrendingUp, Target, Shield, Trophy, TrendingDown, Calendar, ArrowUpDown, BarChart3 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 type FilterType = "all" | "my-team" | "league";
 type SortKey = "date" | "fairness" | "value";
+
+function savedPickLabel(pick: { year: number; round: number; estimatedValue: number }): string {
+  if (pick.year <= 0 || pick.round <= 0) return `Legacy pick (${pick.estimatedValue.toLocaleString()})`;
+  const round = pick.round === 1 ? "1st" : pick.round === 2 ? "2nd" : pick.round === 3 ? "3rd" : `${pick.round}th`;
+  return `${pick.year} ${round} (${pick.estimatedValue.toLocaleString()})`;
+}
 
 export default function TradeHistoryPage() {
   const { savedTrades, removeSavedTrade, rosters, tradeAnalysis, myTeamId } = useAppStore();
   const [filter, setFilter] = useState<FilterType>("all");
   const [sortKey, setSortKey] = useState<SortKey>("date");
   const [sortDesc, setSortDesc] = useState(true);
+  const [renderedAt] = useState(() => Date.now());
 
   function getTeamName(id: string) {
     return rosters.find((r) => r.teamId === id)?.teamName || `Team ${id}`;
@@ -32,11 +39,11 @@ export default function TradeHistoryPage() {
   }
 
   function getRecommendationLabel(score: number) {
-    if (score > 20) return { label: "Strong Decline", color: "text-red-400 bg-red-500/10 border-red-500/30" };
-    if (score > 8) return { label: "Slight Decline", color: "text-orange-400 bg-orange-500/10 border-orange-500/30" };
+    if (score > 20) return { label: "Strong Accept", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30" };
+    if (score > 8) return { label: "Slight Accept", color: "text-blue-400 bg-blue-500/10 border-blue-500/30" };
     if (score > -8) return { label: "Fair", color: "text-green-400 bg-green-500/10 border-green-500/30" };
-    if (score > -20) return { label: "Slight Accept", color: "text-blue-400 bg-blue-500/10 border-blue-500/30" };
-    return { label: "Strong Accept", color: "text-emerald-400 bg-emerald-500/10 border-emerald-500/30" };
+    if (score > -20) return { label: "Slight Decline", color: "text-orange-400 bg-orange-500/10 border-orange-500/30" };
+    return { label: "Strong Decline", color: "text-red-400 bg-red-500/10 border-red-500/30" };
   }
 
   // Filter and sort saved trades
@@ -56,9 +63,11 @@ export default function TradeHistoryPage() {
       } else if (sortKey === "fairness") {
         comparison = Math.abs(a.fairnessScore) - Math.abs(b.fairnessScore);
       } else if (sortKey === "value") {
-        const aTotal = a.teamAPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + a.teamAPickValues.reduce((sum, v) => sum + v, 0);
-        const bTotal = b.teamBPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + b.teamBPickValues.reduce((sum, v) => sum + v, 0);
-        comparison = (aTotal + bTotal) - (aTotal + bTotal);
+        const aTotal = a.teamAPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + a.teamAPicks.reduce((sum, p) => sum + p.estimatedValue, 0);
+        const aOtherTotal = a.teamBPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + a.teamBPicks.reduce((sum, p) => sum + p.estimatedValue, 0);
+        const bTotal = b.teamAPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + b.teamAPicks.reduce((sum, p) => sum + p.estimatedValue, 0);
+        const bOtherTotal = b.teamBPlayers.reduce((sum, p) => sum + (p.dynastyValue || 0), 0) + b.teamBPicks.reduce((sum, p) => sum + p.estimatedValue, 0);
+        comparison = (aTotal + aOtherTotal) - (bTotal + bOtherTotal);
       }
       return sortDesc ? -comparison : comparison;
     });
@@ -73,11 +82,11 @@ export default function TradeHistoryPage() {
     );
     const wins = myTrades.filter((trade) => {
       const isTeamA = trade.teamAId === myTeamId;
-      return isTeamA ? trade.fairnessScore < 0 : trade.fairnessScore > 0;
+      return isTeamA ? trade.fairnessScore > 0 : trade.fairnessScore < 0;
     }).length;
     const losses = myTrades.filter((trade) => {
       const isTeamA = trade.teamAId === myTeamId;
-      return isTeamA ? trade.fairnessScore > 0 : trade.fairnessScore < 0;
+      return isTeamA ? trade.fairnessScore < 0 : trade.fairnessScore > 0;
     }).length;
     const ties = myTrades.length - wins - losses;
     return { wins, losses, ties, total: myTrades.length };
@@ -100,7 +109,7 @@ export default function TradeHistoryPage() {
     
     const tradesWithScore = myTrades.map((trade) => {
       const isTeamA = trade.teamAId === myTeamId;
-      const myScore = isTeamA ? -trade.fairnessScore : trade.fairnessScore;
+      const myScore = isTeamA ? trade.fairnessScore : -trade.fairnessScore;
       return { trade, myScore };
     });
 
@@ -134,8 +143,7 @@ export default function TradeHistoryPage() {
   };
 
   function getTimeSince(timestamp: number) {
-    const now = Date.now();
-    const diff = now - timestamp;
+    const diff = renderedAt - timestamp;
     const days = Math.floor(diff / (1000 * 60 * 60 * 24));
     if (days === 0) return "Today";
     if (days === 1) return "Yesterday";
@@ -453,9 +461,9 @@ export default function TradeHistoryPage() {
                                 {p.position} {p.name}
                               </Badge>
                             ))}
-                            {trade.teamAPickValues.map((v, i) => (
-                              <Badge key={i} variant="outline" className="mr-1 text-sm">
-                                Pick ({v.toLocaleString()})
+                            {trade.teamAPicks.map((pick, i) => (
+                              <Badge key={`${pick.year}-${pick.round}-${pick.originalOwner}-${i}`} variant="outline" className="mr-1 text-sm">
+                                {savedPickLabel(pick)}
                               </Badge>
                             ))}
                           </div>
@@ -471,9 +479,9 @@ export default function TradeHistoryPage() {
                                 {p.position} {p.name}
                               </Badge>
                             ))}
-                            {trade.teamBPickValues.map((v, i) => (
-                              <Badge key={i} variant="outline" className="mr-1 text-sm">
-                                Pick ({v.toLocaleString()})
+                            {trade.teamBPicks.map((pick, i) => (
+                              <Badge key={`${pick.year}-${pick.round}-${pick.originalOwner}-${i}`} variant="outline" className="mr-1 text-sm">
+                                {savedPickLabel(pick)}
                               </Badge>
                             ))}
                           </div>

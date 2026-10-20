@@ -1,23 +1,140 @@
-import type { SleeperLeague, SleeperRoster, SleeperUser } from "@/types";
+import type { LeagueMode, SleeperLeague, SleeperRoster, SleeperUser } from "@/types";
 
 const SLEEPER_BASE_URL = "https://api.sleeper.app/v1";
+
+export function expectSleeperObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Sleeper returned invalid ${label} data`);
+  }
+  return value as Record<string, unknown>;
+}
+
+export function expectSleeperArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`Sleeper returned invalid ${label} data`);
+  return value;
+}
+
+export interface SleeperNFLState {
+  season: string;
+  week: number;
+  season_type: "pre" | "regular" | "post";
+}
+
+export function parseSleeperNFLState(payload: unknown): SleeperNFLState {
+  const state = expectSleeperObject(payload, "NFL state");
+  if (typeof state.season !== "string" || !/^\d{4}$/.test(state.season)) {
+    throw new Error("Sleeper NFL state is missing a valid season");
+  }
+  if (typeof state.week !== "number" || !Number.isFinite(state.week)) {
+    throw new Error("Sleeper NFL state is missing a valid week");
+  }
+  const seasonType = state.season_type;
+  return {
+    season: state.season,
+    week: Math.max(1, Math.min(18, Math.trunc(state.week))),
+    season_type: seasonType === "pre" || seasonType === "post" ? seasonType : "regular",
+  };
+}
+
+export function parseSleeperUser(payload: unknown): SleeperUser {
+  const data = expectSleeperObject(payload, "user");
+  if (typeof data.user_id !== "string" || typeof data.username !== "string") {
+    throw new Error("Sleeper user data is missing required fields");
+  }
+  return data as unknown as SleeperUser;
+}
+
+export function parseSleeperLeague(payload: unknown): SleeperLeague {
+  const data = expectSleeperObject(payload, "league");
+  if (typeof data.league_id !== "string" || typeof data.name !== "string") {
+    throw new Error("Sleeper league data is missing required fields");
+  }
+  if (!Array.isArray(data.roster_positions)) {
+    throw new Error("Sleeper league data is missing roster positions");
+  }
+  if (typeof data.total_rosters !== "number" || !Number.isFinite(data.total_rosters)) {
+    throw new Error("Sleeper league data is missing its team count");
+  }
+  return data as unknown as SleeperLeague;
+}
+
+export function parseSleeperLeagueList(payload: unknown): SleeperLeague[] {
+  return expectSleeperArray(payload, "league list").map((league) => parseSleeperLeague(league));
+}
+
+export function getSleeperLeagueMode(league: SleeperLeague): LeagueMode {
+  if (league.settings?.type === 2) return "dynasty";
+  if (league.settings?.type === 1) return "keeper";
+  return "redraft";
+}
+
+export function parseSleeperRosters(payload: unknown): SleeperRoster[] {
+  return expectSleeperArray(payload, "rosters").map((value) => {
+    const roster = expectSleeperObject(value, "roster");
+    if (typeof roster.roster_id !== "number" || !Number.isFinite(roster.roster_id)) {
+      throw new Error("Sleeper roster is missing its roster ID");
+    }
+    if (roster.owner_id !== null && typeof roster.owner_id !== "string") {
+      throw new Error("Sleeper roster has an invalid owner ID");
+    }
+    const players = roster.players ?? [];
+    const starters = roster.starters ?? [];
+    if (!Array.isArray(players) || !players.every((id) => typeof id === "string")) {
+      throw new Error("Sleeper roster has an invalid player list");
+    }
+    if (!Array.isArray(starters) || !starters.every((id) => typeof id === "string")) {
+      throw new Error("Sleeper roster has an invalid starter list");
+    }
+    return { ...roster, owner_id: roster.owner_id ?? null, players, starters } as unknown as SleeperRoster;
+  });
+}
+
+export function findSleeperRosterForUser(
+  rosters: SleeperRoster[],
+  userId: string,
+): SleeperRoster | undefined {
+  return rosters.find((roster) => roster.owner_id === userId);
+}
+
+export function parseSleeperLeagueUsers(payload: unknown): SleeperUser[] {
+  return expectSleeperArray(payload, "league users")
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value))
+    .filter((user) => typeof user.user_id === "string")
+    .map((user) => ({
+      ...user,
+      username: typeof user.username === "string" ? user.username : "Unknown",
+      display_name: typeof user.display_name === "string" ? user.display_name : "Unknown Manager",
+      avatar: typeof user.avatar === "string" ? user.avatar : "",
+    })) as unknown as SleeperUser[];
+}
+
+export async function getSleeperNFLState(): Promise<SleeperNFLState> {
+  const res = await fetch(`${SLEEPER_BASE_URL}/state/nfl`, { next: { revalidate: 300 } });
+  if (!res.ok) throw new Error("Failed to fetch NFL state");
+  return parseSleeperNFLState(await res.json());
+}
+
+export function getCurrentNFLSeason(date: Date = new Date()): string {
+  const year = date.getFullYear();
+  return String(date.getMonth() < 2 ? year - 1 : year);
+}
 
 export async function getSleeperUser(username: string): Promise<SleeperUser> {
   const res = await fetch(`${SLEEPER_BASE_URL}/user/${username}`);
   if (!res.ok) throw new Error(`User "${username}" not found`);
-  return res.json();
+  return parseSleeperUser(await res.json());
 }
 
 export async function getSleeperLeagues(
   userId: string,
   sport: string = "nfl",
-  season: string = "2025"
+  season: string = getCurrentNFLSeason()
 ): Promise<SleeperLeague[]> {
   const res = await fetch(
     `${SLEEPER_BASE_URL}/user/${userId}/leagues/${sport}/${season}`
   );
   if (!res.ok) throw new Error("Failed to fetch leagues");
-  return res.json();
+  return parseSleeperLeagueList(await res.json());
 }
 
 export async function getSleeperLeague(
@@ -25,7 +142,7 @@ export async function getSleeperLeague(
 ): Promise<SleeperLeague> {
   const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}`);
   if (!res.ok) throw new Error("Failed to fetch league");
-  return res.json();
+  return parseSleeperLeague(await res.json());
 }
 
 export async function getSleeperRosters(
@@ -33,7 +150,7 @@ export async function getSleeperRosters(
 ): Promise<SleeperRoster[]> {
   const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}/rosters`);
   if (!res.ok) throw new Error("Failed to fetch rosters");
-  return res.json();
+  return parseSleeperRosters(await res.json());
 }
 
 export async function getSleeperLeagueUsers(
@@ -41,13 +158,13 @@ export async function getSleeperLeagueUsers(
 ): Promise<SleeperUser[]> {
   const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}/users`);
   if (!res.ok) throw new Error("Failed to fetch league users");
-  return res.json();
+  return parseSleeperLeagueUsers(await res.json());
 }
 
-export async function getSleeperDrafts(leagueId: string) {
+export async function getSleeperDrafts(leagueId: string): Promise<SleeperDraft[]> {
   const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}/drafts`);
   if (!res.ok) throw new Error("Failed to fetch drafts");
-  return res.json();
+  return expectSleeperArray(await res.json(), "drafts") as SleeperDraft[];
 }
 
 export interface SleeperDraft {
@@ -88,7 +205,7 @@ export async function getSleeperDraft(draftId: string): Promise<SleeperDraft> {
     cache: "no-store",
   });
   if (!res.ok) throw new Error("Failed to fetch draft");
-  return res.json();
+  return expectSleeperObject(await res.json(), "draft") as unknown as SleeperDraft;
 }
 
 export async function getSleeperDraftPicks(
@@ -98,15 +215,23 @@ export async function getSleeperDraftPicks(
     cache: "no-store",
   });
   if (!res.ok) throw new Error("Failed to fetch draft picks");
-  return res.json();
+  return expectSleeperArray(await res.json(), "draft picks") as SleeperDraftPick[];
 }
 
-export async function getSleeperTradedPicks(leagueId: string) {
+export interface SleeperTradedPick {
+  season: string;
+  round: number;
+  roster_id: number;
+  previous_owner_id: number;
+  owner_id: number;
+}
+
+export async function getSleeperTradedPicks(leagueId: string): Promise<SleeperTradedPick[]> {
   const res = await fetch(
     `${SLEEPER_BASE_URL}/league/${leagueId}/traded_picks`
   );
   if (!res.ok) throw new Error("Failed to fetch traded picks");
-  return res.json();
+  return expectSleeperArray(await res.json(), "traded picks") as SleeperTradedPick[];
 }
 
 export interface SleeperTransaction {
@@ -114,7 +239,7 @@ export interface SleeperTransaction {
   type: string; // "trade", "waiver", "free_agent", etc.
   status: "complete" | "pending" | "cancelled";
   metadata: {
-    [key: string]: any;
+    [key: string]: unknown;
   };
   roster_ids: number[];
   adds: {
@@ -123,9 +248,13 @@ export interface SleeperTransaction {
   drops: {
     [playerId: string]: number; // player_id -> roster_id
   };
-  draft_picks: {
-    [pickId: string]: number; // pick_id -> roster_id
-  };
+  draft_picks: Array<{
+    season: string;
+    round: number;
+    roster_id: number;
+    previous_owner_id: number;
+    owner_id: number;
+  }>;
   waiver_budget: {
     [rosterId: string]: number;
   };
@@ -135,19 +264,21 @@ export interface SleeperTransaction {
 
 export async function getSleeperTransactions(leagueId: string, week: number): Promise<SleeperTransaction[]> {
   // Fetch transactions for a specific week
-  const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}/transactions/${week}`);
+  const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}/transactions/${week}`, {
+    next: { revalidate: 3600 },
+  });
   if (!res.ok) return [];
-  const data = await res.json();
-  return Array.isArray(data) ? data : [];
+  return expectSleeperArray(await res.json(), "transactions") as SleeperTransaction[];
 }
 
 export async function getSleeperLeagueInfo(leagueId: string): Promise<{ season: string; previous_league_id: string | null }> {
   const res = await fetch(`${SLEEPER_BASE_URL}/league/${leagueId}`);
   if (!res.ok) throw new Error("Failed to fetch league info");
-  const data = await res.json();
+  const data = expectSleeperObject(await res.json(), "league info");
+  if (typeof data.season !== "string") throw new Error("Sleeper league info is missing its season");
   return {
     season: data.season,
-    previous_league_id: data.previous_league_id || null,
+    previous_league_id: typeof data.previous_league_id === "string" ? data.previous_league_id : null,
   };
 }
 
@@ -166,7 +297,7 @@ export async function getSleeperPlayers(): Promise<
 > {
   const res = await fetch(`${SLEEPER_BASE_URL}/players/nfl`);
   if (!res.ok) throw new Error("Failed to fetch players");
-  return res.json();
+  return expectSleeperObject(await res.json(), "players") as unknown as Awaited<ReturnType<typeof getSleeperPlayers>>;
 }
 
 export function mapSleeperPositions(positions: string[]): {

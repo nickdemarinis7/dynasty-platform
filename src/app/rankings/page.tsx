@@ -5,21 +5,13 @@ import { useAppStore } from "@/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { DEFAULT_DYNASTY_VALUES, getTeamWindowLabel } from "@/lib/player-values";
-import { buildLeagueContext } from "@/lib/trade-engine";
-import { optimizeLineup } from "@/lib/lineup-optimizer";
-import { getCachedProjections, getCurrentNFLWeek } from "@/lib/projections-cache";
+import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
+import { buildLeagueContext, optimizeLineup } from "@/lib/analytics";
+import { getAuthoritativeNFLWeek, getCachedProjections } from "@/lib/projections-cache";
 import type { PlayerProjection } from "@/lib/projections-api";
-import type { Player, TeamRoster } from "@/types";
-import { Crown, Trophy, TrendingUp, TrendingDown, BarChart3, Activity, Info, Zap, Target } from "lucide-react";
+import type { Player } from "@/types";
+import { Crown, Trophy, TrendingUp, BarChart3, Activity, Zap, Target } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-const positionColors: Record<string, string> = {
-  QB: "bg-red-500/20 text-red-400 border-red-500/30",
-  RB: "bg-green-500/20 text-green-400 border-green-500/30",
-  WR: "bg-blue-500/20 text-blue-400 border-blue-500/30",
-  TE: "bg-orange-500/20 text-orange-400 border-orange-500/30",
-};
 
 const posBarColors: Record<string, string> = {
   QB: "bg-red-500",
@@ -36,21 +28,17 @@ export default function RankingsPage() {
   const [sortBy, setSortBy] = useState<SortField>("overall");
   const [projections, setProjections] = useState<Record<string, PlayerProjection>>({});
   const [currentWeek, setCurrentWeek] = useState<{ season: number; week: number } | null>(null);
-  const [projectionsLoading, setProjectionsLoading] = useState(true);
 
   // Fetch projections on mount
   useEffect(() => {
     async function fetchProjections() {
       try {
-        setProjectionsLoading(false);
-        const nflWeek = getCurrentNFLWeek();
+        const nflWeek = await getAuthoritativeNFLWeek();
         setCurrentWeek(nflWeek);
-        const projs = await getCachedProjections(nflWeek.season, nflWeek.week);
+        const projs = await getCachedProjections(nflWeek.season, nflWeek.week, nflWeek.seasonType);
         setProjections(projs);
       } catch (error) {
         console.error("Failed to fetch projections:", error);
-      } finally {
-        setProjectionsLoading(false);
       }
     }
     fetchProjections();
@@ -150,27 +138,23 @@ export default function RankingsPage() {
       });
   }, [rosters, leagueSettings, leagueCtx, projections, currentWeek, sortBy]);
 
-  const { leagueAvgValue, leagueAvgStarters, leagueAvgDepth, leagueAvgProjection } = useMemo(() => {
+  const { leagueAvgValue, leagueAvgStarters, leagueAvgDepth } = useMemo(() => {
     if (teamRankings.length === 0) return { 
       leagueAvgValue: 1, 
       leagueAvgStarters: 1, 
       leagueAvgDepth: 1,
-      leagueAvgProjection: 1 
     };
     const n = teamRankings.length;
     return {
       leagueAvgValue: Math.max(teamRankings.reduce((s, t) => s + t.total, 0) / n, 1),
       leagueAvgStarters: Math.max(teamRankings.reduce((s, t) => s + t.starterValue, 0) / n, 1),
       leagueAvgDepth: Math.max(teamRankings.reduce((s, t) => s + t.depthValue, 0) / n, 1),
-      leagueAvgProjection: Math.max(teamRankings.reduce((s, t) => s + t.weeklyProjection, 0) / n, 1),
     };
   }, [teamRankings]);
 
   const getRating = (v: number) => Math.min(99, Math.round((v / leagueAvgValue) * 65));
   const getStRating = (v: number) => Math.min(99, Math.round((v / leagueAvgStarters) * 65));
   const getDpRating = (v: number) => Math.min(99, Math.round((v / leagueAvgDepth) * 65));
-  const getProjRating = (v: number) => Math.min(99, Math.round((v / leagueAvgProjection) * 65));
-
   const getRatingColor = (r: number) => {
     if (r >= 88) return "text-green-400";
     if (r >= 74) return "text-emerald-400";
@@ -204,7 +188,7 @@ export default function RankingsPage() {
       <div>
         <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Power Rankings</h1>
         <p className="text-muted-foreground mt-2 text-base sm:text-lg">
-          Dynasty rankings based on roster value and weekly projections
+          {leagueSettings?.mode === "redraft" ? "Redraft" : "Dynasty"} rankings based on roster value and weekly projections
         </p>
         {myTeam && (
           <div className="mt-4 flex items-center gap-4 text-sm">
@@ -220,7 +204,7 @@ export default function RankingsPage() {
       </div>
 
       {/* Top 3 Podium */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {teamRankings.slice(0, 3).map((team, idx) => {
           const rating = getRating(team.total);
           return (
@@ -254,9 +238,9 @@ export default function RankingsPage() {
                   </p>
                   <p className="text-xs text-muted-foreground mb-3">{team.roster.ownerName}</p>
                   
-                  <div className="flex items-center gap-4 mb-3">
+                  <div className="flex items-center justify-center gap-4 mb-3">
                     <div className="text-center">
-                      <p className={`text-3xl font-black tabular-nums ${getRatingColor(rating)}`}>
+                      <p className={`text-2xl sm:text-3xl font-black tabular-nums ${getRatingColor(rating)}`}>
                         {rating}
                       </p>
                       <p className="text-[10px] text-muted-foreground">Overall</p>
@@ -284,8 +268,8 @@ export default function RankingsPage() {
       {/* Sort Controls */}
       <Card>
         <CardContent className="py-4">
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground mr-2">Sort by:</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs sm:text-sm text-muted-foreground mr-2">Sort by:</span>
             {[
               { value: "overall" as const, label: "Overall Value", icon: BarChart3 },
               { value: "starters" as const, label: "Starters", icon: Target },
@@ -297,7 +281,7 @@ export default function RankingsPage() {
                 key={option.value}
                 onClick={() => setSortBy(option.value)}
                 className={cn(
-                  "px-3 py-1.5 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5",
+                  "px-2 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors flex items-center gap-1 sm:gap-1.5",
                   sortBy === option.value
                     ? "bg-primary text-primary-foreground"
                     : "bg-muted hover:bg-muted/80"
@@ -325,7 +309,35 @@ export default function RankingsPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
-          <div className="px-6 py-3 border-b border-border grid grid-cols-12 gap-4 text-xs text-muted-foreground font-medium">
+          <div className="divide-y divide-border/50 md:hidden">
+            {teamRankings.map((team, idx) => {
+              const overallRating = getRating(team.total);
+              return (
+                <div key={team.roster.teamId} className={cn("space-y-3 px-4 py-4", team.roster.teamId === myTeamId && "bg-primary/5")}>
+                  <div className="flex items-start gap-3">
+                    <span className={cn("pt-0.5 text-sm font-bold", idx === 0 ? "text-yellow-400" : "text-muted-foreground")}>#{idx + 1}</span>
+                    <div className="min-w-0 flex-1">
+                      <p className="flex items-center gap-1.5 truncate text-sm font-semibold">
+                        {team.roster.teamName}
+                        {team.roster.teamId === myTeamId && <Crown className="h-3.5 w-3.5 shrink-0 text-yellow-500" />}
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">{team.roster.ownerName}</p>
+                    </div>
+                    <Badge variant="outline" className={cn("shrink-0 text-[10px]", team.windowColor)}>{team.windowLabel}</Badge>
+                  </div>
+                  <div className="grid grid-cols-4 gap-2 rounded-lg bg-muted/30 p-2 text-center">
+                    <div><p className="text-[10px] uppercase text-muted-foreground">Overall</p><p className={cn("text-sm font-black", getRatingColor(overallRating))}>{overallRating}</p></div>
+                    <div><p className="text-[10px] uppercase text-muted-foreground">Starters</p><p className="text-sm font-bold">{getStRating(team.starterValue)}</p></div>
+                    <div><p className="text-[10px] uppercase text-muted-foreground">Depth</p><p className="text-sm font-bold">{getDpRating(team.depthValue)}</p></div>
+                    <div><p className="text-[10px] uppercase text-muted-foreground">{currentWeek ? `W${currentWeek.week}` : "Avg age"}</p><p className="text-sm font-bold">{currentWeek ? (team.weeklyProjection > 0 ? team.weeklyProjection.toFixed(1) : "—") : (team.avgAge > 0 ? team.avgAge.toFixed(1) : "—")}</p></div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="hidden overflow-x-auto md:block">
+          <div className="px-4 sm:px-6 py-3 border-b border-border grid grid-cols-12 gap-2 sm:gap-4 text-xs text-muted-foreground font-medium min-w-[700px]">
             <div className="col-span-1">#</div>
             <div className="col-span-3">Team</div>
             <div className="col-span-1 text-right">Overall</div>
@@ -340,13 +352,11 @@ export default function RankingsPage() {
             const overallRating = getRating(team.total);
             const starterRating = getStRating(team.starterValue);
             const depthRating = getDpRating(team.depthValue);
-            const projRating = getProjRating(team.weeklyProjection);
-
             return (
               <div
                 key={team.roster.teamId}
                 className={cn(
-                  "px-6 py-4 border-b border-border/50 grid grid-cols-12 gap-4 items-center hover:bg-muted/50 transition-colors",
+                  "px-4 sm:px-6 py-4 border-b border-border/50 grid grid-cols-12 gap-2 sm:gap-4 items-center hover:bg-muted/50 transition-colors min-w-[700px]",
                   team.roster.teamId === myTeamId && "bg-primary/5"
                 )}
               >
@@ -500,6 +510,7 @@ export default function RankingsPage() {
               </div>
             );
           })}
+          </div>
         </CardContent>
       </Card>
     </div>

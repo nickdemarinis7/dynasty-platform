@@ -15,10 +15,13 @@ export interface RosterSlot {
   count: number;
 }
 
+export type LeagueMode = "dynasty" | "keeper" | "redraft";
+
 export interface LeagueSettings {
   id: string;
   name: string;
   platform: "sleeper" | "espn" | "yahoo" | "manual";
+  mode: LeagueMode;
   teamCount: number;
   rosterSlots: RosterSlot[];
   scoringType: "ppr" | "half_ppr" | "standard";
@@ -102,6 +105,10 @@ export interface SleeperUser {
   username: string;
   display_name: string;
   avatar: string;
+  metadata?: {
+    team_name?: string;
+    [key: string]: unknown;
+  };
 }
 
 export interface SleeperLeague {
@@ -116,7 +123,7 @@ export interface SleeperLeague {
 
 export interface SleeperRoster {
   roster_id: number;
-  owner_id: string;
+  owner_id: string | null;
   players: string[];
   starters: string[];
 }

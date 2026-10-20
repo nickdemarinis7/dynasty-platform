@@ -6,27 +6,27 @@ import { Button } from "@/components/ui/button";
 import { ArrowRightLeft, Users, TrendingUp, Settings, Crown, Zap, Trophy, ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 
 export default function Home() {
   const { leagueSettings, rosters, myTeamId, personalValues } = useAppStore();
 
   const myRoster = rosters.find((r) => r.teamId === myTeamId);
 
-  const getPlayerValue = (player: { id: string; name: string; dynastyValue: number }) => {
-    if (personalValues[player.id]) return personalValues[player.id];
+  const getPlayerValue = useCallback((player: { id: string; name: string; dynastyValue: number }) => {
+    if (personalValues[player.id] !== undefined) return personalValues[player.id];
     return player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
-  };
+  }, [personalValues]);
 
-  const getRosterValue = (roster: typeof rosters[0]) => {
+  const getRosterValue = useCallback((roster: typeof rosters[0]) => {
     return roster.players.reduce((sum, p) => sum + getPlayerValue(p), 0);
-  };
+  }, [getPlayerValue]);
 
-  const getAverageAge = (roster: typeof rosters[0]) => {
+  const getAverageAge = useCallback((roster: typeof rosters[0]) => {
     const ages = roster.players.filter((p) => p.age > 0).map((p) => p.age);
     if (ages.length === 0) return 0;
     return ages.reduce((sum, age) => sum + age, 0) / ages.length;
-  };
+  }, []);
 
   const { myRank, myValue, myAvgAge, topPlayers } = useMemo(() => {
     if (!myRoster || rosters.length === 0) {
@@ -42,14 +42,16 @@ export default function Home() {
       .slice(0, 5);
 
     return { myRank, myValue, myAvgAge, topPlayers };
-  }, [myRoster, rosters, myTeamId, personalValues]);
+  }, [myRoster, rosters, myTeamId, getAverageAge, getPlayerValue, getRosterValue]);
 
   return (
     <div className="space-y-8">
       <div>
         <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Dashboard</h1>
         <p className="text-muted-foreground mt-2 text-base sm:text-lg">
-          Dynasty trade simulator &amp; recommendation engine
+          {leagueSettings
+            ? `${leagueSettings.mode === "redraft" ? "Redraft" : leagueSettings.mode === "keeper" ? "Keeper" : "Dynasty"} trade simulator & recommendation engine`
+            : "Trade intelligence for dynasty and redraft leagues"}
         </p>
       </div>
 
@@ -103,7 +105,9 @@ export default function Home() {
               </CardHeader>
               <CardContent>
                 <div className="text-2xl font-bold font-mono">{myValue.toLocaleString()}</div>
-                <p className="text-xs text-muted-foreground">Total dynasty value</p>
+                <p className="text-xs text-muted-foreground">
+                  Total {leagueSettings.mode === "redraft" ? "rest-of-season" : "dynasty"} value
+                </p>
               </CardContent>
             </Card>
           </div>

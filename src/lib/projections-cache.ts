@@ -10,6 +10,35 @@ import { getWeeklyProjections, getCurrentNFLWeek as _getCurrentNFLWeek, type Pla
 // Re-export for convenience
 export { getCurrentNFLWeek } from "./projections-api";
 
+export interface CurrentNFLWeek {
+  season: number;
+  week: number;
+  isPlayoffs: boolean;
+  seasonType: "pre" | "regular" | "post";
+  source: "sleeper" | "calendar_fallback";
+}
+
+let stateCache: { data: CurrentNFLWeek; timestamp: number } | null = null;
+
+export async function getAuthoritativeNFLWeek(): Promise<CurrentNFLWeek> {
+  if (stateCache && Date.now() - stateCache.timestamp < 5 * 60 * 1000) return stateCache.data;
+  try {
+    const res = await fetch("/api/sleeper/state");
+    if (!res.ok) throw new Error("NFL state request failed");
+    const data = await res.json() as CurrentNFLWeek;
+    if (!Number.isInteger(data.season) || !Number.isInteger(data.week)) throw new Error("Invalid NFL state");
+    stateCache = { data, timestamp: Date.now() };
+    return data;
+  } catch {
+    const fallback = _getCurrentNFLWeek();
+    return {
+      ...fallback,
+      seasonType: fallback.isPlayoffs ? "post" : "regular",
+      source: "calendar_fallback",
+    };
+  }
+}
+
 interface CacheEntry {
   data: Record<string, PlayerProjection>;
   timestamp: number;

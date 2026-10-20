@@ -12,6 +12,7 @@
  */
 
 import type { Player, LeagueSettings, PlayerSeasonStats, PlayerProjection, TrajectoryLabel } from "@/types";
+import { getEdgeScoreWeights } from "./projection-mode";
 import { getAssetTimeProfile } from "@/lib/trade-engine";
 
 // ============================================================================
@@ -369,14 +370,13 @@ export function computeTeamFitScore(
 // Composite Edge Score
 // ============================================================================
 
-const WEIGHTS = { trajectory: 0.35, production: 0.35, teamFit: 0.30 };
-
 export function computeEdgeScore(
   player: Player,
   settings: LeagueSettings,
   stats?: PlayerSeasonStats,
   teamAggs?: Record<string, TeamAggregates>
 ): PlayerProjection {
+  const isRedraft = settings.mode === "redraft";
   const current = player.dynastyValue || 0;
   const v1 = projectPlayerValue(player, 1);
   const v3 = projectPlayerValue(player, 3);
@@ -433,7 +433,7 @@ export function computeEdgeScore(
   // SF QB trajectory premium: young QBs in SF are dynasty cornerstones with the longest
   // productive shelf of any position. FantasyCalc lags 3-6 months on emerging starters.
   let trajectoryScoreAdj = trajectoryScore;
-  if (player.position === "QB" && settings.superflex && current >= 20) {
+  if (!isRedraft && player.position === "QB" && settings.superflex && current >= 20) {
     const sfMultiplier =
       player.age <= 23 ? 1.35 :  // elite young SF cornerstone in the making
       player.age <= 26 ? 1.25 :  // developing starter with huge ceiling
@@ -442,10 +442,11 @@ export function computeEdgeScore(
     trajectoryScoreAdj = Math.min(100, trajectoryScore * sfMultiplier);
   }
 
+  const weights = getEdgeScoreWeights(settings.mode);
   const edgeScore = Math.round(
-    trajectoryScoreAdj * WEIGHTS.trajectory +
-    productionScore * WEIGHTS.production +
-    teamFitScore * WEIGHTS.teamFit
+    trajectoryScoreAdj * weights.trajectory +
+    productionScore * weights.production +
+    teamFitScore * weights.teamFit
   );
 
   // Market score: dynastyValue is already on 0-100 scale (normalized at FantasyCalc import).
@@ -456,16 +457,16 @@ export function computeEdgeScore(
   // Human-readable signals
   const signals: string[] = [];
 
-  if (trajectoryLabel === "RISING") {
+  if (!isRedraft && trajectoryLabel === "RISING") {
     signals.push(`↑ Value +${Math.round(delta1 * 100)}% projected over 12 months`);
-  } else if (trajectoryLabel === "DECLINING") {
+  } else if (!isRedraft && trajectoryLabel === "DECLINING") {
     signals.push(`↓ Value -${Math.round(Math.abs(delta1) * 100)}% projected over 12 months`);
-  } else if (trajectoryLabel === "PEAK") {
+  } else if (!isRedraft && trajectoryLabel === "PEAK") {
     signals.push(`⚡ At or near peak — sell window may be opening`);
   }
 
   // SF QB cornerstone signal (before snap share signals)
-  if (player.position === "QB" && settings.superflex && current >= 20 && player.age <= 26) {
+  if (!isRedraft && player.position === "QB" && settings.superflex && current >= 20 && player.age <= 26) {
     signals.push(`🏰 SF Cornerstone — young franchise QB in superflex (highest dynasty shelf)`);
   }
 
@@ -478,8 +479,8 @@ export function computeEdgeScore(
 
   // Three-down RB
   if (player.position === "RB" && alphaModifier !== undefined && recPerGame !== undefined) {
-    if (alphaModifier >= 18) signals.push(`💪 Three-down workhorse — highest floor in dynasty (snap + carry + rec role)`);
-    else if (alphaModifier >= 10) signals.push(`✅ Lead back with receiving role — strong dynasty floor`);
+    if (alphaModifier >= 18) signals.push(`💪 Three-down workhorse — elite floor from snap, carry, and receiving role`);
+    else if (alphaModifier >= 10) signals.push(`✅ Lead back with receiving role — strong production floor`);
     else if (alphaModifier <= -10) signals.push(`🚨 Committee role — RB ceiling severely capped`);
   }
 
@@ -567,9 +568,9 @@ export function computeEdgeScore(
 
   if (completionPct !== undefined && player.position === "QB") {
     const pct = Math.round(completionPct * 100);
-    if (completionPct >= 0.68) signals.push(`🎯 ${pct}% completion — highly accurate, dynasty stable`);
+    if (completionPct >= 0.68) signals.push(`🎯 ${pct}% completion — highly accurate, stable production`);
     else if (completionPct >= 0.63) signals.push(`→ ${pct}% completion — solid accuracy`);
-    else if (completionPct < 0.58) signals.push(`⚠ ${pct}% completion — accuracy concern, dynasty value at risk`);
+    else if (completionPct < 0.58) signals.push(`⚠ ${pct}% completion — accuracy and production concern`);
   }
 
   if (tdRate !== undefined && player.position === "QB") {

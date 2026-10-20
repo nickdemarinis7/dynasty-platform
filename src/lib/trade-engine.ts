@@ -1,6 +1,7 @@
-import type { Player, TeamRoster, LeagueSettings, DraftPick } from "@/types";
-import { getPlayerValue, calculatePositionalNeed } from "@/lib/player-values";
-import { evaluateTradeLineupImpact } from "@/lib/lineup-optimizer";
+import type { Player, TeamRoster, LeagueSettings, DraftPick } from "../types/index.ts";
+import { getPlayerValue, calculatePositionalNeed } from "./player-values.ts";
+import { evaluateTradeLineupImpact } from "./lineup-optimizer.ts";
+import type { PlayerProjection } from "./projections-api.ts";
 
 // ============================================================================
 // Asset time profiles — how an asset's value splits between "win now" (next
@@ -252,6 +253,7 @@ export function buildLeagueContext(
   const ctxMap = new Map<string, TeamContext>();
 
   for (const x of raw) {
+    const isRedraft = leagueSettings.mode === "redraft";
     const rank = rankMap.get(x.roster.teamId)!;
     // Strength component: +1 best roster, -1 worst.
     const strengthComp = teams > 1 ? 1 - (2 * (rank - 1)) / (teams - 1) : 0;
@@ -259,9 +261,11 @@ export function buildLeagueContext(
     const ageComp = Math.max(-1, Math.min(1, (x.avgAge - leagueAvgAge) / 3));
 
     // Contention: mostly strength, modulated by age.
-    let contentionScore = 0.62 * strengthComp + 0.38 * ageComp;
+    let contentionScore = isRedraft ? strengthComp : 0.62 * strengthComp + 0.38 * ageComp;
     contentionScore = Math.max(-1, Math.min(1, contentionScore));
-    const winNowWeight = Math.max(0.12, Math.min(0.88, (contentionScore + 1) / 2));
+    const winNowWeight = isRedraft
+      ? 1
+      : Math.max(0.12, Math.min(0.88, (contentionScore + 1) / 2));
 
     const lbl = labelForWeight(winNowWeight);
     const positionNeeds = calculatePositionalNeed(
@@ -279,6 +283,7 @@ export function buildLeagueContext(
     // Dead zone assets: aging players in the moderate-value range losing value fast
     const deadZonePlayerIds = x.roster.players
       .filter((p) => {
+        if (isRedraft) return false;
         const cliff = DEAD_ZONE_CLIFF[p.position];
         if (!cliff) return false;
         const v = value(p);
@@ -300,12 +305,14 @@ export function buildLeagueContext(
       })
       .map((p) => p.id);
 
-    // Dynasty power score (0-100): long-run trajectory, not just current rank
-    // 40pts roster rank, 30pts age trajectory (younger = better), 20pts pick capital, 10pts balance
-    const rankScore = teams > 1 ? ((teams - rank) / (teams - 1)) * 40 : 20;
-    const ageScore = Math.min(30, Math.max(0, (28 - x.avgAge) * 3));
-    const pickScore = maxPickCapital > 0 ? (x.pickCapital / maxPickCapital) * 20 : 0;
-    const balanceScore = (1 - x.rosterTopHeaviness) * 10;
+    // Redraft measures current roster strength and balance only. Dynasty adds
+    // age trajectory and future draft capital to that foundation.
+    const rankScore = teams > 1
+      ? ((teams - rank) / (teams - 1)) * (isRedraft ? 80 : 40)
+      : (isRedraft ? 40 : 20);
+    const ageScore = isRedraft ? 0 : Math.min(30, Math.max(0, (28 - x.avgAge) * 3));
+    const pickScore = isRedraft ? 0 : maxPickCapital > 0 ? (x.pickCapital / maxPickCapital) * 20 : 0;
+    const balanceScore = (1 - x.rosterTopHeaviness) * (isRedraft ? 20 : 10);
     const dynastyPowerScore = Math.round(Math.max(0, Math.min(100, rankScore + ageScore + pickScore + balanceScore)));
 
     ctxMap.set(x.roster.teamId, {
@@ -398,6 +405,10 @@ export interface SmartTradeInput {
   teamARoster?: Player[];
   teamBRoster?: Player[];
   leagueSettings?: LeagueSettings;
+  projections?: Record<string, PlayerProjection>;
+  lineupPointEstimates?: Record<string, number>;
+  currentWeek?: number;
+  isPlayoffs?: boolean;
 }
 
 export interface SmartTradeResult {
@@ -410,7 +421,7 @@ export interface SmartTradeResult {
   fitB: number;
   fitAPct: number; // fit relative to team's roster value
   fitBPct: number;
-  acceptanceLikelihood: number; // 0-100, how likely Team B accepts
+  acceptanceLikelihood: number; // 0-100 heuristic offer-fit score for Team B
   verdictForA: { label: string; tone: "good" | "fair" | "bad" };
   reasoning: string[];
   needsAfterA: Record<string, number>;
@@ -420,12 +431,31 @@ export interface SmartTradeResult {
     pointsGained: number;
     receivedPlayerStarts: boolean;
     recommendation: "strong_upgrade" | "upgrade" | "lateral" | "downgrade" | "strong_downgrade";
+    source: "weekly_projection" | "season_fppg" | "market_value_estimate";
   };
   lineupImpactB?: {
     pointsGained: number;
     receivedPlayerStarts: boolean;
     recommendation: "strong_upgrade" | "upgrade" | "lateral" | "downgrade" | "strong_downgrade";
+    source: "weekly_projection" | "season_fppg" | "market_value_estimate";
   };
+}
+
+/**
+ * Applies a roster-spot/consolidation discount to packages. The best asset is
+ * valued in full; additional assets contribute progressively less because
+ * dynasty managers generally prefer one elite asset over an equal raw sum of
+ * replaceable pieces.
+ */
+export function packageAdjustedValue(values: number[]): number {
+  return [...values]
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => b - a)
+    .reduce((total, value, index) => {
+      if (index === 0) return total + value;
+      const multiplier = Math.max(0.75, 0.9 - (index - 1) * 0.05);
+      return total + value * multiplier;
+    }, 0);
 }
 
 export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
@@ -440,17 +470,23 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
     teamARoster,
     teamBRoster,
     leagueSettings,
+    projections,
+    lineupPointEstimates,
+    currentWeek,
+    isPlayoffs = false,
   } = input;
 
   const mv = (p: Player) => getPlayerValue(p, personalValues);
 
   // Raw market totals (what each side gives up)
-  const marketA =
-    aGivesPlayers.reduce((s, p) => s + mv(p), 0) +
-    aGivesPicks.reduce((s, p) => s + p.estimatedValue, 0);
-  const marketB =
-    bGivesPlayers.reduce((s, p) => s + mv(p), 0) +
-    bGivesPicks.reduce((s, p) => s + p.estimatedValue, 0);
+  const marketA = packageAdjustedValue([
+    ...aGivesPlayers.map(mv),
+    ...aGivesPicks.map((p) => p.estimatedValue),
+  ]);
+  const marketB = packageAdjustedValue([
+    ...bGivesPlayers.map(mv),
+    ...bGivesPicks.map((p) => p.estimatedValue),
+  ]);
 
   const marketDiff = marketB - marketA; // positive = A receives more raw value
   const marketMax = Math.max(marketA, marketB, 1);
@@ -478,7 +514,8 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
   const fitAPct = (fitA / Math.max(teamACtx.totalValue, 1)) * 100;
   const fitBPct = (fitB / Math.max(teamBCtx.totalValue, 1)) * 100;
 
-  // Acceptance likelihood for Team B: driven by their net (market + fit).
+  // Offer-fit score for Team B: driven by their net (market + fit). This is a
+  // ranking heuristic, not a calibrated probability of acceptance.
   // Base of 15: real dynasty trade acceptance on cold offers is 5-15%.
   // Market edge weighted 60% (value matters most), fit 40% (context helps but less).
   // Fit scaled 2x (not 4x) — a 5% roster improvement shouldn't add 20 points.
@@ -534,12 +571,22 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
       teamARoster,
       aGivesPlayers,
       bGivesPlayers,
-      leagueSettings
+      leagueSettings,
+      isPlayoffs,
+      currentWeek,
+      projections,
+      leagueSettings.scoringType === "standard" ? "std" : leagueSettings.scoringType,
+      lineupPointEstimates,
     );
     lineupImpactA = {
       pointsGained: impact.pointsGained,
       receivedPlayerStarts: impact.receivedPlayerStarts,
       recommendation: impact.recommendation,
+      source: projections && Object.keys(projections).length > 0
+        ? "weekly_projection"
+        : lineupPointEstimates && Object.keys(lineupPointEstimates).length > 0
+          ? "season_fppg"
+          : "market_value_estimate",
     };
   }
   
@@ -548,12 +595,22 @@ export function evaluateTrade(input: SmartTradeInput): SmartTradeResult {
       teamBRoster,
       bGivesPlayers,
       aGivesPlayers,
-      leagueSettings
+      leagueSettings,
+      isPlayoffs,
+      currentWeek,
+      projections,
+      leagueSettings.scoringType === "standard" ? "std" : leagueSettings.scoringType,
+      lineupPointEstimates,
     );
     lineupImpactB = {
       pointsGained: impact.pointsGained,
       receivedPlayerStarts: impact.receivedPlayerStarts,
       recommendation: impact.recommendation,
+      source: projections && Object.keys(projections).length > 0
+        ? "weekly_projection"
+        : lineupPointEstimates && Object.keys(lineupPointEstimates).length > 0
+          ? "season_fppg"
+          : "market_value_estimate",
     };
   }
 
@@ -698,11 +755,11 @@ function buildReasoning(i: ReasoningInput): string[] {
 
   // Acceptance read
   if (i.acceptanceLikelihood >= 65) {
-    out.push(`**${i.teamBCtx.teamName} is likely to accept** — it fits their ${i.teamBCtx.windowLabel.toLowerCase()} direction.`);
+    out.push(`**Strong fit for ${i.teamBCtx.teamName}** — it supports their ${i.teamBCtx.windowLabel.toLowerCase()} direction.`);
   } else if (i.acceptanceLikelihood <= 35) {
-    out.push(`**${i.teamBCtx.teamName} will likely reject** — it doesn't help their ${i.teamBCtx.windowLabel.toLowerCase()} plan. Sweeten the offer.`);
+    out.push(`**Weak fit for ${i.teamBCtx.teamName}** — it does not help their ${i.teamBCtx.windowLabel.toLowerCase()} plan. Sweeten the offer.`);
   } else {
-    out.push(`${i.teamBCtx.teamName} could go either way — a small sweetener may push it through.`);
+    out.push(`${i.teamBCtx.teamName} has a moderate fit — a small sweetener may improve the offer.`);
   }
 
   return out;

@@ -1,16 +1,16 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { useAppStore } from "@/store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
-import { getCachedProjections, getCurrentNFLWeek } from "@/lib/projections-cache";
+import { getAuthoritativeNFLWeek, getCachedProjections } from "@/lib/projections-cache";
 import type { PlayerProjection } from "@/lib/projections-api";
 import { cn } from "@/lib/utils";
-import { Search, TrendingUp, TrendingDown, ArrowUpDown, Filter, Activity, BarChart3, Info } from "lucide-react";
+import { Search, ArrowUpDown, Filter, Activity, BarChart3, Info } from "lucide-react";
 
 // Normalize any value to 0-100. Values > 150: FantasyCalc 0-10000 — divide by 100 and cap. Values 0-150: cap at 100.
 const normVal = (v: number): number =>
@@ -45,9 +45,9 @@ export default function ValuesPage() {
     async function fetchProjections() {
       try {
         setProjectionsLoading(true);
-        const nflWeek = getCurrentNFLWeek();
+        const nflWeek = await getAuthoritativeNFLWeek();
         setCurrentWeek(nflWeek);
-        const projs = await getCachedProjections(nflWeek.season, nflWeek.week);
+        const projs = await getCachedProjections(nflWeek.season, nflWeek.week, nflWeek.seasonType);
         setProjections(projs);
       } catch (error) {
         console.error("Failed to fetch projections:", error);
@@ -59,7 +59,7 @@ export default function ValuesPage() {
   }, []);
 
   // Get player projection
-  const getPlayerProjection = (playerId: string) => {
+  const getPlayerProjection = useCallback((playerId: string) => {
     const projection = projections[playerId];
     if (!projection?.stats) return null;
     
@@ -67,7 +67,7 @@ export default function ValuesPage() {
                         leagueSettings?.scoringType === "half_ppr" ? "pts_half_ppr" : "pts_std";
     
     return projection.stats[scoringType] || null;
-  };
+  }, [projections, leagueSettings?.scoringType]);
 
   // Build combined player list from store + defaults
   const allPlayers = useMemo(() => {
@@ -116,7 +116,7 @@ export default function ValuesPage() {
     }
 
     return playerList;
-  }, [players, projections, leagueSettings]);
+  }, [players, getPlayerProjection]);
 
   // Calculate position rankings
   const positionRankings = useMemo(() => {
@@ -130,10 +130,10 @@ export default function ValuesPage() {
   }, [allPlayers]);
 
   // Get position rank for a player
-  const getPositionRank = (player: typeof allPlayers[0]) => {
+  const getPositionRank = useCallback((player: typeof allPlayers[0]) => {
     const posPlayers = positionRankings[player.position] || [];
     return posPlayers.findIndex(p => p.id === player.id) + 1;
-  };
+  }, [positionRankings]);
 
   // Get value tier
   const getValueTier = (value: number) => {
@@ -210,7 +210,7 @@ export default function ValuesPage() {
     });
     
     return list;
-  }, [allPlayers, posFilter, teamFilter, tierFilter, search, sortField, sortDirection]);
+  }, [allPlayers, posFilter, teamFilter, tierFilter, search, sortField, sortDirection, getPositionRank]);
 
   // Toggle sort
   const toggleSort = (field: SortField) => {
@@ -227,7 +227,9 @@ export default function ValuesPage() {
       <div>
         <h1 className="text-3xl sm:text-4xl font-bold tracking-tight gradient-text">Player Values</h1>
         <p className="text-muted-foreground mt-2 text-base sm:text-lg">
-          Dynasty values from FantasyCalc based on ~1M real trades
+          {leagueSettings?.mode === "redraft"
+            ? "Rest-of-season values from FantasyCalc market data"
+            : "Dynasty values from FantasyCalc based on real trades"}
         </p>
         <div className="mt-4 flex flex-wrap items-center gap-3 sm:gap-4 text-xs sm:text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
@@ -324,8 +326,43 @@ export default function ValuesPage() {
       {/* Player List */}
       <Card className="modern-card">
         <CardContent className="p-0">
-          {/* Mobile: Add horizontal scroll */}
-          <div className="overflow-x-auto">
+          <div className="divide-y divide-border/50 md:hidden">
+            {filteredPlayers.map((player, idx) => {
+              const posRank = getPositionRank(player);
+              const injury = player.injuryStatus && player.injuryStatus !== "active"
+                ? player.injuryStatus.toUpperCase()
+                : null;
+
+              return (
+                <div key={player.id} className="flex items-center gap-3 px-4 py-3">
+                  <span className="w-7 shrink-0 text-xs font-medium text-muted-foreground">#{idx + 1}</span>
+                  <Badge variant="outline" className={cn("w-10 shrink-0 justify-center text-xs", positionColors[player.position] || "")}>
+                    {player.position}
+                  </Badge>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <p className="truncate text-sm font-semibold">{player.name}</p>
+                      {injury && <Badge variant="outline" className="shrink-0 px-1 text-[10px] text-orange-400">{injury}</Badge>}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {[player.team, player.age > 0 ? `${player.age}y` : null, `${player.position}${posRank}`].filter(Boolean).join(" · ")}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p className="font-mono text-sm font-semibold">{player.value.toLocaleString()}</p>
+                    {currentWeek && (
+                      <p className="text-xs text-green-500">W{currentWeek.week}: {player.projection?.toFixed(1) ?? "—"}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {filteredPlayers.length === 0 && (
+              <div className="px-4 py-10 text-center text-sm text-muted-foreground">No players found matching your filters</div>
+            )}
+          </div>
+
+          <div className="hidden overflow-x-auto md:block">
           <div className="px-4 sm:px-6 py-3 border-b border-border grid grid-cols-[auto_auto_1fr_auto_auto_auto] gap-2 sm:gap-4 text-xs text-muted-foreground font-medium min-w-[600px]">
             <div className="w-12">Rank</div>
             <div className="w-12">Pos</div>

@@ -1,15 +1,14 @@
 "use client";
 
 import { useAppStore } from "@/store";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
-import { optimizeLineup, getLineupDisplay } from "@/lib/lineup-optimizer";
-import { getCachedProjections, getCurrentNFLWeek } from "@/lib/projections-cache";
+import { optimizeLineup, getLineupDisplay } from "@/lib/analytics";
+import { getAuthoritativeNFLWeek, getCachedProjections } from "@/lib/projections-cache";
 import { cn } from "@/lib/utils";
-import { Crown, ArrowLeft, TrendingUp, User, Info, Flame, Package, AlertCircle, Activity } from "lucide-react";
+import { Crown, ArrowLeft, Flame, Package, Activity } from "lucide-react";
 import { useRouter, useParams } from "next/navigation";
 import { useMemo, useEffect, useState } from "react";
 import type { PlayerProjection } from "@/lib/projections-api";
@@ -42,9 +41,9 @@ export default function RosterDetailPage() {
     async function fetchProjections() {
       try {
         setProjectionsLoading(true);
-        const nflWeek = getCurrentNFLWeek();
+        const nflWeek = await getAuthoritativeNFLWeek();
         setCurrentWeek(nflWeek);
-        const projs = await getCachedProjections(nflWeek.season, nflWeek.week);
+        const projs = await getCachedProjections(nflWeek.season, nflWeek.week, nflWeek.seasonType);
         setProjections(projs);
       } catch (error) {
         console.error("Failed to fetch projections:", error);
@@ -56,12 +55,8 @@ export default function RosterDetailPage() {
   }, []);
 
   const getPlayerValue = (player: { id: string; name: string; dynastyValue: number }) => {
-    if (personalValues[player.id]) return personalValues[player.id];
+    if (personalValues[player.id] !== undefined) return personalValues[player.id];
     return player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
-  };
-
-  const getRosterValue = (roster: typeof rosters[0]) => {
-    return roster.players.reduce((sum, p) => sum + getPlayerValue(p), 0);
   };
 
   // Use lineup optimizer for accurate starters/bench
@@ -81,7 +76,6 @@ export default function RosterDetailPage() {
     );
   }, [roster, leagueSettings, projections, currentWeek]);
 
-  const starters = optimizedLineup?.starters || [];
   const bench = optimizedLineup?.bench || [];
   const totalProjectedPoints = optimizedLineup?.totalProjectedPoints || 0;
 
@@ -151,17 +145,6 @@ export default function RosterDetailPage() {
     return getLineupDisplay(roster.players, leagueSettings);
   }, [roster, leagueSettings, projections, currentWeek]);
 
-  // Position breakdown - must be before early return
-  const positionBreakdown = useMemo(() => {
-    if (!roster) return {};
-    const breakdown: Record<string, typeof roster.players> = {};
-    roster.players.forEach(p => {
-      if (!breakdown[p.position]) breakdown[p.position] = [];
-      breakdown[p.position].push(p);
-    });
-    return breakdown;
-  }, [roster]);
-
   // Get player's projected points
   const getPlayerProjection = (player: { id: string }) => {
     const projection = projections[player.id];
@@ -209,7 +192,7 @@ export default function RosterDetailPage() {
         </div>
         <Card>
           <CardContent className="py-12 text-center">
-            <p className="text-muted-foreground mb-4">This roster doesn't exist or hasn't been loaded.</p>
+            <p className="text-muted-foreground mb-4">This roster does not exist or has not been loaded.</p>
             <Button onClick={() => router.push("/rosters")}>
               <ArrowLeft className="h-4 w-4 mr-2" />
               Back to Rosters
@@ -220,10 +203,7 @@ export default function RosterDetailPage() {
     );
   }
 
-  const rosterValue = getRosterValue(roster);
   const isMyTeam = roster.teamId === myTeamId;
-  const startersValue = starters.reduce((sum, p) => sum + getPlayerValue(p), 0);
-  const benchValue = bench.reduce((sum, p) => sum + getPlayerValue(p), 0);
 
   return (
     <div className="space-y-6">

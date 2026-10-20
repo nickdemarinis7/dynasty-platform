@@ -1,5 +1,10 @@
 import { getSleeperUser, getSleeperLeagues } from "@/lib/sleeper-api";
 import { NextRequest } from "next/server";
+import type { SleeperLeague } from "@/types";
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unable to load leagues";
+}
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
@@ -12,23 +17,31 @@ export async function GET(request: NextRequest) {
   try {
     const user = await getSleeperUser(username);
 
-    // Fetch leagues from multiple seasons to find all dynasty leagues
+    // Search recent seasons in bounded parallel batches. Sequential requests
+    // made account connection unnecessarily slow, while one large burst risks
+    // upstream throttling.
     const currentYear = new Date().getFullYear();
     const seasons = Array.from({ length: 10 }, (_, i) => String(currentYear + 1 - i));
-    const allLeagues: any[] = [];
+    const allLeagues: Array<SleeperLeague & { season: string }> = [];
     const seenIds = new Set<string>();
 
-    for (const season of seasons) {
-      try {
-        const leagues = await getSleeperLeagues(user.user_id, "nfl", season);
+    for (let index = 0; index < seasons.length; index += 4) {
+      const batch = seasons.slice(index, index + 4);
+      const results = await Promise.all(batch.map(async (season) => {
+        try {
+          return { season, leagues: await getSleeperLeagues(user.user_id, "nfl", season) };
+        } catch {
+          return { season, leagues: [] as SleeperLeague[] };
+        }
+      }));
+
+      for (const { season, leagues } of results) {
         for (const league of leagues) {
           if (!seenIds.has(league.league_id)) {
             seenIds.add(league.league_id);
             allLeagues.push({ ...league, season });
           }
         }
-      } catch {
-        // Season might not exist yet, skip
       }
     }
 
@@ -37,7 +50,7 @@ export async function GET(request: NextRequest) {
       user,
       leagues: allLeagues,
     });
-  } catch (err: any) {
-    return Response.json({ error: err.message }, { status: 400 });
+  } catch (error: unknown) {
+    return Response.json({ error: errorMessage(error) }, { status: 400 });
   }
 }

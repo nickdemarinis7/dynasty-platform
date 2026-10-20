@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import type { PlayerSeasonStats } from "@/types";
+import { getCurrentNFLSeason } from "@/lib/sleeper-api";
 
 const STAT_FIELDS: (keyof PlayerSeasonStats)[] = [
   "pts_half_ppr", "pts_ppr", "tgt", "rec", "rec_yd", "rec_td",
@@ -20,7 +21,12 @@ function emptyStats(): PlayerSeasonStats {
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const season = searchParams.get("season") ?? "2025";
+  const season = searchParams.get("season") ?? getCurrentNFLSeason();
+  const seasonNumber = Number(season);
+  const maxSeason = Number(getCurrentNFLSeason()) + 1;
+  if (!/^20\d{2}$/.test(season) || seasonNumber < 2000 || seasonNumber > maxSeason) {
+    return NextResponse.json({ error: "Invalid season" }, { status: 400 });
+  }
   const weeks = 18; // regular season
 
   // Fetch all weeks in parallel

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { DEFAULT_DYNASTY_VALUES } from "@/lib/player-values";
 import { cn } from "@/lib/utils";
 import { Crown, Users, Search, TrendingUp, ArrowRight } from "lucide-react";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useRouter } from "next/navigation";
 
 export default function RostersPage() {
@@ -15,14 +15,14 @@ export default function RostersPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState<"value" | "name">("value");
 
-  const getPlayerValue = (player: { id: string; name: string; dynastyValue: number }) => {
-    if (personalValues[player.id]) return personalValues[player.id];
+  const getPlayerValue = useCallback((player: { id: string; name: string; dynastyValue: number }) => {
+    if (personalValues[player.id] !== undefined) return personalValues[player.id];
     return player.dynastyValue || DEFAULT_DYNASTY_VALUES[player.name] || 0;
-  };
+  }, [personalValues]);
 
-  const getRosterValue = (roster: typeof rosters[0]) => {
+  const getRosterValue = useCallback((roster: typeof rosters[0]) => {
     return roster.players.reduce((sum, p) => sum + getPlayerValue(p), 0);
-  };
+  }, [getPlayerValue]);
 
   const getPositionCounts = (roster: typeof rosters[0]) => {
     const counts: Record<string, number> = { QB: 0, RB: 0, WR: 0, TE: 0 };
@@ -44,7 +44,7 @@ export default function RostersPage() {
     if (rosters.length === 0) return 1;
     const total = rosters.reduce((sum, r) => sum + getRosterValue(r), 0);
     return Math.max(total / rosters.length, 1);
-  }, [rosters]);
+  }, [rosters, getRosterValue]);
 
   const sortedRosters = useMemo(() => {
     const filtered = rosters.filter(
@@ -56,7 +56,7 @@ export default function RostersPage() {
       if (sortBy === "value") return getRosterValue(b) - getRosterValue(a);
       return a.teamName.localeCompare(b.teamName);
     });
-  }, [rosters, searchQuery, sortBy]);
+  }, [rosters, searchQuery, sortBy, getRosterValue]);
 
   if (rosters.length === 0) {
     return (

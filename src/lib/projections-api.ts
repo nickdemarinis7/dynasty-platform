@@ -84,15 +84,17 @@ export async function getWeeklyProjections(
     const res = await fetch(url);
     
     if (!res.ok) {
-      console.warn(`Failed to fetch projections for ${season} week ${week}: ${res.status}`);
-      return {};
+      throw new Error(`Failed to fetch projections for ${season} week ${week}: ${res.status}`);
     }
     
-    const data = await res.json();
-    return data || {};
+    const data: unknown = await res.json();
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("Sleeper returned invalid weekly projections");
+    }
+    return data as Record<string, PlayerProjection>;
   } catch (error) {
     console.error(`Error fetching projections:`, error);
-    return {};
+    throw error;
   }
 }
 
@@ -118,8 +120,11 @@ export async function getPlayerSeasonProjections(
       return {};
     }
     
-    const data = await res.json();
-    return data || {};
+    const data: unknown = await res.json();
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("Sleeper returned invalid player projections");
+    }
+    return data as Record<number, PlayerProjection>;
   } catch (error) {
     console.error(`Error fetching player projections:`, error);
     return {};
