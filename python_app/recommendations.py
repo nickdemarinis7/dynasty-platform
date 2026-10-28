@@ -24,6 +24,7 @@ class Recommendation:
     confidence: str = "D"
     confidence_reasons: tuple[str, ...] = ()
     score_breakdown: tuple[tuple[str, float], ...] = ()
+    review_only: bool = False
 
 
 def _anchor_ids(roster: Roster, league: League) -> set[str]:
@@ -205,6 +206,21 @@ def _passes_quality_gates(
     return True
 
 
+def _passes_review_gates(result: TradeResult, user_context: TeamContext) -> bool:
+    """Allow useful conversation starters without presenting unsafe deals as recommendations."""
+    if result.acceptance_score < 35 or not result.lineup_a.received_player_starts:
+        return False
+    if not (-18 <= result.fairness <= 20):
+        return False
+    if result.lineup_a.points_gained < 0:
+        return False
+    if result.lineup_a.depth_change < -15:
+        return False
+    if user_context.window in {"Win Now", "Competing"} and result.lineup_a.after_resilience < 40:
+        return False
+    return True
+
+
 def _evidence(result: TradeResult, league: League, context: TeamContext, partner: Roster) -> tuple[tuple[str, ...], tuple[str, ...]]:
     playoff_note = f" · {context.playoff_probability}% playoff odds" if context.playoff_probability is not None else ""
     deadline_note = f" · {context.deadline_status}" if context.deadline_status != "No deadline" else ""
@@ -242,6 +258,7 @@ def generate_recommendations(
     limit: int = 15,
     target_position: str | None = None,
     include_low_confidence: bool = False,
+    include_review_candidates: bool = False,
 ) -> list[Recommendation]:
     if league.values_status != "live" or (league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters)):
         return []
@@ -268,12 +285,14 @@ def generate_recommendations(
                 if league.mode != "redraft" and target.age > 31 and projections[target.id].trajectory == "DECLINING":
                     continue
                 candidates: list[Recommendation] = []
+                review_candidates: list[Recommendation] = []
                 packages = _candidate_packages(target, expendable, my_team.draft_picks, partner, league, contexts)
                 for send_players, send_picks in packages:
                     result = evaluate_trade(my_team, partner, send_players, [target], league, send_picks, [], contexts)
                     if not result.lineup_a.received_player_starts:
                         continue
-                    if not _passes_quality_gates(result, send_players, send_picks, target, league, my_context, contexts[partner.team_id]):
+                    clears_quality = _passes_quality_gates(result, send_players, send_picks, target, league, my_context, contexts[partner.team_id])
+                    if not clears_quality and not (include_review_candidates and _passes_review_gates(result, my_context)):
                         continue
                     if my_context.window == "Win Now" and result.lineup_a.playoff_points_gained is not None and result.lineup_a.playoff_points_gained < -1 and result.lineup_a.points_gained < 5:
                         continue
@@ -282,18 +301,21 @@ def generate_recommendations(
                     reason = f"Addresses your {position} need while {partner.team_name} receives {incoming} value that fits its roster and timeline."
                     evidence, cautions = _evidence(result, league, my_context, partner)
                     confidence, confidence_reasons = _confidence(league, my_context, partner, tuple(send_players) + tuple(send_picks) + (target,))
-                    if score < (55 if include_low_confidence else 60):
+                    if score < (45 if include_review_candidates and not clears_quality else 55 if include_low_confidence else 60):
                         continue
-                    if confidence not in {"A", "B"} and not include_low_confidence:
+                    if confidence not in {"A", "B"} and not include_low_confidence and clears_quality:
                         continue
-                    candidates.append(Recommendation(
+                    recommendation = Recommendation(
                         kind="BUY", partner=partner, send_players=tuple(send_players), send_picks=tuple(send_picks),
                         receive_players=(target,), receive_picks=(), evaluation=result, score=score, reason=reason,
                         evidence=evidence, cautions=cautions, confidence=confidence,
-                        confidence_reasons=confidence_reasons, score_breakdown=breakdown,
-                    ))
+                        confidence_reasons=confidence_reasons, score_breakdown=breakdown, review_only=not clears_quality,
+                    )
+                    (candidates if clears_quality else review_candidates).append(recommendation)
                 if candidates:
                     ideas.append(max(candidates, key=lambda idea: (idea.score, idea.evaluation.acceptance_score)))
+                elif review_candidates:
+                    ideas.append(max(review_candidates, key=lambda idea: (idea.score, idea.evaluation.acceptance_score)))
 
     if league.mode != "redraft" and (my_context.resilience_score < 65 or my_context.critical_positions):
         depth_positions = set(my_context.critical_positions) or {position for position, need in needs if need >= 50}

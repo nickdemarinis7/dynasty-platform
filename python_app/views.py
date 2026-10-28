@@ -7,7 +7,7 @@ import io
 import streamlit as st
 
 from .models import League, Roster
-from .analytics import active_roster_players, build_contexts, compute_projections, depth_profile, evaluate_trade, optimize_lineup
+from .analytics import active_roster_players, build_contexts, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
 from .recommendations import generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
@@ -297,12 +297,13 @@ def recommendations(league: League) -> None:
         league,
         target_position=None if position == "ALL" else position,
         include_low_confidence=True,
+        include_review_candidates=True,
     )
     ideas = [idea for idea in all_ideas if idea.confidence != "D" or show_experimental]
     if not ideas:
         st.info("No package is currently strong enough to recommend or review. Try another position or refresh league data after projections, injuries, or roster activity change.")
         return
-    qualified_ideas = [idea for idea in ideas if idea.confidence in {"A", "B"} and idea.score >= 65]
+    qualified_ideas = [idea for idea in ideas if not idea.review_only and idea.confidence in {"A", "B"} and idea.score >= 65]
     actionable_ideas = qualified_ideas[:5]
     alternative_ideas = qualified_ideas[5:8]
     review_ideas = [idea for idea in ideas if idea not in qualified_ideas and idea.confidence != "D"][:3]
@@ -488,10 +489,18 @@ def trade(league: League) -> None:
         selected_a_picks, selected_b_picks,
         trade_contexts,
     )
+    context_a, context_b = trade_contexts[team_a.team_id], trade_contexts[team_b.team_id]
+    narrative = explain_trade(team_a, selected_a_players, selected_b_players, result, context_a)
     _section("Deal verdict")
     st.subheader(result.verdict)
+    st.markdown(
+        f'<div class="insight"><strong>{html.escape(narrative.label)}</strong><br>{html.escape(narrative.summary)}</div>',
+        unsafe_allow_html=True,
+    )
+    for reason in narrative.reasons:
+        st.write(f"• {reason}")
+    st.warning(f"Primary risk: {narrative.primary_risk}")
     _stat_grid([("You send", f"{result.team_a_gives:.1f}"), ("You receive", f"{result.team_b_gives:.1f}"), ("Value edge", f"{result.difference_for_a:+.1f}")])
-    context_a, context_b = trade_contexts[team_a.team_id], trade_contexts[team_b.team_id]
     _stat_grid([(f"{context_a.window} fit", f"{result.fit_a:+.1f}"), (f"{context_b.window} fit", f"{result.fit_b:+.1f}"), ("Market balance", balance_label(result.fairness))])
     st.caption(f"Raw market difference: {result.fairness:+.1f}%. Treat small differences as noise inside the value range, not a precise edge.")
     st.progress(result.acceptance_score / 100, text=f"Partner-fit score for {team_b.team_name}: {result.acceptance_score}/100")

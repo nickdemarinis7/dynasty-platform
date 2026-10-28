@@ -98,6 +98,14 @@ class PlayerProjection:
     confidence: str = "limited"
 
 
+@dataclass(frozen=True)
+class TradeNarrative:
+    label: str
+    summary: str
+    reasons: tuple[str, ...]
+    primary_risk: str
+
+
 def projected_points(player: Player, league: League) -> float:
     weekly = league.weekly_points.get(player.id)
     if weekly is not None and weekly > 0:
@@ -595,3 +603,75 @@ def evaluate_trade(
     else:
         verdict = f"Favors {team_b.team_name}"
     return TradeResult(value_a, value_b, difference, fairness, impact_a, impact_b, verdict, fit_a, fit_b, acceptance)
+
+
+def explain_trade(
+    team: Roster,
+    given: list[Player],
+    received: list[Player],
+    result: TradeResult,
+    context: TeamContext,
+) -> TradeNarrative:
+    impact = result.lineup_a
+    incoming_positions = sorted({player.position for player in received})
+    outgoing_positions = sorted({player.position for player in given})
+    new_starters = ", ".join(impact.new_starters)
+    displaced = ", ".join(impact.displaced_starters)
+    reasons: list[str] = []
+    if new_starters:
+        verb = "enters" if len(impact.new_starters) == 1 else "enter"
+        starter_note = f"{new_starters} {verb} your optimized lineup"
+        if displaced:
+            starter_note += f", displacing {displaced}"
+        reasons.append(starter_note + ".")
+    elif received:
+        reasons.append("The incoming players do not currently change your optimized starters.")
+    if incoming_positions and outgoing_positions:
+        shared = sorted(set(incoming_positions) & set(outgoing_positions))
+        added = sorted(set(incoming_positions) - set(outgoing_positions))
+        if shared and added:
+            reasons.append(f"The return replaces outgoing {'/'.join(shared)} value while adding {'/'.join(added)} help at another position.")
+        elif added:
+            reasons.append(f"You convert {'/'.join(outgoing_positions)} value into help at {'/'.join(added)}.")
+    if impact.points_gained >= 1:
+        reasons.append(f"The optimized lineup improves by {impact.points_gained:.1f} projected PPG.")
+    elif impact.points_gained <= -1:
+        reasons.append(f"The optimized lineup declines by {abs(impact.points_gained):.1f} projected PPG.")
+    else:
+        reasons.append("The current optimized lineup is essentially unchanged.")
+    if impact.depth_change >= 5:
+        reasons.append(f"Roster resilience improves from {impact.before_resilience} to {impact.after_resilience}.")
+    elif impact.depth_change <= -5:
+        reasons.append(f"Roster resilience falls from {impact.before_resilience} to {impact.after_resilience}.")
+    if result.fairness > 5:
+        reasons.append("The market-value side of the deal favors you.")
+    elif result.fairness < -5:
+        reasons.append("You pay a market premium for the roster improvement.")
+
+    if impact.points_gained < -1 or (impact.depth_change < -10 and context.window in {"Win Now", "Competing"}):
+        label = "Poor roster fit"
+    elif impact.coverage_warnings:
+        label = "Useful idea with roster risk"
+    elif impact.received_player_starts and impact.points_gained >= 0:
+        label = "Strategic roster fit"
+    elif result.fairness > 8:
+        label = "Market win with limited lineup benefit"
+    else:
+        label = "Mostly lateral move"
+
+    if impact.coverage_warnings:
+        risk = impact.coverage_warnings[0]
+    elif impact.depth_change < 0:
+        risk = "The package reduces roster resilience even if the starting lineup improves."
+    elif result.acceptance_score < 45:
+        risk = "The partner-fit model suggests the other manager may need a different secondary asset."
+    elif not impact.received_player_starts:
+        risk = "The return does not currently improve your starting lineup."
+    else:
+        risk = "The primary uncertainty is whether projections and player availability hold."
+    summary = (
+        f"This trade fits a {context.window.lower()} plan because it improves a starting spot without an excessive roster sacrifice."
+        if label == "Strategic roster fit"
+        else f"This trade is best viewed as a {label.lower()}, not just a market-value comparison."
+    )
+    return TradeNarrative(label, summary, tuple(reasons), risk)

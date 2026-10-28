@@ -1,10 +1,10 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import build_contexts, evaluate_trade, package_value
+from python_app.analytics import build_contexts, evaluate_trade, explain_trade, package_value
 from python_app.counteroffers import generate_counteroffers
 from python_app.models import DraftPick, League, Player, Roster
-from python_app.recommendations import _confidence, _depth_score, _reliable_depth_target, generate_recommendations
+from python_app.recommendations import _confidence, _depth_score, _passes_review_gates, _reliable_depth_target, generate_recommendations
 
 
 class TradeEngineRegressionTests(unittest.TestCase):
@@ -45,6 +45,37 @@ class TradeEngineRegressionTests(unittest.TestCase):
         left = replace(self.a["rb"], value=50)
         result = evaluate_trade(self.team_a, self.team_b, [left], [self.b["rb"]], self.league)
         self.assertAlmostEqual(result.fairness, 0, delta=0.1)
+
+    def test_review_gate_can_surface_safe_lateral_starter_idea(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["bench"]], [self.b["bench"]], self.league)
+        reviewable = replace(
+            result,
+            acceptance_score=40,
+            fairness=4,
+            lineup_a=replace(result.lineup_a, received_player_starts=True, points_gained=0, depth_change=0, after_resilience=60),
+        )
+        context = build_contexts(self.league)[self.team_a.team_id]
+        self.assertTrue(_passes_review_gates(reviewable, context))
+
+    def test_trade_narrative_explains_positional_conversion(self) -> None:
+        weak_qb = Player("weak-qb", "Weak QB", "QB", "A", 27, 10)
+        outgoing_rb = Player("out-rb", "Outgoing RB", "RB", "A", 25, 78)
+        incoming_qb = Player("in-qb", "Incoming QB", "QB", "B", 26, 9)
+        incoming_rb = Player("in-rb", "Incoming RB", "RB", "B", 24, 97)
+        mine = Roster("1", "Mine", "Me", (weak_qb, outgoing_rb), wins=6, losses=1, points_for=800)
+        other = Roster("2", "Other", "Them", (incoming_qb, incoming_rb), wins=3, losses=4, points_for=650)
+        weekly = {"weak-qb": 10, "out-rb": 12, "in-qb": 16, "in-rb": 14}
+        league = League(
+            "narrative", "Narrative", "2026", "dynasty", 2, False, False, "half_ppr",
+            (("QB", 1), ("RB", 1)), "1", (mine, other), "live", weekly_points=weekly,
+        )
+        contexts = build_contexts(league)
+        result = evaluate_trade(mine, other, [outgoing_rb], [incoming_qb, incoming_rb], league, contexts=contexts)
+        narrative = explain_trade(mine, [outgoing_rb], [incoming_qb, incoming_rb], result, contexts[mine.team_id])
+        combined = " ".join(narrative.reasons)
+        self.assertIn("Incoming QB, Incoming RB enter", combined)
+        self.assertIn("replaces outgoing RB value while adding QB", combined)
+        self.assertEqual(narrative.label, "Useful idea with roster risk")
 
     def test_pick_changes_market_value_but_not_lineup_directly(self) -> None:
         result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["rb"]], self.league, [], [self.pick_b])
