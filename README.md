@@ -5,42 +5,39 @@ A mobile-first fantasy football management platform for dynasty and redraft Slee
 ## ✨ Features
 
 ### 🔄 Trade Simulator
-- Real-time trade fairness analysis
-- Lineup impact calculations
-- Acceptance likelihood predictions
-- Draft pick value integration
+- Current FantasyCalc market comparison
+- Lineup impact from weekly projections or scored season averages
+- Two-sided roster and timeline fit heuristic
+- Draft-pick integration when provider values are available
 
 ### 🎯 Trade Finder
-- AI-powered trade recommendations
-- Positional need analysis
+- Rules-based, quality-gated trade candidates
+- League-relative positional need analysis
 - Window alignment (Rebuild/Compete/Win Now)
-- Historical pattern matching
+- Player, player-plus-pick, and consolidation packages
 
 ### 📊 Power Rankings
-- Team value rankings with composition breakdowns
-- Starter vs depth value analysis
-- Weekly projection integration
-- Average age tracking
+- One shared power model across the dashboard and rankings
+- Starting strength, depth, and dynasty-capital inputs
+- Weekly projection integration when available
+- Average-age and competitive-window context
 
-### 🧠 Edge Intelligence
-- Proprietary player projections
+### 🧠 Market Signals
+- Position-relative model and market percentiles
 - Trajectory curve analysis (Rising/Peak/Declining)
-- Production efficiency scoring
-- Team fit analysis
-- Buy/Sell/Hold recommendations
+- Production and opportunity scoring
+- Explicit low-confidence states when evidence is incomplete
+- Model-disagreement signals, not standalone trade advice
 
 ### 💎 Player Values
-- FantasyCalc dynasty values (1M+ trades)
-- League-specific tuning (SF, TEP, PPR)
-- Advanced filtering and sorting
-- Position rankings and tiers
-- Weekly projections integration
+- Current FantasyCalc market values
+- League-format inputs for dynasty/redraft, QB count, team count, and PPR
+- Search and position filtering
 
-### 📈 Trade History
-- Win/Loss/Fair trade tracking
-- Best and worst trade highlights
-- Team trading susceptibilities
-- Historical pattern analysis
+### 📈 Saved Trades
+- User-scoped saved evaluations when durable storage is configured
+- Session storage fallback
+- CSV export
 
 ## 🚀 Quick Start
 
@@ -53,7 +50,7 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501). The Python rewrite currently includes live Sleeper league import, FantasyCalc market and pick values, traded-pick ownership, weekly and season production data, optimized lineups, a contextual player-and-pick Trade Simulator, recommendation-to-simulator handoff, session trade history with CSV export, a quality-gated Trade Finder, a 15-second Sleeper live-draft board, mobile Edge Intelligence, rosters, power rankings, and player values. Durable database storage is the primary remaining platform milestone.
+Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market and pick values, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, saved-trade export, a quality-gated Trade Finder, a live-draft board, market signals, rosters, power rankings, and player values. Recommendation calibration and historical validation remain active development milestones.
 
 ### Legacy Next.js application
 
@@ -87,12 +84,10 @@ Open [http://localhost:3000](http://localhost:3000) to view the app.
 
 ## 🏗️ Tech Stack
 
-- **Framework:** Next.js 16 (App Router)
-- **Language:** TypeScript
-- **Styling:** Tailwind CSS v4
-- **UI Components:** shadcn/ui (base-ui)
-- **State Management:** Zustand
-- **Data Persistence:** localStorage
+- **Primary app:** Python 3.13 + Streamlit
+- **HTTP/data:** Requests + public Sleeper and FantasyCalc APIs
+- **Optional persistence:** Supabase with OIDC authentication
+- **Legacy reference implementation:** Next.js, TypeScript, Tailwind, Zustand
 - **APIs:** 
   - Sleeper API (league data)
   - FantasyCalc API (dynasty values)
@@ -131,21 +126,19 @@ docs/
 1. Go to **Trade Simulator**
 2. Select two teams
 3. Add players/picks to each side
-4. View fairness score, acceptance likelihood, and lineup impact
+4. View market fairness, partner fit, evidence quality, and lineup impact
 5. Save the trade to history
 
 ### Finding Trade Opportunities
 1. Go to **Trade Finder**
-2. Review AI-generated recommendations
-3. Filter by position or trade type
+2. Review rules-based recommendations
+3. Filter by target position
 4. Click "View in Simulator" to analyze
-5. Provide feedback (👍/👎) to improve suggestions
 
 ### Checking Player Values
 1. Go to **Player Values**
-2. Filter by position, team, or tier
-3. Sort by value, projection, or position rank
-4. View weekly projections and injury status
+2. Search by player or NFL team and filter by position
+3. Compare current market values
 
 ## 🔧 Configuration
 
@@ -158,7 +151,7 @@ The app automatically detects your league settings:
 
 ### Data Storage
 
-Without cloud credentials, imported league data and saved trades remain in the Streamlit session and can be exported as CSV. Production deployments can enable native OIDC authentication and user-scoped Supabase trade history. The application automatically selects durable storage when those secrets are present.
+Without cloud credentials, imported league data and decision-journal entries remain in the Streamlit session and can be exported as CSV. Production deployments can enable native OIDC authentication and user-scoped Supabase history. The journal preserves model inputs, predictions, outcomes, and feedback for trade and waiver calibration. The application automatically selects durable storage when those secrets are present.
 
 ## 🚢 Deployment
 

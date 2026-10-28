@@ -59,3 +59,36 @@ def delete_trade(user_id: str, trade_id: str) -> None:
         st.session_state.saved_trades = [trade for trade in saved if trade.get("id") != trade_id]
         return
     _request("DELETE", "saved_trades", params={"id": f"eq.{trade_id}", "user_id": f"eq.{user_id}"})
+
+
+def load_decisions(user_id: str, league_id: str | None = None) -> list[dict[str, Any]]:
+    if not durable_storage_configured():
+        rows = list(st.session_state.get("decision_journal", []))
+        return [row for row in rows if league_id is None or row.get("league_id") == league_id]
+    params = {"user_id": f"eq.{user_id}", "select": "*", "order": "saved_at.desc"}
+    if league_id is not None:
+        params["league_id"] = f"eq.{league_id}"
+    rows = _request("GET", "decision_journal", params=params)
+    return rows if isinstance(rows, list) else []
+
+
+def save_decision(user_id: str, decision: dict[str, Any]) -> None:
+    if not durable_storage_configured():
+        st.session_state.setdefault("decision_journal", []).insert(0, decision)
+        return
+    _request("POST", "decision_journal", json={**decision, "user_id": user_id})
+
+
+def update_decision(user_id: str, decision_id: str, updates: dict[str, Any]) -> None:
+    if not durable_storage_configured():
+        rows = st.session_state.get("decision_journal", [])
+        st.session_state.decision_journal = [{**row, **updates} if row.get("id") == decision_id else row for row in rows]
+        return
+    _request("PATCH", "decision_journal", params={"id": f"eq.{decision_id}", "user_id": f"eq.{user_id}"}, json=updates)
+
+
+def delete_decision(user_id: str, decision_id: str) -> None:
+    if not durable_storage_configured():
+        st.session_state.decision_journal = [row for row in st.session_state.get("decision_journal", []) if row.get("id") != decision_id]
+        return
+    _request("DELETE", "decision_journal", params={"id": f"eq.{decision_id}", "user_id": f"eq.{user_id}"})
