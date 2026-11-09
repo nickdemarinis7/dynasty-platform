@@ -1,9 +1,23 @@
 import unittest
 
-from python_app.providers import _parse_weekly_projection_stats
+from python_app.providers import _league_mode, _parse_devy_prospects, _parse_weekly_projection_stats
 
 
 class ProjectionProviderTests(unittest.TestCase):
+    def test_league_mode_accepts_numeric_strings_and_root_fallback(self) -> None:
+        self.assertEqual(_league_mode({"settings": {"type": "2"}}), "dynasty")
+        self.assertEqual(_league_mode({"type": 1}), "keeper")
+        self.assertEqual(_league_mode({"settings": {"type": 0}}), "redraft")
+
+    def test_devy_response_is_normalized_and_invalid_rows_are_ignored(self) -> None:
+        payload = {"data": [
+            {"rank": 1, "playerName": "Jeremiah Smith", "playerID": 16015, "position": "WR", "school": "OSU", "eligibleYear": 2027, "ktcValue": 9960},
+            {"rank": 2, "playerName": "Missing Value", "position": "QB", "eligibleYear": 2028},
+        ]}
+        prospects = _parse_devy_prospects(payload)
+        self.assertEqual(len(prospects), 1)
+        self.assertEqual(prospects[0].name, "Jeremiah Smith")
+        self.assertEqual(prospects[0].eligible_year, 2027)
     def test_current_sleeper_list_response_is_parsed(self) -> None:
         payload = [
             {"player_id": "123", "stats": {"pass_yd": 250.5, "pass_td": 2, "label": "ignored"}},

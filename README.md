@@ -6,6 +6,8 @@ A mobile-first fantasy football management platform for dynasty and redraft Slee
 
 ### 🔄 Trade Simulator
 - Current FantasyCalc market comparison
+- League-specific early/middle/late pick projections with widening future uncertainty
+- Draft-class strength adjustments from eligibility-year devy prospect markets
 - Lineup impact from weekly projections or scored season averages
 - Two-sided roster and timeline fit heuristic
 - Draft-pick integration when provider values are available
@@ -32,6 +34,7 @@ A mobile-first fantasy football management platform for dynasty and redraft Slee
 ### 💎 Player Values
 - Current FantasyCalc market values
 - League-format inputs for dynasty/redraft, QB count, team count, and PPR
+- League-relative asset tiers, negotiation bands, and positional ranks
 - Search and position filtering
 
 ### 📈 Saved Trades
@@ -50,7 +53,7 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market and pick values, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, saved-trade export, a quality-gated Trade Finder, a live-draft board, market signals, rosters, power rankings, and player values. Recommendation calibration and historical validation remain active development milestones.
+Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market values, projected early/middle/late pick pricing, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, decision journaling, a quality-gated Trade Finder, a waiver claim plan, a live-draft board, market signals, rosters, power rankings, and player values. Recommendation calibration and historical validation remain active development milestones.
 
 ### Legacy Next.js application
 

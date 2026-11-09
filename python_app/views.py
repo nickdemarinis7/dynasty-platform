@@ -7,8 +7,8 @@ import io
 import streamlit as st
 
 from .models import League, Roster
-from .analytics import active_roster_players, build_contexts, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
-from .recommendations import generate_recommendations
+from .analytics import active_roster_players, backtest_projection_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
+from .recommendations import recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
 from .quality import assess_league_readiness
@@ -17,13 +17,13 @@ from .auth import current_user_id
 from .storage import StorageError, delete_decision, durable_storage_configured, load_decisions, save_decision, update_decision
 from .waivers import generate_waiver_recommendations
 from .counteroffers import generate_counteroffers
-from .journal import trade_snapshot, waiver_snapshot
+from .journal import build_calibration_report, trade_snapshot, waiver_snapshot
 from .diagnostics import build_diagnostic_report
-from .value_system import balance_label, format_value, value_profile
+from .value_system import balance_label, format_value, pick_profile, value_profile
 
 
 def _load_recommendation(idea: object) -> None:
-    for key in ("trade_team_a", "trade_team_b", "trade_a_players", "trade_b_players", "trade_a_picks", "trade_b_picks"):
+    for key in ("trade_team_a", "trade_team_b", "trade_a_players", "trade_b_players", "trade_a_picks", "trade_b_picks", "trade_counter_signature", "trade_counteroffers"):
         st.session_state.pop(key, None)
     st.session_state.trade_prefill = idea
     st.session_state.area = "Moves"
@@ -33,6 +33,31 @@ def _load_recommendation(idea: object) -> None:
 def _navigate(section: str, page: str) -> None:
     st.session_state.area = section
     st.session_state.view = page
+
+
+def _navigate_filtered(section: str, page: str, filter_key: str, filter_value: str) -> None:
+    st.session_state[filter_key] = filter_value
+    _navigate(section, page)
+
+
+TRADE_FINDER_CACHE_VERSION = 9
+
+
+def _cached_trade_finder(league: League, target_position: str | None, risk_profile: str, engine_version: int) -> tuple[list[object], object]:
+    """Cache recommendation objects in-session without pickling live dataclasses."""
+    cache_key = (engine_version, league.id, league.imported_at, target_position, risk_profile)
+    cached = st.session_state.get("_trade_finder_cache")
+    if cached and cached.get("key") == cache_key:
+        return cached["value"]
+    value = timed_generate_recommendations(
+        league,
+        target_position=target_position,
+        include_low_confidence=True,
+        include_review_candidates=True,
+        risk_profile=risk_profile,
+    )
+    st.session_state._trade_finder_cache = {"key": cache_key, "value": value}
+    return value
 
 
 def _page_header(kicker: str, title: str, description: str) -> None:
@@ -108,18 +133,31 @@ def home(league: League) -> None:
         f'<div class="insight"><strong>{html.escape(plan.direction)}</strong><br>{html.escape(plan.headline)}</div>',
         unsafe_allow_html=True,
     )
-    _section("Priority actions")
-    for number, action in enumerate(plan.actions, 1):
-        st.markdown(f"**{number}.** {action}")
+    _section("Next best action")
+    next_position = context.critical_positions[0] if context.critical_positions else biggest_need
+    needs_insurance = context.resilience_score < 60 or bool(context.critical_positions)
+    next_action = plan.actions[0]
+    st.markdown(f'<div class="insight"><strong>{html.escape(next_action)}</strong><br>{"Open the waiver pool for an immediate depth fix." if needs_insurance else "Open a pre-filtered trade search for realistic upgrades."}</div>', unsafe_allow_html=True)
+    if needs_insurance:
+        st.button(
+            f"Find {next_position} waiver help", type="primary", use_container_width=True,
+            on_click=_navigate_filtered, args=("Moves", "Waivers", "waiver_position", next_position),
+        )
+    else:
+        st.button(
+            f"Find a {next_position} upgrade", type="primary", use_container_width=True,
+            on_click=_navigate_filtered, args=("Moves", "Ideas", "recommendation_position", next_position),
+        )
+    with st.expander("Full action plan"):
+        for number, action in enumerate(plan.actions, 1):
+            st.markdown(f"**{number}.** {action}")
     if plan.protect or plan.shop:
         protect, shop = st.columns(2)
         protect.caption("PROTECT")
         protect.write(", ".join(player.name for player in plan.protect) or "No protected core identified")
         shop.caption("TEST THE MARKET")
         shop.write(", ".join(player.name for player in plan.shop) or "No urgent sell window")
-    trade_col, team_col = st.columns(2)
-    trade_col.button("Find a move", type="primary", use_container_width=True, on_click=_navigate, args=("Moves", "Ideas"))
-    team_col.button("Review roster", use_container_width=True, on_click=_navigate, args=("Plan", "Roster"))
+    st.button("Review roster", use_container_width=True, on_click=_navigate, args=("Plan", "Roster"))
     settings = " · ".join(filter(None, [league.scoring.upper(), "Superflex" if league.superflex else "1QB", "TE Premium" if league.te_premium else None]))
     schedule = f" · Schedule difficulty {context.schedule_difficulty}/100" if context.schedule_difficulty is not None else ""
     deadline = f" · {context.deadline_status}" if context.deadline_status != "No deadline" else ""
@@ -146,7 +184,7 @@ def rosters(league: League) -> None:
     _stat_grid([
         ("Players", len(selected.players)),
         ("Future picks", len(selected.draft_picks)),
-        ("Total assets", format_value(selected.total_asset_value)),
+        ("Total assets", format_value(selected.player_value + sum(pick_profile(pick, league).adjusted_value for pick in selected.draft_picks))),
         ("Resilience", f"{resilience.score}/100"),
     ])
     if resilience.warnings:
@@ -176,7 +214,9 @@ def rosters(league: League) -> None:
         with st.expander(f"Draft capital · {len(selected.draft_picks)} picks"):
             for pick in selected.draft_picks:
                 owner_note = "" if pick.original_owner == selected.team_id else f" · via Team {pick.original_owner}"
-                st.write(f"**{pick.label}**{owner_note} · Market {format_value(pick.value)}")
+                profile = pick_profile(pick, league)
+                leader = f" · led by {profile.top_prospects[0]}" if profile.top_prospects else ""
+                st.write(f"**{pick.label} · {profile.projection}**{owner_note} · {format_value(profile.adjusted_value)} · {profile.class_outlook}{leader} · range {format_value(profile.low)}–{format_value(profile.high)} · {profile.confidence.lower()} pick confidence")
 
 
 def rankings(league: League) -> None:
@@ -233,10 +273,43 @@ def values(league: League) -> None:
 
 
 def projections(league: League) -> None:
-    _page_header("Research", "Market Signals", f"Week {league.current_week} · league-relative production and role compared with market rank")
+    _page_header("Research", "Player Outlook", f"Week {league.current_week} · expected scoring range, recent role, and market disagreement")
+    lens = st.segmented_control("Research lens", ["Weekly outlook", "Market signals"], default="Weekly outlook", label_visibility="collapsed")
+    query = st.text_input("Search players", placeholder="Search player or NFL team", key="outlook_search")
     position = st.pills("Position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL", key="edge_position")
+    if lens == "Weekly outlook":
+        sort_by = st.selectbox("Sort by", ["Expected points", "Ceiling", "Recent scoring"], label_visibility="collapsed")
+        profiles = [
+            item for item in compute_projection_profiles(league)
+            if (position == "ALL" or item.player.position == position)
+            and (not query or query.lower() in item.player.name.lower() or query.lower() in item.player.team.lower())
+        ]
+        key = {
+            "Expected points": lambda item: item.expected_points,
+            "Ceiling": lambda item: item.ceiling,
+            "Recent scoring": lambda item: item.recent_fppg if item.recent_fppg is not None else -1,
+        }[sort_by]
+        profiles.sort(key=key, reverse=True)
+        st.caption("Expected points blend the current provider projection with recent and season scoring evidence. The range describes observed scoring variability, not a guarantee.")
+        st.caption(f"Showing {min(len(profiles), 50)} of {len(profiles)} matching players")
+        _section("Weekly outlook")
+        for item in profiles[:50]:
+            with st.container(border=True):
+                heading, confidence = st.columns([3, 1])
+                with heading:
+                    _asset_heading(item.player.name, f"{item.player.position} · {item.player.team} · {item.role_trend} role")
+                _compact_value(confidence, "Confidence", item.confidence)
+                _stat_grid([
+                    ("Expected", f"{item.expected_points:.1f}"),
+                    ("Floor–ceiling", f"{item.floor:.1f}–{item.ceiling:.1f}"),
+                    ("Recent FPPG", f"{item.recent_fppg:.1f}" if item.recent_fppg is not None else "—"),
+                ])
+                with st.expander("Projection evidence"):
+                    for evidence in item.evidence:
+                        st.write(f"• {evidence}")
+        return
     recommendation = st.pills("Signal", ["ALL", "MODEL WELL ABOVE MARKET", "MODEL ABOVE MARKET", "MARKET ALIGNED", "MARKET ABOVE MODEL", "MARKET WELL ABOVE MODEL", "LOW CONFIDENCE"], default="ALL")
-    results = [item for item in compute_projections(league) if (position == "ALL" or item.player.position == position) and (recommendation == "ALL" or item.recommendation == recommendation)]
+    results = [item for item in compute_projections(league) if (position == "ALL" or item.player.position == position) and (recommendation == "ALL" or item.recommendation == recommendation) and (not query or query.lower() in item.player.name.lower() or query.lower() in item.player.team.lower())]
     if not league.player_stats:
         st.warning("Season production is unavailable; results currently use neutral production and role scores.")
     st.caption("Signals describe disagreement between current production/role evidence and market rank. They are not buy or sell instructions.")
@@ -248,7 +321,7 @@ def projections(league: League) -> None:
             with heading:
                 _asset_heading(item.player.name, f"{item.player.position} · {item.player.team} · Age {item.player.age or '—'}")
             signal.markdown(f'<div style="text-align:right"><span class="signal">{html.escape(item.recommendation)}</span></div>', unsafe_allow_html=True)
-            _stat_grid([("Model pct", item.edge_score), ("Market pct", item.market_score), ("FPPG", f"{item.fppg:.1f}" if item.fppg is not None else "—")])
+            _stat_grid([("Role/production rank", item.edge_score), ("Market rank", item.market_score), ("Rank gap", f"{item.edge_delta:+d}")])
             if item.signals:
                 with st.expander("Why"):
                     for signal_text in item.signals:
@@ -279,11 +352,30 @@ def diagnostics(league: League) -> None:
         with st.expander("Healthy checks"):
             for strength in report.strengths:
                 st.write(f"✓ {strength}")
+    backtest = backtest_projection_model(league)
+    _section("Projection validation")
+    if backtest.samples:
+        _stat_grid([
+            ("Walk-forward samples", backtest.samples),
+            ("Blended MAE", f"{backtest.blended_mae:.2f}"),
+            ("Vs baseline", f"{backtest.improvement:+.1%}"),
+            ("Direction correct", f"{backtest.directional_accuracy:.0%}"),
+        ])
+        st.caption(f"{backtest.readiness}. Each week is predicted only from earlier completed weeks; future results are never included.")
+        with st.expander("Accuracy by position"):
+            for item in backtest.by_position:
+                st.write(f"**{item.position}** · {item.samples} samples · {item.blended_mae:.2f} MAE · {item.improvement:+.1%} vs season-average baseline")
+    else:
+        st.info("At least four completed weekly stat lines per player are needed before walk-forward projection validation is available.")
     st.caption("Refresh the league from the top navigation after injuries, waivers, trades, or scoring corrections.")
 
 
 def recommendations(league: League) -> None:
-    _page_header("Actionable deals", "Trade Finder", "Real partners and owned assets, filtered for fairness, fit, and lineup impact.")
+    _page_header("Trade strategy", "Trade Finder", "Compare safe, balanced, and aggressive ways to improve your roster.")
+    risk_profile = st.segmented_control(
+        "Risk preference", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
+        help="Conservative protects depth; Aggressive prioritizes starter and playoff upside.",
+    )
     position = st.pills("Target position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL", key="recommendation_position")
     show_experimental = st.toggle(
         "Show D-grade experiments",
@@ -293,17 +385,30 @@ def recommendations(league: League) -> None:
     if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
         st.info(f"Your week {league.trade_deadline_week} trade deadline has passed. Trade Finder is paused so it does not present unavailable moves.")
         return
-    all_ideas = generate_recommendations(
-        league,
-        target_position=None if position == "ALL" else position,
-        include_low_confidence=True,
-        include_review_candidates=True,
-    )
+    with st.spinner("Evaluating realistic packages…"):
+        all_ideas, search_performance = _cached_trade_finder(
+            league, None if position == "ALL" else position, risk_profile, TRADE_FINDER_CACHE_VERSION,
+        )
     ideas = [idea for idea in all_ideas if idea.confidence != "D" or show_experimental]
     if not ideas:
-        st.info("No package is currently strong enough to recommend or review. Try another position or refresh league data after projections, injuries, or roster activity change.")
+        st.info("No package currently offers enough strategic upside for this risk profile. Holding is preferable to forcing a trade.")
+        st.caption(f"{search_performance.team_diagnosis or 'Team strategy'} · {search_performance.packages_evaluated} packages evaluated in {search_performance.elapsed_ms:,} ms")
+        with st.expander("Recommendation funnel"):
+            for reason, count in search_performance.rejection_counts:
+                st.write(f"**{count}** · {reason}")
+        with st.expander("Why no deal cleared the gates"):
+            for note in recommendation_search_notes(league, None if position == "ALL" else position):
+                st.write(f"• {note}")
         return
-    qualified_ideas = [idea for idea in ideas if not idea.review_only and idea.confidence in {"A", "B"} and idea.score >= 65]
+    objectives = list(dict.fromkeys(idea.objective for idea in ideas))
+    if len(objectives) > 1:
+        objective = st.pills("Move objective", ["ALL", *objectives], default="ALL", key="recommendation_objective")
+        if objective != "ALL":
+            ideas = [idea for idea in ideas if idea.objective == objective]
+    if not ideas:
+        st.info("No package matches that move objective and position. Choose another filter to see the available shortlist.")
+        return
+    qualified_ideas = [idea for idea in ideas if idea.tier != "Exploratory" and idea.confidence in {"A", "B"}]
     actionable_ideas = qualified_ideas[:5]
     alternative_ideas = qualified_ideas[5:8]
     review_ideas = [idea for idea in ideas if idea not in qualified_ideas and idea.confidence != "D"][:3]
@@ -318,25 +423,39 @@ def recommendations(league: League) -> None:
         if alternatives:
             summary += f" · {alternatives} actionable alternative{'s' if alternatives != 1 else ''}"
         if review:
-            summary += f" · {review} needs review"
+            summary += f" · {review} exploratory"
         if experimental:
             summary += f" · {experimental} experimental"
         st.caption(summary)
     else:
-        st.warning(f"No actionable deal clears every gate. Showing {review} review candidate{'s' if review != 1 else ''} without presenting them as recommendations.")
+        st.warning(f"No best-fit or {risk_profile.lower()} option surfaced. Showing {review} exploratory candidate{'s' if review != 1 else ''} with the tradeoffs exposed.")
     my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
     my_context = build_contexts(league)[my_team.team_id]
+    rank_detail = " · ".join(filter(None, [
+        f"Record #{my_context.record_rank}" if my_context.record_rank is not None else None,
+        f"Competitive #{my_context.league_rank}",
+        f"Points #{my_context.points_rank}" if my_context.points_rank is not None else None,
+        f"Assets #{my_context.asset_rank}",
+    ]))
+    st.markdown(f'<div class="insight"><strong>{html.escape(search_performance.team_diagnosis or "Team strategy")}</strong><br>{html.escape(rank_detail)}<br>{html.escape(risk_profile)} search · starter upside, playoff value, market cost, partner fit, and resilience are weighted together.</div>', unsafe_allow_html=True)
+    st.caption(f"Search profile: {search_performance.packages_evaluated} packages evaluated · {search_performance.viable_candidates} viable before diversification · {search_performance.elapsed_ms:,} ms · cached until league data changes")
+    with st.expander("Recommendation funnel"):
+        if search_performance.rejection_counts:
+            for reason, count in search_performance.rejection_counts:
+                st.write(f"**{count}** · {reason}")
+        else:
+            st.caption("No candidate rejection details were recorded.")
     depth_pick_labels = [pick.label for idea in ideas if idea.kind == "DEPTH" for pick in idea.send_picks]
     shared_picks = sorted({label for label in depth_pick_labels if depth_pick_labels.count(label) > 1})
     if shared_picks:
         st.info(f"Alternative packages: {', '.join(shared_picks)} appears in multiple ideas. Choose one use of that pick, then refresh the plan after any completed move.")
-    _section("Best available deals" if actionable else "Candidates worth reviewing")
+    _section("Best available deals" if actionable else "Exploratory tradeoffs")
     for idea in ideas:
         with st.container(border=True):
             heading, score = st.columns([3, 1])
             with heading:
-                tier = idea.kind if idea in actionable_ideas else f"ALTERNATIVE · {idea.kind}" if idea in alternative_ideas else f"REVIEW · {idea.kind}"
-                _asset_heading(f"{tier} · {idea.partner.team_name}", idea.reason)
+                prefix = idea.tier.upper() if idea in actionable_ideas else f"ALTERNATIVE · {idea.tier.upper()}" if idea in alternative_ideas else f"EXPLORATORY · {idea.objective.upper()}"
+                _asset_heading(f"{prefix} · {idea.partner.team_name}", idea.reason)
             _compact_value(score, f"Evidence {idea.confidence}", f"{idea.score}/100")
             sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
             receives = [player.name for player in idea.receive_players] + [pick.label for pick in idea.receive_picks]
@@ -345,7 +464,14 @@ def recommendations(league: League) -> None:
             playoff_gain = idea.evaluation.lineup_a.playoff_points_gained
             fairness = idea.evaluation.fairness
             market_balance = balance_label(fairness)
-            _stat_grid([("Market balance", market_balance), ("Your lineup", f"{idea.evaluation.lineup_a.points_gained:+.1f}"), ("Resilience", f"{idea.evaluation.lineup_a.before_resilience} → {idea.evaluation.lineup_a.after_resilience}"), ("Playoff lineup", f"{playoff_gain:+.1f}" if playoff_gain is not None else "Unavailable")])
+            partner_fit = "Strong" if idea.evaluation.acceptance_score >= 65 else "Neutral" if idea.evaluation.acceptance_score >= 48 else "Difficult"
+            _stat_grid([("Market balance", market_balance), ("Your lineup", f"{idea.evaluation.lineup_a.points_gained:+.1f}"), ("Partner fit", partner_fit), ("Playoff lineup", f"{playoff_gain:+.1f}" if playoff_gain is not None else "Unavailable")])
+            if idea.cautions:
+                st.caption(f"Main risk: {idea.cautions[0]}")
+            elif idea.evaluation.lineup_a.depth_change < 0:
+                st.caption("Main risk: the move reduces roster resilience.")
+            else:
+                st.caption("Main risk: projections and player availability can change before kickoff.")
             with st.expander("Before and after roster impact"):
                 impact = idea.evaluation.lineup_a
                 st.write(f"**New starters:** {', '.join(impact.new_starters) or 'No change'}")
@@ -463,8 +589,8 @@ def trade(league: League) -> None:
     st.markdown("**You receive**")
     st.markdown(f'<div class="field-help">Select players from {html.escape(team_b.team_name)}.</div>', unsafe_allow_html=True)
     b_selected = st.multiselect("Players you receive", b_options, default=b_defaults, key="trade_b_players", label_visibility="collapsed", placeholder="Add their players")
-    a_pick_options = {f"{pick.label} · via Team {pick.original_owner} · {format_value(pick.value)}": pick for pick in team_a.draft_picks}
-    b_pick_options = {f"{pick.label} · via Team {pick.original_owner} · {format_value(pick.value)}": pick for pick in team_b.draft_picks}
+    a_pick_options = {f"{pick.label} · {pick_profile(pick, league).projection} · {pick_profile(pick, league).class_outlook} · {format_value(pick_profile(pick, league).adjusted_value)}": pick for pick in team_a.draft_picks}
+    b_pick_options = {f"{pick.label} · {pick_profile(pick, league).projection} · {pick_profile(pick, league).class_outlook} · {format_value(pick_profile(pick, league).adjusted_value)}": pick for pick in team_b.draft_picks}
     if league.mode != "redraft":
         prefill_a_picks = {(pick.year, pick.round, pick.original_owner) for pick in prefill.send_picks} if prefill else set()
         prefill_b_picks = {(pick.year, pick.round, pick.original_owner) for pick in prefill.receive_picks} if prefill else set()
@@ -524,26 +650,36 @@ def trade(league: League) -> None:
         if result.lineup_a.coverage_warnings:
             st.warning("Coverage after trade: " + "; ".join(result.lineup_a.coverage_warnings))
     _section("Negotiation options")
+    counter_signature = (
+        team_b.team_id,
+        tuple(sorted(player.id for player in selected_a_players)),
+        tuple(sorted(player.id for player in selected_b_players)),
+        tuple(sorted((pick.year, pick.round, pick.original_owner) for pick in selected_a_picks)),
+        tuple(sorted((pick.year, pick.round, pick.original_owner) for pick in selected_b_picks)),
+    )
     if st.button("Build counteroffers", use_container_width=True):
         counters = generate_counteroffers(
             team_a, team_b, selected_a_players, selected_b_players, league,
             selected_a_picks, selected_b_picks, trade_contexts,
         )
-        if not counters:
-            st.info("No one-step adjustment clears the fairness and roster-impact gates. Rebuild the package around a different primary asset.")
-        for counter in counters:
-            with st.container(border=True):
-                st.markdown(f"**{counter.label} · {counter.edits} package edit{'s' if counter.edits != 1 else ''}**")
-                st.caption(counter.description)
-                sends = [player.name for player in counter.team_a_players] + [pick.label for pick in counter.team_a_picks]
-                receives = [player.name for player in counter.team_b_players] + [pick.label for pick in counter.team_b_picks]
-                st.write(f"**Send:** {', '.join(sends)}")
-                st.write(f"**Receive:** {', '.join(receives)}")
-                _stat_grid([
-                    ("Market", balance_label(counter.evaluation.fairness)),
-                    ("Your lineup", f"{counter.evaluation.lineup_a.points_gained:+.1f}"),
-                    ("Partner fit", f"{counter.evaluation.acceptance_score}/100"),
-                ])
+        st.session_state.trade_counter_signature = counter_signature
+        st.session_state.trade_counteroffers = counters
+    counters = st.session_state.get("trade_counteroffers", []) if st.session_state.get("trade_counter_signature") == counter_signature else []
+    if st.session_state.get("trade_counter_signature") == counter_signature and not counters:
+        st.info("No one-step adjustment clears the fairness and roster-impact gates. Rebuild the package around a different primary asset.")
+    for counter in counters:
+        with st.container(border=True):
+            st.markdown(f"**{counter.label} · {counter.edits} package edit{'s' if counter.edits != 1 else ''}**")
+            st.caption(counter.description)
+            sends = [player.name for player in counter.team_a_players] + [pick.label for pick in counter.team_a_picks]
+            receives = [player.name for player in counter.team_b_players] + [pick.label for pick in counter.team_b_picks]
+            st.write(f"**Send:** {', '.join(sends)}")
+            st.write(f"**Receive:** {', '.join(receives)}")
+            _stat_grid([
+                ("Market", balance_label(counter.evaluation.fairness)),
+                ("Your lineup", f"{counter.evaluation.lineup_a.points_gained:+.1f}"),
+                ("Partner fit", f"{counter.evaluation.acceptance_score}/100"),
+            ])
     if st.button("Save to journal", type="primary", use_container_width=True):
         decision = trade_snapshot(
             league, team_a, team_b, selected_a_players, selected_b_players,
@@ -566,21 +702,20 @@ def history(league: League) -> None:
     if not saved:
         st.info("No decisions saved for this league yet. Save a trade or waiver recommendation to begin calibration.")
         return
-    resolved_trades = [item for item in saved if item.get("decision_type") == "trade" and item.get("status") in {"accepted", "rejected", "completed"}]
-    accepted = sum(item.get("status") in {"accepted", "completed"} for item in resolved_trades)
-    completed = [item for item in saved if item.get("outcome", {}).get("actual_lineup_change") is not None]
-    errors = [abs(float(item["outcome"]["actual_lineup_change"]) - float(item.get("payload", {}).get("prediction", {}).get("lineup_change") or 0)) for item in completed]
-    avg_error = sum(errors) / len(errors) if errors else None
+    report = build_calibration_report(saved)
     _stat_grid([
-        ("Tracked", len(saved)),
-        ("Trade acceptance", f"{accepted / len(resolved_trades):.0%}" if resolved_trades else "—"),
-        ("Avg PPG error", f"{avg_error:.1f}" if avg_error is not None else "—"),
+        ("Tracked", report.tracked),
+        ("Positive outcome", f"{report.positive_rate:.0%}" if report.positive_rate is not None else "—"),
+        ("Avg PPG error", f"{report.mean_absolute_error:.1f}" if report.mean_absolute_error is not None else "—"),
+        ("Direction correct", f"{report.directional_accuracy:.0%}" if report.directional_accuracy is not None else "—"),
     ])
-    confidence_counts: dict[str, int] = {}
-    for item in saved:
-        confidence = str(item.get("payload", {}).get("confidence") or "Unrated")
-        confidence_counts[confidence] = confidence_counts.get(confidence, 0) + 1
-    st.caption("Confidence mix: " + " · ".join(f"{grade} {count}" for grade, count in sorted(confidence_counts.items())))
+    st.caption(f"{report.readiness} · {report.resolved} resolved decisions · {report.observed} with observed lineup impact")
+    with st.expander("Calibration by evidence grade"):
+        for item in report.by_confidence:
+            outcome = f"{item.positive_rate:.0%} positive" if item.positive_rate is not None else "No resolved outcomes"
+            st.write(f"**{item.label}** · {item.tracked} tracked · {item.resolved} resolved · {outcome}")
+        if report.useful_feedback_rate is not None:
+            st.caption(f"{report.useful_feedback_rate:.0%} of explicit model feedback marked the recommendation useful.")
     output = io.StringIO()
     export_rows = [{
         "id": item.get("id"), "saved_at": item.get("saved_at"), "type": item.get("decision_type"),
@@ -619,12 +754,17 @@ def history(league: League) -> None:
                 feedback_options = ["", "Useful", "Unrealistic", "Too expensive", "Wrong team direction", "Partner would not accept"]
                 current_feedback = item.get("feedback") or ""
                 feedback = st.selectbox("Model feedback", feedback_options, index=feedback_options.index(current_feedback) if current_feedback in feedback_options else 0)
-                actual_lineup = st.number_input("Observed lineup change (PPG)", value=float(outcome.get("actual_lineup_change") or 0), step=0.1)
-                actual_value = st.number_input("Observed market-value change", value=float(outcome.get("actual_value_change") or 0), step=1.0)
+                has_observation = outcome.get("actual_lineup_change") is not None or outcome.get("actual_value_change") is not None
+                record_observation = st.checkbox("Record observed impact", value=has_observation, help="Leave this off until you have a real post-decision result. Missing outcomes are not treated as zero.")
+                actual_lineup = st.number_input("Observed lineup change (PPG)", value=float(outcome.get("actual_lineup_change") or 0), step=0.1, disabled=not record_observation)
+                actual_value = st.number_input("Observed market-value change", value=float(outcome.get("actual_value_change") or 0), step=1.0, disabled=not record_observation)
                 notes = st.text_input("Outcome notes", value=str(outcome.get("notes") or ""))
                 if st.form_submit_button("Update outcome", use_container_width=True):
                     try:
-                        update_decision(current_user_id(), str(item["id"]), {"status": status, "feedback": feedback or None, "outcome": {"actual_lineup_change": actual_lineup, "actual_value_change": actual_value, "notes": notes}})
+                        updated_outcome = {"notes": notes}
+                        if record_observation:
+                            updated_outcome.update({"actual_lineup_change": actual_lineup, "actual_value_change": actual_value})
+                        update_decision(current_user_id(), str(item["id"]), {"status": status, "feedback": feedback or None, "outcome": updated_outcome})
                         st.rerun()
                     except StorageError as exc:
                         st.error(str(exc))

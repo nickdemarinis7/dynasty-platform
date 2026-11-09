@@ -5,6 +5,7 @@ import math
 import random
 
 from .models import DraftPick, League, Player, Roster
+from .value_system import pick_profile
 from .scoring import score_stats
 
 
@@ -99,6 +100,40 @@ class PlayerProjection:
 
 
 @dataclass(frozen=True)
+class ProjectionProfile:
+    player: Player
+    expected_points: float
+    floor: float
+    ceiling: float
+    recent_fppg: float | None
+    season_fppg: float | None
+    role_trend: str
+    availability_probability: float
+    confidence: str
+    evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProjectionBacktestSlice:
+    position: str
+    samples: int
+    blended_mae: float
+    baseline_mae: float
+    improvement: float
+
+
+@dataclass(frozen=True)
+class ProjectionBacktest:
+    samples: int
+    blended_mae: float | None
+    baseline_mae: float | None
+    improvement: float | None
+    directional_accuracy: float | None
+    by_position: tuple[ProjectionBacktestSlice, ...]
+    readiness: str
+
+
+@dataclass(frozen=True)
 class TradeNarrative:
     label: str
     summary: str
@@ -106,10 +141,139 @@ class TradeNarrative:
     primary_risk: str
 
 
+def projection_profile(player: Player, league: League) -> ProjectionProfile:
+    """Build a transparent weekly outlook from provider, recent, and season evidence."""
+    weekly_lines = [
+        (week, players[player.id])
+        for week, players in sorted(league.weekly_player_stats.items())
+        if player.id in players
+    ]
+    weekly_scores = [score_stats(stats, league.scoring_settings, player.position) for _, stats in weekly_lines]
+    recent_scores = weekly_scores[-3:]
+    recent_fppg = round(sum(recent_scores) / len(recent_scores), 1) if recent_scores else None
+    season_stats = league.player_stats.get(player.id)
+    season_fppg = round(calc_fppg(season_stats, player, league), 1) if season_stats and season_stats.get("gp", 0) > 0 else None
+    provider = league.weekly_points.get(player.id)
+
+    evidence: list[str] = []
+    weighted: list[tuple[float, float]] = []
+    if provider is not None and provider > 0:
+        weighted.append((provider, .55))
+        evidence.append("Current-week provider projection")
+    if recent_fppg is not None:
+        weighted.append((recent_fppg, .30 if provider else .70))
+        evidence.append(f"Last {len(recent_scores)} scored weeks")
+    if season_fppg is not None:
+        weighted.append((season_fppg, .15 if provider else .30))
+        evidence.append("Season scoring baseline")
+    total_weight = sum(weight for _, weight in weighted)
+    expected = sum(value * weight for value, weight in weighted) / total_weight if total_weight else 0.0
+
+    if len(weekly_scores) >= 3:
+        ordered = sorted(weekly_scores)
+        floor = ordered[max(0, round((len(ordered) - 1) * .2))]
+        ceiling = ordered[min(len(ordered) - 1, round((len(ordered) - 1) * .8))]
+    else:
+        spread = max(2.0, expected * .30)
+        floor, ceiling = max(0.0, expected - spread), expected + spread
+
+    def opportunities(stats: dict[str, float]) -> float:
+        if player.position == "QB":
+            return stats.get("pass_att", 0)
+        if player.position == "RB":
+            return stats.get("rush_att", 0) + stats.get("tgt", 0)
+        return stats.get("tgt", 0)
+
+    role_trend = "Stable"
+    if len(weekly_lines) >= 4:
+        recent_role = sum(opportunities(stats) for _, stats in weekly_lines[-2:]) / 2
+        prior_lines = weekly_lines[-5:-2]
+        prior_role = sum(opportunities(stats) for _, stats in prior_lines) / max(len(prior_lines), 1)
+        if prior_role > 0 and recent_role >= prior_role * 1.18:
+            role_trend = "Rising"
+        elif prior_role > 0 and recent_role <= prior_role * .82:
+            role_trend = "Falling"
+        evidence.append(f"Recent opportunity trend: {role_trend.lower()}")
+
+    status = (player.injury_status or "active").lower()
+    availability = 0.0 if status in {"out", "o", "ir", "pup", "nfi", "suspended", "sus"} else .35 if status in {"doubtful", "d"} else .80 if status in {"questionable", "q"} else 1.0
+    expected *= availability
+    confidence_points = (35 if provider else 0) + min(45, len(weekly_scores) * 9) + (20 if season_fppg is not None else 0)
+    if availability < 1:
+        confidence_points -= 15
+        evidence.append(f"Availability adjustment: {availability:.0%}")
+    confidence = "High" if confidence_points >= 80 else "Medium" if confidence_points >= 55 else "Low"
+    return ProjectionProfile(
+        player, round(expected, 1), round(floor * availability, 1), round(ceiling * availability, 1),
+        recent_fppg, season_fppg, role_trend, availability, confidence, tuple(evidence),
+    )
+
+
+def compute_projection_profiles(league: League) -> list[ProjectionProfile]:
+    players = {player.id: player for roster in league.rosters for player in roster.players}.values()
+    return sorted((projection_profile(player, league) for player in players), key=lambda item: item.expected_points, reverse=True)
+
+
+def backtest_projection_model(league: League, minimum_history: int = 3) -> ProjectionBacktest:
+    """Walk completed weeks forward without using future information.
+
+    Historical provider projections are not available, so this validates the
+    recency-weighted fallback against a simple prior-season-average baseline.
+    """
+    player_positions = {player.id: player.position for roster in league.rosters for player in roster.players}
+    observations: list[tuple[str, float, float, float, bool]] = []
+    histories: dict[str, list[float]] = {}
+    for _, weekly_players in sorted(league.weekly_player_stats.items()):
+        for player_id, stats in weekly_players.items():
+            position = player_positions.get(player_id)
+            if not position:
+                continue
+            actual = score_stats(stats, league.scoring_settings, position)
+            prior = histories.setdefault(player_id, [])
+            if len(prior) >= minimum_history:
+                baseline = sum(prior) / len(prior)
+                recent = sum(prior[-3:]) / min(3, len(prior))
+                blended = recent * .70 + baseline * .30
+                baseline_error = abs(actual - baseline)
+                blended_error = abs(actual - blended)
+                # Direction asks whether the model correctly identified an
+                # above/below-baseline week, with a small neutral band.
+                predicted_delta = blended - baseline
+                actual_delta = actual - baseline
+                direction = abs(predicted_delta) < .5 and abs(actual_delta) < .5 or predicted_delta * actual_delta > 0
+                observations.append((position, blended_error, baseline_error, actual, direction))
+            prior.append(actual)
+
+    def summarize(position: str, rows: list[tuple[str, float, float, float, bool]]) -> ProjectionBacktestSlice:
+        blended_mae = sum(row[1] for row in rows) / len(rows)
+        baseline_mae = sum(row[2] for row in rows) / len(rows)
+        improvement = (baseline_mae - blended_mae) / baseline_mae if baseline_mae > 0 else 0.0
+        return ProjectionBacktestSlice(position, len(rows), round(blended_mae, 2), round(baseline_mae, 2), round(improvement, 3))
+
+    slices = tuple(
+        summarize(position, [row for row in observations if row[0] == position])
+        for position in ("QB", "RB", "WR", "TE")
+        if any(row[0] == position for row in observations)
+    )
+    if not observations:
+        return ProjectionBacktest(0, None, None, None, None, (), "Insufficient history")
+    blended_mae = sum(row[1] for row in observations) / len(observations)
+    baseline_mae = sum(row[2] for row in observations) / len(observations)
+    improvement = (baseline_mae - blended_mae) / baseline_mae if baseline_mae > 0 else 0.0
+    readiness = "Early signal" if len(observations) < 100 else "Usable sample" if len(observations) < 400 else "Strong sample"
+    return ProjectionBacktest(
+        len(observations), round(blended_mae, 2), round(baseline_mae, 2), round(improvement, 3),
+        round(sum(row[4] for row in observations) / len(observations), 3), slices, readiness,
+    )
+
+
 def projected_points(player: Player, league: League) -> float:
     weekly = league.weekly_points.get(player.id)
     if weekly is not None and weekly > 0:
         base = weekly
+    elif league.weekly_player_stats:
+        # Use the recency-aware outlook when a provider has no projection.
+        return projection_profile(player, league).expected_points
     else:
         stats = league.player_stats.get(player.id)
         base = calc_fppg(stats, player, league) if stats and stats.get("gp", 0) > 0 else 0.0
@@ -131,35 +295,43 @@ def active_roster_players(roster: Roster) -> tuple[Player, ...]:
 
 
 def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) -> Lineup:
-    available = sorted(players, key=lambda player: projected_points(player, league), reverse=True)
-    starters: list[Player] = []
-    used: set[str] = set()
+    available = sorted(players, key=lambda player: (projected_points(player, league), player.value, player.id), reverse=True)
+    eligibility = {
+        "QB": {"QB"}, "RB": {"RB"}, "WR": {"WR"}, "TE": {"TE"}, "K": {"K"}, "DEF": {"DEF"},
+        "FLEX": {"RB", "WR", "TE"}, "SUPERFLEX": {"QB", "RB", "WR", "TE"},
+    }
+    slots = [slot for slot, count in league.roster_slots if slot in eligibility for _ in range(count)]
+    if not slots:
+        return Lineup((), tuple(available), 0.0)
 
-    def fill(count: int, eligible: set[str]) -> None:
-        for player in available:
-            if count <= 0:
-                break
-            if player.id not in used and player.position in eligible:
-                starters.append(player)
-                used.add(player.id)
-                count -= 1
-
-    for slot, count in league.roster_slots:
-        if slot in {"QB", "RB", "WR", "TE", "K", "DEF"}:
-            fill(count, {slot})
-    for slot, count in league.roster_slots:
-        if slot == "FLEX":
-            fill(count, {"RB", "WR", "TE"})
-        elif slot == "SUPERFLEX":
-            fill(count, {"QB", "RB", "WR", "TE"})
-
-    bench = tuple(player for player in available if player.id not in used)
+    # Exact maximum-weight assignment. A player is considered once and can fill
+    # at most one slot, so FLEX/SUPERFLEX ordering cannot change the result.
+    # Typical fantasy lineups have <= 12 slots, keeping this bitmask DP small.
+    states: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    for player_index, player in enumerate(available):
+        points = projected_points(player, league)
+        updated = dict(states)
+        for mask, (score, assignments) in states.items():
+            for slot_index, slot in enumerate(slots):
+                bit = 1 << slot_index
+                if mask & bit or player.position not in eligibility[slot]:
+                    continue
+                next_mask = mask | bit
+                candidate = (score + points, assignments + (player_index,))
+                existing = updated.get(next_mask)
+                if existing is None or candidate[0] > existing[0]:
+                    updated[next_mask] = candidate
+        states = updated
+    _, (_, starter_indices) = max(states.items(), key=lambda item: (item[1][0], item[0].bit_count()))
+    starter_set = set(starter_indices)
+    starters = tuple(player for index, player in enumerate(available) if index in starter_set)
+    bench = tuple(player for index, player in enumerate(available) if index not in starter_set)
     total = round(sum(projected_points(player, league) for player in starters), 1)
-    return Lineup(tuple(starters), bench, total)
+    return Lineup(starters, bench, total)
 
 
-def depth_profile(players: tuple[Player, ...] | list[Player], league: League) -> DepthProfile:
-    lineup = optimize_lineup(players, league)
+def depth_profile(players: tuple[Player, ...] | list[Player], league: League, lineup: Lineup | None = None) -> DepthProfile:
+    lineup = lineup or optimize_lineup(players, league)
     starters_by_position = {
         position: [player for player in lineup.starters if player.position == position]
         for position in ("QB", "RB", "WR", "TE")
@@ -217,7 +389,13 @@ def _depth_profile(players: tuple[Player, ...] | list[Player], league: League) -
     return float(profile.score), profile.warnings
 
 
-def lineup_impact(roster: Roster, given: list[Player], received: list[Player], league: League) -> LineupImpact:
+def lineup_impact(
+    roster: Roster,
+    given: list[Player],
+    received: list[Player],
+    league: League,
+    model_playoffs: bool = True,
+) -> LineupImpact:
     active_players = active_roster_players(roster)
     before = optimize_lineup(active_players, league)
     given_ids = {player.id for player in given}
@@ -233,11 +411,11 @@ def lineup_impact(roster: Roster, given: list[Player], received: list[Player], l
     new = tuple(player.name for player in after.starters if player.id not in before_ids)
     replacements = tuple(player.name for player in after.starters if player.id not in before_ids and player.id not in received_ids)
     displaced = tuple(player.name for player in before.starters if player.id not in after_ids and player.id not in given_ids)
-    before_profile = depth_profile(active_players, league)
-    after_profile = depth_profile(after_players, league)
+    before_profile = depth_profile(active_players, league, before)
+    after_profile = depth_profile(after_players, league, after)
     playoff_deltas: list[float] = []
     playoff_weeks: list[int] = []
-    for week, points in sorted(league.playoff_weekly_points.items()):
+    for week, points in sorted(league.playoff_weekly_points.items()) if model_playoffs else ():
         if not points:
             continue
         week_league = replace(league, weekly_points=points, playoff_weekly_points={})
@@ -266,10 +444,10 @@ def lineup_impact(roster: Roster, given: list[Player], received: list[Player], l
     )
 
 
-def package_value(players: list[Player], picks: list[DraftPick] | None = None) -> float:
+def package_value(players: list[Player], picks: list[DraftPick] | None = None, league: League | None = None) -> float:
     values = sorted(
         [player.value for player in players if player.value > 0]
-        + [pick.value for pick in (picks or []) if pick.value > 0],
+        + [(pick_profile(pick, league).adjusted_value if league else pick.value) for pick in (picks or []) if pick.value > 0],
         reverse=True,
     )
     return round(sum(value if index == 0 else value * max(0.75, 0.9 - (index - 1) * 0.05) for index, value in enumerate(values)), 1)
@@ -297,7 +475,7 @@ def build_contexts(league: League) -> dict[str, TeamContext]:
         lineup = optimize_lineup(active, league)
         starter_market = sum(player.value for player in lineup.starters)
         depth_market = sum(player.value for player in lineup.bench)
-        pick_market = sum(pick.value for pick in roster.draft_picks)
+        pick_market = sum(pick_profile(pick, league).adjusted_value for pick in roster.draft_picks)
         if league.mode == "redraft":
             return lineup.projected_points
         return starter_market + depth_market * .2 + pick_market * .25
@@ -457,9 +635,9 @@ def _contextual_player_value(player: Player, context: TeamContext) -> float:
     return player.value * blend * need
 
 
-def _contextual_pick_value(pick: DraftPick, context: TeamContext) -> float:
+def _contextual_pick_value(pick: DraftPick, context: TeamContext, league: League) -> float:
     blend = context.win_now_weight * 0.5 + (1 - context.win_now_weight) * 1.35
-    return pick.value * blend
+    return pick_profile(pick, league).adjusted_value * blend
 
 
 def calc_fppg(stats: dict[str, float], player: Player, league: League) -> float:
@@ -560,27 +738,28 @@ def evaluate_trade(
     a_gives_picks: list[DraftPick] | None = None,
     b_gives_picks: list[DraftPick] | None = None,
     contexts: dict[str, TeamContext] | None = None,
+    model_playoffs: bool = True,
 ) -> TradeResult:
-    value_a = package_value(a_gives, a_gives_picks)
-    value_b = package_value(b_gives, b_gives_picks)
+    value_a = package_value(a_gives, a_gives_picks, league)
+    value_b = package_value(b_gives, b_gives_picks, league)
     difference = round(value_b - value_a, 1)
     fairness = round(difference / max(value_a, value_b, 1) * 100, 1)
-    impact_a = lineup_impact(team_a, a_gives, b_gives, league)
-    impact_b = lineup_impact(team_b, b_gives, a_gives, league)
+    impact_a = lineup_impact(team_a, a_gives, b_gives, league, model_playoffs)
+    impact_b = lineup_impact(team_b, b_gives, a_gives, league, model_playoffs)
     contexts = contexts or build_contexts(league)
     context_a, context_b = contexts[team_a.team_id], contexts[team_b.team_id]
     a_picks, b_picks = a_gives_picks or [], b_gives_picks or []
     fit_a = round(
         sum(_contextual_player_value(player, context_a) for player in b_gives)
-        + sum(_contextual_pick_value(pick, context_a) for pick in b_picks)
+        + sum(_contextual_pick_value(pick, context_a, league) for pick in b_picks)
         - sum(_contextual_player_value(player, context_a) for player in a_gives)
-        - sum(_contextual_pick_value(pick, context_a) for pick in a_picks), 1,
+        - sum(_contextual_pick_value(pick, context_a, league) for pick in a_picks), 1,
     )
     fit_b = round(
         sum(_contextual_player_value(player, context_b) for player in a_gives)
-        + sum(_contextual_pick_value(pick, context_b) for pick in a_picks)
+        + sum(_contextual_pick_value(pick, context_b, league) for pick in a_picks)
         - sum(_contextual_player_value(player, context_b) for player in b_gives)
-        - sum(_contextual_pick_value(pick, context_b) for pick in b_picks), 1,
+        - sum(_contextual_pick_value(pick, context_b, league) for pick in b_picks), 1,
     )
     # A balanced offer should sit near the middle of the scale. Market value,
     # roster-window fit, and immediate lineup impact then move it up or down.

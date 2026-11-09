@@ -1,13 +1,13 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import active_roster_players, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points
-from python_app.models import DraftPick, League, Player, Roster
+from python_app.analytics import active_roster_players, backtest_projection_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile
+from python_app.models import DevyProspect, DraftPick, League, Player, Roster
 from python_app.recommendations import generate_recommendations
 from python_app.strategy import build_team_plan
 from python_app.waivers import generate_waiver_recommendations
 from python_app.counteroffers import generate_counteroffers
-from python_app.value_system import balance_label, protected_player_ids, value_profile
+from python_app.value_system import balance_label, draft_class_outlooks, pick_profile, protected_player_ids, value_profile
 
 
 class RosterModelTests(unittest.TestCase):
@@ -56,6 +56,68 @@ class RosterModelTests(unittest.TestCase):
         self.assertEqual(balance_label(-8.0), "Give a little more")
         self.assertEqual(balance_label(16.0), "Receive meaningfully more")
 
+    def test_pick_projection_distinguishes_early_and_late_original_owners(self) -> None:
+        rosters = tuple(
+            Roster(str(index), f"Team {index}", f"Owner {index}", wins=7 - index, losses=index, points_for=1000 - index * 80)
+            for index in range(1, 7)
+        )
+        league = League(
+            "picks", "Pick Test", "2026", "dynasty", 6, False, False, "half_ppr",
+            (("QB", 1),), "1", rosters, "live",
+        )
+        late = pick_profile(DraftPick(2027, 1, "1", "1", 40), league)
+        early = pick_profile(DraftPick(2027, 1, "6", "1", 40), league)
+        self.assertEqual(late.projection, "Projected late")
+        self.assertEqual(early.projection, "Projected early")
+        self.assertGreater(early.adjusted_value, late.adjusted_value)
+
+    def test_distant_pick_projection_has_wider_uncertainty(self) -> None:
+        rosters = tuple(
+            Roster(str(index), f"Team {index}", f"Owner {index}", wins=7 - index, losses=index, points_for=1000 - index * 80)
+            for index in range(1, 7)
+        )
+        league = League("picks", "Pick Test", "2026", "dynasty", 6, False, False, "half_ppr", (("QB", 1),), "1", rosters, "live")
+        near = pick_profile(DraftPick(2027, 2, "3", "1", 15), league)
+        far = pick_profile(DraftPick(2029, 2, "3", "1", 15), league)
+        self.assertGreater(far.high - far.low, near.high - near.low)
+        self.assertEqual(far.confidence, "Low")
+
+    def test_draft_class_strength_distinguishes_prospect_years(self) -> None:
+        rosters = tuple(
+            Roster(str(index), f"Team {index}", f"Owner {index}", wins=7 - index, losses=index, points_for=1000 - index * 80)
+            for index in range(1, 7)
+        )
+        prospects = tuple(
+            DevyProspect(f"s{index}", f"Strong {index}", "WR", "A", 2028, value, index)
+            for index, value in enumerate((10000, 8500, 7500, 6500, 6000, 5500, 5000, 4500, 4000, 3500, 3000, 2500), 1)
+        ) + tuple(
+            DevyProspect(f"w{index}", f"Weak {index}", "WR", "B", 2029, value, index)
+            for index, value in enumerate((5000, 4000, 3500, 3000, 2600, 2300, 2000, 1800, 1600, 1400, 1200, 1000), 1)
+        )
+        league = League("classes", "Classes", "2026", "dynasty", 6, False, False, "half_ppr", (("QB", 1),), "1", rosters, "live", devy_prospects=prospects)
+        outlooks = draft_class_outlooks(league)
+        self.assertIn(outlooks[2028].label, {"Strong class", "Exceptional class"})
+        self.assertIn(outlooks[2029].label, {"Weak class", "Very weak class"})
+        self.assertGreater(outlooks[2028].multiplier, outlooks[2029].multiplier)
+
+    def test_class_premium_affects_early_pick_more_than_late_pick(self) -> None:
+        rosters = tuple(
+            Roster(str(index), f"Team {index}", f"Owner {index}", wins=7 - index, losses=index, points_for=1000 - index * 80)
+            for index in range(1, 7)
+        )
+        prospects = tuple(
+            DevyProspect(f"s{index}", f"Strong {index}", "WR", "A", 2028, value, index)
+            for index, value in enumerate((10000, 8500, 7500, 6500, 6000, 5500, 5000, 4500), 1)
+        ) + tuple(
+            DevyProspect(f"a{index}", f"Average {index}", "WR", "B", 2029, value, index)
+            for index, value in enumerate((6000, 5500, 5000, 4500, 4000, 3500, 3000, 2500), 1)
+        )
+        league = League("classes", "Classes", "2026", "dynasty", 6, False, False, "half_ppr", (("QB", 1),), "1", rosters, "live", devy_prospects=prospects)
+        early = pick_profile(DraftPick(2028, 1, "6", "1", 40), league)
+        late = pick_profile(DraftPick(2028, 1, "1", "1", 40), league)
+        self.assertGreater(abs(early.class_multiplier - 1), abs(late.class_multiplier - 1))
+        self.assertEqual(early.top_prospects[0], "Strong 1")
+
     def test_roster_metrics_ignore_unknown_ages(self) -> None:
         roster = Roster(
             team_id="1",
@@ -79,6 +141,20 @@ class RosterModelTests(unittest.TestCase):
         lineup = optimize_lineup(players, self._league((roster,)))
         self.assertEqual(len(lineup.starters), len({player.id for player in lineup.starters}))
         self.assertEqual(len(lineup.starters), 5)
+
+    def test_optimizer_is_not_dependent_on_flex_slot_order(self) -> None:
+        running_back = Player("rb", "Elite RB", "RB", "A", 24, 80)
+        quarterback = Player("qb", "Quarterback", "QB", "A", 27, 70)
+        receiver = Player("wr", "Depth WR", "WR", "A", 25, 10)
+        roster = Roster("1", "A", "A", (running_back, quarterback, receiver))
+        league = replace(
+            self._league((roster,)),
+            roster_slots=(("SUPERFLEX", 1), ("FLEX", 1)),
+            weekly_points={"rb": 20, "qb": 19, "wr": 1},
+        )
+        lineup = optimize_lineup(roster.players, league)
+        self.assertEqual({player.id for player in lineup.starters}, {"rb", "qb"})
+        self.assertEqual(lineup.projected_points, 39)
 
     def test_trade_reports_lineup_upgrade_for_better_starter(self) -> None:
         weak = Player("weak", "Weak RB", "RB", "A", 26, 20)
@@ -268,6 +344,53 @@ class RosterModelTests(unittest.TestCase):
         league = replace(self._league((roster,)), weekly_points={"p": 7.25})
         self.assertEqual(projected_points(player, league), 7.2)
 
+    def test_projection_profile_weights_recent_scoring_above_season_average(self) -> None:
+        player = Player("trend", "Trending WR", "WR", "A", 24, 80)
+        roster = Roster("1", "A", "A", (player,))
+        league = replace(
+            self._league((roster,)),
+            player_stats={"trend": {"gp": 5, "rec": 25, "rec_yd": 300}},
+            weekly_player_stats={
+                1: {"trend": {"rec": 2, "rec_yd": 20, "tgt": 3}},
+                2: {"trend": {"rec": 4, "rec_yd": 40, "tgt": 5}},
+                3: {"trend": {"rec": 7, "rec_yd": 90, "tgt": 9}},
+                4: {"trend": {"rec": 8, "rec_yd": 110, "tgt": 11}},
+                5: {"trend": {"rec": 9, "rec_yd": 120, "tgt": 12}},
+            },
+        )
+        profile = projection_profile(player, league)
+        self.assertGreater(profile.expected_points, profile.season_fppg)
+        self.assertEqual(profile.role_trend, "Rising")
+        self.assertGreater(profile.ceiling, profile.floor)
+        self.assertEqual(projected_points(player, league), profile.expected_points)
+
+    def test_projection_profile_exposes_low_confidence_when_evidence_is_thin(self) -> None:
+        player = Player("thin", "Thin Sample", "RB", "A", 23, 50)
+        roster = Roster("1", "A", "A", (player,))
+        league = replace(
+            self._league((roster,)),
+            weekly_player_stats={1: {"thin": {"rush_att": 4, "rush_yd": 18}}},
+        )
+        profile = projection_profile(player, league)
+        self.assertEqual(profile.confidence, "Low")
+        self.assertGreaterEqual(profile.ceiling, profile.expected_points)
+        self.assertLessEqual(profile.floor, profile.expected_points)
+
+    def test_projection_backtest_walks_forward_and_rewards_recent_trend(self) -> None:
+        player = Player("walk", "Walk Forward WR", "WR", "A", 24, 50)
+        roster = Roster("1", "A", "A", (player,))
+        league = replace(
+            self._league((roster,)),
+            weekly_player_stats={
+                week: {"walk": {"rec_yd": yards}}
+                for week, yards in enumerate((10, 20, 30, 40, 50), 1)
+            },
+        )
+        report = backtest_projection_model(league)
+        self.assertEqual(report.samples, 2)
+        self.assertGreater(report.improvement, 0)
+        self.assertEqual(report.by_position[0].position, "WR")
+
     def test_out_player_never_uses_healthy_projection_or_average(self) -> None:
         player = Player("out", "Out Player", "WR", "A", 26, 50, "OUT")
         roster = Roster("1", "A", "A", (player,))
@@ -349,6 +472,20 @@ class RosterModelTests(unittest.TestCase):
         ideas = generate_waiver_recommendations(league)
 
         self.assertTrue(all(idea.drop != ir_player for idea in ideas))
+
+    def test_ir_player_cannot_displace_active_starter_in_waiver_drop_logic(self) -> None:
+        active = Player("active", "Active WR", "WR", "A", 25, 10)
+        ir_player = Player("ir-star", "IR Star", "WR", "A", 24, 80, "IR")
+        add = Player("add-wr", "Available WR", "WR", "B", 24, 30)
+        roster = Roster("1", "Mine", "Me", (active, ir_player), reserve_player_ids=("ir-star",))
+        league = replace(
+            self._league((roster,)),
+            roster_slots=(("WR", 1), ("IR", 1)),
+            free_agents=(add,), active_roster_capacity=1,
+            weekly_points={"active": 6, "ir-star": 20, "add-wr": 12},
+        )
+        ideas = generate_waiver_recommendations(league)
+        self.assertFalse(any(idea.drop == active for idea in ideas))
 
     def test_redraft_edge_excludes_trajectory(self) -> None:
         young = Player("young", "Young", "WR", "A", 21, 50)

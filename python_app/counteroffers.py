@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .analytics import TeamContext, TradeResult, evaluate_trade
 from .models import DraftPick, League, Player, Roster
-from .value_system import protected_player_ids
+from .value_system import pick_profile, protected_player_ids, premium_value_cutoff
 
 
 @dataclass(frozen=True)
@@ -105,9 +105,15 @@ def generate_counteroffers(
         add_variant(base_ap, base_ad, base_bp, tuple(item for item in base_bd if item != pick))
 
     protected_a = protected_player_ids(team_a, league)
+    protected_b = protected_player_ids(team_b, league)
     a_pool = [player for player in team_a.players if player not in base_ap and player.id not in protected_a]
-    b_pool = [player for player in team_b.players if player not in base_bp]
-    target_value = abs(sum(player.value for player in base_bp) + sum(pick.value for pick in base_bd) - sum(player.value for player in base_ap) - sum(pick.value for pick in base_ad))
+    b_pool = [player for player in team_b.players if player not in base_bp and player.id not in protected_b]
+    target_value = abs(
+        sum(player.value for player in base_bp)
+        + sum(pick_profile(pick, league).adjusted_value for pick in base_bd)
+        - sum(player.value for player in base_ap)
+        - sum(pick_profile(pick, league).adjusted_value for pick in base_ad)
+    )
     a_pool = sorted(a_pool, key=lambda player: abs(player.value - target_value))[:8]
     b_pool = sorted(b_pool, key=lambda player: abs(player.value - target_value))[:8]
     for player in a_pool:
@@ -133,13 +139,21 @@ def generate_counteroffers(
         edits = _edit_count(base_ap, base_ad, base_bp, base_bd, ap, ad, bp, bd)
         evaluated.append(Counteroffer("", _describe(base_ap, base_ad, base_bp, base_bd, ap, ad, bp, bd), ap, ad, bp, bd, result, edits))
 
-    viable = [
-        item for item in evaluated
-        if abs(item.evaluation.fairness) <= 18
-        and item.evaluation.lineup_a.points_gained >= -1
-        and (item.evaluation.lineup_a.depth_change >= -12 or item.evaluation.lineup_a.points_gained >= 4)
-        and (item.evaluation.lineup_a.playoff_points_gained is None or item.evaluation.lineup_a.playoff_points_gained >= -1 or item.evaluation.lineup_a.points_gained >= 5)
-    ]
+    def viable_counter(item: Counteroffer) -> bool:
+        if abs(item.evaluation.fairness) > 18 or item.evaluation.lineup_a.points_gained < -1:
+            return False
+        if item.evaluation.lineup_a.depth_change < -12 and item.evaluation.lineup_a.points_gained < 4:
+            return False
+        if item.evaluation.lineup_a.playoff_points_gained is not None and item.evaluation.lineup_a.playoff_points_gained < -1 and item.evaluation.lineup_a.points_gained < 5:
+            return False
+        added_firsts = [pick for pick in item.team_a_picks if pick.round == 1 and pick not in base_ad]
+        if added_firsts:
+            received_value = sum(player.value for player in item.team_b_players) + sum(pick_profile(pick, league).adjusted_value for pick in item.team_b_picks)
+            if received_value < premium_value_cutoff(league) or item.evaluation.lineup_a.points_gained < 3.5:
+                return False
+        return True
+
+    viable = [item for item in evaluated if viable_counter(item)]
     if not viable:
         return []
     selections: list[Counteroffer] = []

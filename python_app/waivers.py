@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .analytics import build_contexts, lineup_impact, optimize_lineup, projected_points
+from .analytics import active_roster_players, build_contexts, lineup_impact, optimize_lineup, projected_points
 from .models import League, Player
 from .value_system import protected_player_ids
 
@@ -82,7 +82,7 @@ def generate_waiver_recommendations(league: League, limit: int = 20) -> list[Wai
         return []
     roster = next(item for item in league.rosters if item.team_id == league.my_team_id)
     context = build_contexts(league)[roster.team_id]
-    starter_ids = {player.id for player in optimize_lineup(roster.players, league).starters}
+    starter_ids = {player.id for player in optimize_lineup(active_roster_players(roster), league).starters}
     inactive_ids = set(roster.reserve_player_ids) | set(roster.taxi_player_ids)
     unavailable = {"out", "o", "ir", "pup", "nfi", "suspended", "sus", "doubtful", "d"}
     protected = protected_player_ids(roster, league)

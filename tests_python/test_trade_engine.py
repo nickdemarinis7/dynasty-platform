@@ -4,7 +4,7 @@ from dataclasses import replace
 from python_app.analytics import build_contexts, evaluate_trade, explain_trade, package_value
 from python_app.counteroffers import generate_counteroffers
 from python_app.models import DraftPick, League, Player, Roster
-from python_app.recommendations import _confidence, _depth_score, _passes_review_gates, _reliable_depth_target, generate_recommendations
+from python_app.recommendations import Recommendation, _confidence, _depth_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _recommendation_tier, _reliable_depth_target, _return_packages, _team_diagnosis, diversify_recommendations, generate_recommendations, timed_generate_recommendations
 
 
 class TradeEngineRegressionTests(unittest.TestCase):
@@ -50,12 +50,55 @@ class TradeEngineRegressionTests(unittest.TestCase):
         result = evaluate_trade(self.team_a, self.team_b, [self.a["bench"]], [self.b["bench"]], self.league)
         reviewable = replace(
             result,
-            acceptance_score=40,
+            acceptance_score=50,
             fairness=4,
             lineup_a=replace(result.lineup_a, received_player_starts=True, points_gained=0, depth_change=0, after_resilience=60),
         )
         context = build_contexts(self.league)[self.team_a.team_id]
         self.assertTrue(_passes_review_gates(reviewable, context))
+
+    def test_review_gate_rejects_dynasty_qb_downgrade_for_small_lineup_gain(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["qb"]], [self.b["bench"]], self.league)
+        reviewable = replace(
+            result,
+            acceptance_score=50,
+            fairness=3,
+            lineup_a=replace(result.lineup_a, received_player_starts=True, points_gained=5, depth_change=0, after_resilience=60),
+        )
+        context = build_contexts(self.league)[self.team_a.team_id]
+        self.assertFalse(_passes_review_gates(reviewable, context, [self.a["qb"]], [self.b["bench"]], self.league))
+
+    def test_final_qb_safety_applies_even_when_other_quality_gates_pass(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["qb"], self.a["bench"]], [self.b["qb"], self.b["wr"]], self.league)
+        superficially_strong = replace(
+            result,
+            lineup_a=replace(result.lineup_a, points_gained=2, critical_positions=()),
+        )
+        self.assertFalse(_passes_qb_asset_safety(
+            superficially_strong,
+            [self.a["qb"], self.a["bench"]],
+            [self.b["qb"], self.b["wr"]],
+            self.league,
+        ))
+
+    def test_review_candidate_requires_material_current_or_playoff_gain(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["bench"]], [self.b["bench"]], self.league)
+        churn = replace(
+            result,
+            lineup_a=replace(
+                result.lineup_a,
+                points_gained=.4,
+                playoff_points_gained=3.6,
+                depth_change=0,
+                critical_positions=(),
+                after_resilience=65,
+            ),
+        )
+        self.assertFalse(_passes_final_review_value(churn))
+        self.assertTrue(_passes_final_review_value(replace(
+            churn,
+            lineup_a=replace(churn.lineup_a, playoff_points_gained=4.0),
+        )))
 
     def test_trade_narrative_explains_positional_conversion(self) -> None:
         weak_qb = Player("weak-qb", "Weak QB", "QB", "A", 27, 10)
@@ -135,6 +178,23 @@ class TradeEngineRegressionTests(unittest.TestCase):
                     or (idea.evaluation.lineup_a.playoff_points_gained or 0) >= 5
                 )
 
+    def test_return_search_includes_balancing_assets_without_replacing_primary_target(self) -> None:
+        later_pick = DraftPick(2028, 2, "2", "2", 12)
+        partner = replace(self.team_b, draft_picks=(self.pick_b, later_pick))
+        packages = _return_packages(self.b["wr"], partner, self.league)
+        self.assertTrue(any(later_pick in picks for _, picks, _ in packages))
+        self.assertTrue(any(len(players) == 2 for players, _, _ in packages))
+        self.assertTrue(all(players[0] == self.b["wr"] for players, _, _ in packages))
+
+    def test_rebuilding_sale_can_return_two_later_picks(self) -> None:
+        veteran = replace(self.a["wr"], value=30, age=31)
+        first = DraftPick(2027, 2, "2", "2", 16)
+        second = DraftPick(2028, 2, "2", "2", 16)
+        partner = replace(self.team_b, draft_picks=(first, second))
+        packages = _pick_return_packages(veteran, partner, self.league)
+        self.assertIn((first, second), packages)
+        self.assertTrue(all(1 <= len(package) <= 2 for package in packages))
+
     def test_actionable_recommendations_do_not_exceed_overpay_gate(self) -> None:
         ideas = generate_recommendations(self.league, include_low_confidence=True)
         self.assertTrue(all(idea.evaluation.fairness >= -12 for idea in ideas))
@@ -198,7 +258,49 @@ class TradeEngineRegressionTests(unittest.TestCase):
     def test_every_returned_recommendation_has_minimum_quality_score(self) -> None:
         ideas = generate_recommendations(self.league, include_low_confidence=True)
         self.assertTrue(all(idea.score >= 55 for idea in ideas))
+        self.assertTrue(all(
+            _passes_qb_asset_safety(idea.evaluation, idea.send_players, idea.receive_players, self.league)
+            for idea in ideas
+        ))
         self.assertTrue(all(idea.score >= 60 for idea in generate_recommendations(self.league)))
+
+    def test_recommendation_search_reports_work_performed(self) -> None:
+        ideas, performance = timed_generate_recommendations(self.league, include_low_confidence=True)
+        self.assertEqual(performance.recommendations_returned, len(ideas))
+        self.assertGreater(performance.packages_evaluated, 0)
+        self.assertGreaterEqual(performance.elapsed_ms, 0)
+        self.assertTrue(performance.team_diagnosis)
+        self.assertGreater(sum(count for _, count in performance.rejection_counts), 0)
+
+    def test_aggressive_profile_surfaces_upside_with_explicit_depth_cost(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["rb"]], [self.b["wr"]], self.league)
+        upside = replace(
+            result,
+            acceptance_score=52,
+            fairness=5,
+            lineup_a=replace(result.lineup_a, points_gained=2.5, playoff_points_gained=4, depth_change=-15, critical_positions=(), after_resilience=45),
+        )
+        self.assertEqual(_recommendation_tier(upside, 60, "Aggressive"), "Aggressive upside")
+        self.assertEqual(_recommendation_tier(upside, 60, "Conservative"), "Exploratory")
+        self.assertIsNone(_hard_gate_reason(upside, [self.a["rb"]], [self.b["wr"]], [], self.league, self.b["wr"]))
+
+    def test_bottom_record_with_top_scoring_is_underperforming_contender(self) -> None:
+        context = replace(
+            build_contexts(self.league)[self.team_a.team_id],
+            record_rank=2,
+            points_rank=1,
+        )
+        self.assertEqual(_team_diagnosis(context, self.league), "Underperforming contender")
+
+    def test_shortlist_does_not_spend_the_same_outgoing_package_twice(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["rb"], self.a["wr"]], [self.b["wr"]], self.league)
+        first = Recommendation(
+            "BUY", self.team_b, (self.a["rb"], self.a["wr"]), (), (self.b["wr"],), (),
+            result, 72, "First use", objective="Starter upgrade",
+        )
+        second = replace(first, receive_players=(self.b["rb"],), score=68, reason="Second use", objective="Starter plus depth")
+        shortlist = diversify_recommendations([first, second], 5)
+        self.assertEqual(shortlist, [first])
 
 
 if __name__ == "__main__":

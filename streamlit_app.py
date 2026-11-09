@@ -8,7 +8,7 @@ from python_app.auth import authentication_configured, require_login
 
 st.set_page_config(page_title="Fantasy GM", page_icon="🏈", layout="centered", initial_sidebar_state="collapsed")
 
-APP_STATE_SCHEMA_VERSION = 13
+APP_STATE_SCHEMA_VERSION = 14
 if st.session_state.get("_app_state_schema_version") != APP_STATE_SCHEMA_VERSION:
     st.session_state.clear()
     st.session_state._app_state_schema_version = APP_STATE_SCHEMA_VERSION

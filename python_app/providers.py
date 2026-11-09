@@ -8,11 +8,12 @@ from time import monotonic
 import requests
 import streamlit as st
 
-from .models import DraftPick, League, Player, Roster, SourceHealth
+from .models import DevyProspect, DraftPick, League, Player, Roster, SourceHealth
 from .scoring import score_stats, unsupported_scoring_settings
 
 SLEEPER_BASE = "https://api.sleeper.app/v1"
 FANTASY_CALC_BASE = "https://api.fantasycalc.com/values/current"
+TRADYR_DEVY_URL = "https://api.tradyr.app/v1/devy"
 TIMEOUT = 20
 
 
@@ -61,8 +62,46 @@ def get_players() -> dict[str, dict[str, Any]]:
     return data
 
 
+def _parse_devy_prospects(data: Any) -> tuple[DevyProspect, ...]:
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return ()
+    prospects: list[DevyProspect] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            year = int(item.get("eligibleYear") or 0)
+            value = float(item.get("ktcValue") or 0)
+            rank = int(item.get("rank") or 0)
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("playerName") or "").strip()
+        position = str(item.get("position") or "").upper()
+        if not name or year <= 0 or value <= 0 or position not in {"QB", "RB", "WR", "TE"}:
+            continue
+        prospects.append(DevyProspect(
+            id=str(item.get("playerID") or item.get("slug") or name),
+            name=name,
+            position=position,
+            school=str(item.get("school") or "—"),
+            eligible_year=year,
+            value=value,
+            rank=rank or len(prospects) + 1,
+        ))
+    return tuple(sorted(prospects, key=lambda prospect: (prospect.eligible_year, prospect.rank, -prospect.value)))
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_devy_prospects() -> tuple[DevyProspect, ...]:
+    prospects = _parse_devy_prospects(_get_json(TRADYR_DEVY_URL))
+    if not prospects:
+        raise ProviderError("Tradyr returned no usable devy prospects")
+    return prospects
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_season_stats_snapshot(season: str, through_week: int) -> tuple[dict[str, dict[str, float]], tuple[int, ...]]:
+def _get_season_stats_evidence(season: str, through_week: int) -> tuple[dict[str, dict[str, float]], tuple[int, ...], dict[int, dict[str, dict[str, float]]]]:
     def week(week_number: int) -> tuple[int, Any]:
         try:
             return week_number, _get_json(f"{SLEEPER_BASE}/stats/nfl/regular/{season}/{week_number}")
@@ -73,19 +112,30 @@ def get_season_stats_snapshot(season: str, through_week: int) -> tuple[dict[str,
         weeks = list(pool.map(week, range(1, max(1, min(18, through_week)) + 1)))
     totals: dict[str, dict[str, float]] = {}
     successful: list[int] = []
+    history: dict[int, dict[str, dict[str, float]]] = {}
     fields = ("tgt", "rec", "rec_yd", "rec_td", "rec_2pt", "rec_air_yd", "rec_yac", "rush_att", "rush_yd", "rush_td", "rush_2pt", "pass_att", "pass_cmp", "pass_yd", "pass_td", "pass_int", "pass_2pt", "fum_lost", "off_snp", "tm_off_snp", "rz_tgt", "rz_rush_att")
     for week_number, data in weeks:
         if not isinstance(data, dict):
             continue
         successful.append(week_number)
+        history[week_number] = {}
         for player_id, raw in data.items():
             if not isinstance(raw, dict) or (float(raw.get("off_snp") or 0) == 0 and float(raw.get("pts_half_ppr") or 0) == 0):
                 continue
             player = totals.setdefault(str(player_id), {"gp": 0.0, **{field: 0.0 for field in fields}})
             player["gp"] += 1
+            history[week_number][str(player_id)] = {
+                field: float(raw.get(field) or 0) for field in fields
+            }
             for field in fields:
                 player[field] += float(raw.get(field) or 0)
-    return totals, tuple(successful)
+    return totals, tuple(successful), history
+
+
+def get_season_stats_snapshot(season: str, through_week: int) -> tuple[dict[str, dict[str, float]], tuple[int, ...]]:
+    """Return the legacy aggregate snapshot while retaining weekly evidence internally."""
+    totals, successful, _ = _get_season_stats_evidence(season, through_week)
+    return totals, successful
 
 
 def get_season_stats(season: str) -> dict[str, dict[str, float]]:
@@ -164,7 +214,11 @@ def get_market_values(is_dynasty: bool, num_qbs: int, num_teams: int, ppr: float
 
 
 def _league_mode(league: dict[str, Any]) -> str:
-    league_type = (league.get("settings") or {}).get("type")
+    raw_type = (league.get("settings") or {}).get("type", league.get("type", 0))
+    try:
+        league_type = int(raw_type or 0)
+    except (TypeError, ValueError):
+        league_type = 0
     return "dynasty" if league_type == 2 else "keeper" if league_type == 1 else "redraft"
 
 
@@ -269,6 +323,14 @@ def import_league(username: str, league_id: str) -> League:
         values = {}
         pick_values = {}
         values_status = "unavailable"
+
+    if mode == "dynasty":
+        try:
+            devy_prospects = get_devy_prospects()
+        except ProviderError:
+            devy_prospects = ()
+    else:
+        devy_prospects = ()
 
     player_data = get_players()
     player_teams = {
@@ -389,7 +451,7 @@ def import_league(username: str, league_id: str) -> League:
     raw_deadline = int(league_settings.get("trade_deadline") or 0)
     trade_deadline_week = raw_deadline if 1 <= raw_deadline <= 18 else None
     remaining_matchups = get_remaining_matchups(str(league_id), current_week, regular_season_end)
-    stats, stats_weeks = get_season_stats_snapshot(str(state["season"]), max(1, current_week - 1))
+    stats, stats_weeks, weekly_player_stats = _get_season_stats_evidence(str(state["season"]), max(1, current_week - 1))
     weekly_stats = get_weekly_projection_stats(str(state["season"]), current_week)
     weekly_points = {
         player_id: round(score_stats(raw, scoring_settings, str(player_data.get(player_id, {}).get("position") or "")), 2)
@@ -418,6 +480,7 @@ def import_league(username: str, league_id: str) -> League:
         SourceHealth("Sleeper projections", "ready" if weekly_points else "limited", f"Week {current_week} projections loaded" if weekly_points else f"Week {current_week} projections unavailable"),
         SourceHealth("Playoff projections", "ready" if playoff_weekly_points else "limited", f"Loaded weeks {', '.join(map(str, playoff_weekly_points))}" if playoff_weekly_points else "Future playoff-week projections are not yet available"),
         SourceHealth("Draft picks", "ready" if mode == "redraft" or bool(pick_values) else "limited", "Market pick values loaded" if pick_values else "Unpriced picks are retained with no estimated value"),
+        SourceHealth("Devy classes", "ready" if mode != "dynasty" or bool(devy_prospects) else "limited", f"Loaded {len(devy_prospects)} future prospects" if devy_prospects else "Future prospect class data is unavailable"),
         SourceHealth("League scoring", "limited" if unsupported_scoring else "ready", f"{len(unsupported_scoring)} threshold bonus rules are disclosed but not modeled" if unsupported_scoring else "Imported scoring rules are supported"),
     )
     return League(
@@ -438,4 +501,6 @@ def import_league(username: str, league_id: str) -> League:
         active_roster_capacity=sum(count for slot, count in _roster_slots(positions) if slot not in {"IR"}),
         waiver_budget=waiver_budget,
         import_duration_ms=round((monotonic() - import_started) * 1000),
+        devy_prospects=devy_prospects,
+        weekly_player_stats=weekly_player_stats,
     )

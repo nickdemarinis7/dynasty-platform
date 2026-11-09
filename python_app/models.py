@@ -42,6 +42,17 @@ class DraftPick:
 
 
 @dataclass(frozen=True)
+class DevyProspect:
+    id: str
+    name: str
+    position: str
+    school: str
+    eligible_year: int
+    value: float
+    rank: int
+
+
+@dataclass(frozen=True)
 class Roster:
     team_id: str
     team_name: str
@@ -128,3 +139,7 @@ class League:
     active_roster_capacity: int = 0
     waiver_budget: int | None = None
     import_duration_ms: int | None = None
+    devy_prospects: tuple[DevyProspect, ...] = field(default_factory=tuple)
+    # Completed-week player stat lines, keyed by week and then Sleeper player id.
+    # The aggregate ``player_stats`` remains available for existing consumers.
+    weekly_player_stats: dict[int, dict[str, dict[str, float]]] = field(default_factory=dict)

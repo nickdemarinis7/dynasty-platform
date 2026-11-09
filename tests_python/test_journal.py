@@ -1,8 +1,8 @@
 import unittest
 
 from python_app.analytics import build_contexts, evaluate_trade
-from python_app.journal import MODEL_VERSION, trade_snapshot, waiver_snapshot
-from python_app.models import League, Player, Roster
+from python_app.journal import MODEL_VERSION, build_calibration_report, trade_snapshot, waiver_snapshot
+from python_app.models import DraftPick, League, Player, Roster
 from python_app.waivers import WaiverRecommendation
 
 
@@ -34,6 +34,24 @@ class JournalSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["payload"]["score_breakdown"][0]["contribution"], 3.5)
         self.assertEqual(snapshot["status"], "considering")
 
+    def test_trade_snapshot_records_pick_projection_inputs(self) -> None:
+        pick = DraftPick(2027, 2, "2", "1", 15)
+        team_a = Roster("1", "Alpha", "Me", (self.player_a,), (pick,), wins=6, losses=2, points_for=900)
+        league = League(
+            "league", "Test League", "2026", "dynasty", 3, False, False, "half_ppr",
+            (("WR", 1),), "1", (team_a, self.team_b, Roster("3", "Gamma", "Other", wins=1, losses=7, points_for=500)), "live",
+            weekly_points={"a": 10, "b": 12},
+        )
+        result = evaluate_trade(team_a, self.team_b, [], [self.player_b], league, [pick], [])
+        snapshot = trade_snapshot(league, team_a, self.team_b, [], [self.player_b], [pick], [], result, build_contexts(league)["1"], source="test")
+        stored = snapshot["payload"]["send_picks"][0]
+        self.assertIn("adjusted_value", stored)
+        self.assertIn("projection", stored)
+        self.assertIn("range", stored)
+        self.assertIn("class_outlook", stored)
+        self.assertIn("class_multiplier", stored)
+        self.assertIn("top_prospects", stored)
+
     def test_waiver_snapshot_preserves_faab_and_drop(self) -> None:
         add = Player("add", "Add", "RB", "C", 22, 25)
         idea = WaiverRecommendation(add, self.player_a, "DYNASTY STASH", 78, 0, None, 4, 10, "Younger asset", "B", suggested_faab=9)
@@ -44,6 +62,29 @@ class JournalSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["payload"]["suggested_faab"], 9)
         self.assertEqual(snapshot["payload"]["faab_remaining"], 75)
         self.assertEqual(snapshot["decision_type"], "waiver")
+
+    def test_calibration_ignores_unrecorded_outcomes_instead_of_treating_them_as_zero(self) -> None:
+        decisions = [
+            {"status": "accepted", "feedback": "Useful", "outcome": {}, "payload": {"confidence": "A", "prediction": {"lineup_change": 4.0}}},
+            {"status": "completed", "feedback": "Useful", "outcome": {"actual_lineup_change": 3.0}, "payload": {"confidence": "A", "prediction": {"lineup_change": 4.0}}},
+            {"status": "rejected", "feedback": "Partner would not accept", "outcome": {}, "payload": {"confidence": "C", "prediction": {"lineup_change": 2.0}}},
+        ]
+        report = build_calibration_report(decisions)
+        self.assertEqual(report.resolved, 3)
+        self.assertEqual(report.observed, 1)
+        self.assertEqual(report.mean_absolute_error, 1.0)
+        self.assertEqual(report.positive_rate, 2 / 3)
+        self.assertEqual(report.directional_accuracy, 1.0)
+
+    def test_calibration_splits_outcomes_by_confidence(self) -> None:
+        decisions = [
+            {"status": "completed", "outcome": {"actual_lineup_change": 2.0}, "payload": {"confidence": "A", "prediction": {"lineup_change": 3.0}}},
+            {"status": "rejected", "outcome": {}, "payload": {"confidence": "C", "prediction": {"lineup_change": 1.0}}},
+        ]
+        report = build_calibration_report(decisions)
+        slices = {item.label: item for item in report.by_confidence}
+        self.assertEqual(slices["A"].positive_rate, 1.0)
+        self.assertEqual(slices["C"].positive_rate, 0.0)
 
 
 if __name__ == "__main__":
