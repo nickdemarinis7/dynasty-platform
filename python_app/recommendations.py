@@ -817,3 +817,130 @@ def timed_generate_recommendations(
         metrics.get("team_diagnosis", ""),
     )
     return ideas, performance
+
+
+def _target_offer_packages(
+    target: Player,
+    my_team: Roster,
+    partner: Roster,
+    league: League,
+    contexts: dict[str, TeamContext],
+) -> list[tuple[list[Player], list[DraftPick]]]:
+    """Build bounded, market-plausible offers for one explicitly selected player."""
+    partner_needs = contexts[partner.team_id].position_needs
+    players = sorted(
+        (player for player in active_roster_players(my_team) if player.value >= 8),
+        key=lambda player: (partner_needs.get(player.position, 0), player.value),
+        reverse=True,
+    )[:12]
+    candidates: list[tuple[list[Player], list[DraftPick]]] = []
+    candidates.extend(([player], []) for player in players)
+    candidates.extend(([first, second], []) for first, second in combinations(players[:10], 2))
+    if league.mode != "redraft":
+        priced_picks = sorted(
+            my_team.draft_picks,
+            key=lambda pick: pick_profile(pick, league).adjusted_value,
+            reverse=True,
+        )[:6]
+        candidates.extend(([], [pick]) for pick in priced_picks)
+        candidates.extend(([player], [pick]) for player in players[:10] for pick in priced_picks)
+        candidates.extend(([], [first, second]) for first, second in combinations(priced_picks, 2))
+
+    viable: dict[tuple[tuple[str, ...], tuple[tuple[int, int, str], ...]], tuple[list[Player], list[DraftPick]]] = {}
+    for send_players, send_picks in candidates:
+        offered = package_value(send_players, send_picks, league)
+        if not (.50 * target.value <= offered <= 1.55 * target.value):
+            continue
+        key = (
+            tuple(sorted(player.id for player in send_players)),
+            tuple(sorted((pick.year, pick.round, pick.original_owner) for pick in send_picks)),
+        )
+        viable[key] = (send_players, send_picks)
+    return sorted(
+        viable.values(),
+        key=lambda package: abs(package_value(package[0], package[1], league) - target.value),
+    )[:30]
+
+
+def generate_target_offers(
+    league: League,
+    target_player_id: str,
+    limit: int = 5,
+    risk_profile: RiskProfile = "Balanced",
+) -> tuple[list[Recommendation], RecommendationSearchPerformance]:
+    """Find credible direct paths to a specific player on another roster."""
+    started = monotonic()
+    if league.values_status != "live":
+        return [], RecommendationSearchPerformance(0, 0, 0, rejection_counts=(("Market values unavailable", 1),))
+    my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+    owner = next(
+        (roster for roster in league.rosters if roster.team_id != my_team.team_id and any(player.id == target_player_id for player in roster.players)),
+        None,
+    )
+    if owner is None:
+        return [], RecommendationSearchPerformance(0, 0, 0, rejection_counts=(("Target is not held by another roster", 1),))
+    target = next(player for player in owner.players if player.id == target_player_id)
+    contexts = build_contexts(league)
+    my_context = contexts[my_team.team_id]
+    outlooks = {profile.player.id: profile for profile in compute_projection_profiles(league)}
+    rejections: dict[str, int] = {}
+    evaluated = 0
+    viable = 0
+    offers: list[Recommendation] = []
+    need = my_context.position_needs.get(target.position, 0)
+    for send_players, send_picks in _target_offer_packages(target, my_team, owner, league, contexts):
+        result = evaluate_trade(
+            my_team, owner, send_players, [target], league, send_picks, [], contexts, model_playoffs=False,
+        )
+        evaluated += 1
+        reason = _hard_gate_reason(result, send_players, [target], send_picks, league, target)
+        if reason:
+            rejections[reason] = rejections.get(reason, 0) + 1
+            continue
+        result = evaluate_trade(my_team, owner, send_players, [target], league, send_picks, [], contexts)
+        score, breakdown = _score(result, need, risk_profile=risk_profile)
+        # A target search may tolerate a small present-lineup cost for a prized
+        # dynasty asset, but it should never describe a lowball as a path.
+        if score < 50 or result.acceptance_score < 45 or abs(result.fairness) > 18:
+            rejections["Insufficient two-sided fit"] = rejections.get("Insufficient two-sided fit", 0) + 1
+            continue
+        tier = (
+            "Strong path" if score >= 70 and result.acceptance_score >= 48
+            else "Viable path" if score >= 58
+            else "Tradeoff path"
+        )
+        evidence, cautions = _evidence(result, league, my_context, owner)
+        assets: tuple[Player | DraftPick, ...] = (*send_players, *send_picks, target)
+        confidence, confidence_reasons = _confidence(league, my_context, owner, assets, outlooks)
+        offers.append(Recommendation(
+            kind="TARGET", partner=owner, send_players=tuple(send_players), send_picks=tuple(send_picks),
+            receive_players=(target,), receive_picks=(), evaluation=result, score=score,
+            reason=f"A direct path to {target.name} built around assets that fit {owner.team_name}.",
+            objective="Acquire target", tier=tier, evidence=evidence, cautions=cautions,
+            confidence=confidence, confidence_reasons=confidence_reasons, score_breakdown=breakdown,
+            review_only=tier == "Tradeoff path",
+        ))
+        viable += 1
+    ranked = sorted(
+        offers,
+        key=lambda idea: (idea.score, idea.evaluation.acceptance_score, -abs(idea.evaluation.fairness)),
+        reverse=True,
+    )
+    # Avoid presenting a page of superficially different packages all built
+    # around the same outgoing player.
+    selected: list[Recommendation] = []
+    player_uses: dict[str, int] = {}
+    for offer in ranked:
+        if any(player_uses.get(player.id, 0) >= 2 for player in offer.send_players):
+            continue
+        selected.append(offer)
+        for player in offer.send_players:
+            player_uses[player.id] = player_uses.get(player.id, 0) + 1
+        if len(selected) >= limit:
+            break
+    performance = RecommendationSearchPerformance(
+        round((monotonic() - started) * 1000), evaluated, len(selected), viable,
+        tuple(sorted(rejections.items(), key=lambda item: item[1], reverse=True)),
+        _team_diagnosis(my_context, league),
+    )
+    return selected, performance

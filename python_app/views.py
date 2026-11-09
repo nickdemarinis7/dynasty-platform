@@ -8,7 +8,7 @@ import streamlit as st
 
 from .models import League, Roster
 from .analytics import active_roster_players, backtest_projection_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
-from .recommendations import recommendation_search_notes, timed_generate_recommendations
+from .recommendations import generate_target_offers, recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
 from .quality import assess_league_readiness
@@ -506,6 +506,100 @@ def recommendations(league: League) -> None:
                 try:
                     save_decision(current_user_id(), decision)
                     st.success("Recommendation saved with its model snapshot.")
+                except StorageError as exc:
+                    st.error(str(exc))
+
+
+def player_seeker(league: League) -> None:
+    _page_header("Goal-directed trades", "Player Seeker", "Choose an exact player and build credible direct offers to acquire them.")
+    my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+    available = {
+        player.id: (player, roster)
+        for roster in league.rosters if roster.team_id != my_team.team_id
+        for player in active_roster_players(roster)
+    }
+    if not available:
+        st.info("No rostered players are currently available to target.")
+        return
+    target_id = st.selectbox(
+        "Target player",
+        options=sorted(available, key=lambda player_id: available[player_id][0].name),
+        index=None,
+        placeholder="Search for a player",
+        format_func=lambda player_id: f"{available[player_id][0].name} · {available[player_id][0].position} · {available[player_id][1].team_name}",
+    )
+    risk_profile = st.segmented_control(
+        "Offer style", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
+        help="Conservative protects depth; Aggressive is more willing to pay for concentrated upside.",
+        key="seeker_risk_profile",
+    )
+    if target_id is None:
+        st.caption("Select any player held by another manager to calculate direct acquisition paths.")
+        return
+    target, owner = available[target_id]
+    if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
+        st.info(f"Your week {league.trade_deadline_week} trade deadline has passed, so acquisition paths are paused.")
+        return
+    with st.spinner(f"Building paths to {target.name}…"):
+        offers, performance = generate_target_offers(league, target_id, risk_profile=risk_profile)
+    st.markdown(
+        f'<div class="insight"><strong>{html.escape(target.name)} · {html.escape(target.position)}</strong><br>'
+        f'Rostered by {html.escape(owner.team_name)} · Market value {target.value:.0f}<br>'
+        f'{html.escape(risk_profile)} offer construction</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"{performance.packages_evaluated} offers evaluated · {performance.viable_candidates} credible before diversification · {performance.elapsed_ms:,} ms")
+    if not offers:
+        st.warning("No credible direct offer clears the market, partner-fit, lineup, and roster-safety checks right now.")
+        with st.expander("What blocked the direct paths"):
+            for reason, count in performance.rejection_counts:
+                st.write(f"**{count}** · {reason}")
+        st.caption("A future release can use multi-step paths—first acquiring an asset this manager wants, then pursuing the target.")
+        return
+    _section("Best acquisition paths")
+    my_context = build_contexts(league)[my_team.team_id]
+    for index, idea in enumerate(offers, 1):
+        with st.container(border=True):
+            heading, score = st.columns([3, 1])
+            with heading:
+                _asset_heading(f"{index}. {idea.tier.upper()} · {owner.team_name}", idea.reason)
+            _compact_value(score, f"Evidence {idea.confidence}", f"{idea.score}/100")
+            sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
+            st.write(f"**Offer:** {', '.join(sends)}")
+            st.write(f"**Target:** {target.name}")
+            result = idea.evaluation
+            _stat_grid([
+                ("Market balance", balance_label(result.fairness)),
+                ("Your lineup", f"{result.lineup_a.points_gained:+.1f}"),
+                ("Partner fit", f"{result.acceptance_score}/100"),
+                ("Playoff lineup", f"{result.lineup_a.playoff_points_gained:+.1f}" if result.lineup_a.playoff_points_gained is not None else "Unavailable"),
+            ])
+            if result.lineup_a.points_gained < 0:
+                st.caption(f"Main tradeoff: acquiring the target lowers the modeled current lineup by {abs(result.lineup_a.points_gained):.1f} PPG before future-value considerations.")
+            elif idea.cautions:
+                st.caption(f"Main risk: {idea.cautions[0]}")
+            with st.expander("Why this path works—and what could block it"):
+                for item in idea.evidence:
+                    st.write(f"✓ {item}")
+                for item in idea.cautions:
+                    st.write(f"! {item}")
+                st.markdown("**Score breakdown**")
+                for label, contribution in idea.score_breakdown:
+                    st.write(f"{label}: {contribution:+.1f}")
+            st.button(
+                "Open in Trade Simulator", key=f"seek-open-{target.id}-{index}", use_container_width=True,
+                on_click=_load_recommendation, args=(idea,),
+            )
+            if st.button("Save to journal", key=f"seek-save-{target.id}-{index}", use_container_width=True):
+                decision = trade_snapshot(
+                    league, my_team, owner, idea.send_players, idea.receive_players,
+                    idea.send_picks, idea.receive_picks, result, my_context,
+                    source="player_seeker", confidence=idea.confidence, score=idea.score,
+                    score_breakdown=idea.score_breakdown,
+                )
+                try:
+                    save_decision(current_user_id(), decision)
+                    st.success("Target offer saved with its model snapshot.")
                 except StorageError as exc:
                     st.error(str(exc))
 

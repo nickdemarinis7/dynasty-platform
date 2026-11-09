@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 
 from python_app.providers import ProviderError, get_leagues, get_nfl_state, get_user, import_league
-from python_app.views import diagnostics, draft, history, home, projections, rankings, recommendations, rosters, trade, values, waivers
+from python_app.views import diagnostics, draft, history, home, player_seeker, projections, rankings, recommendations, rosters, trade, values, waivers
 from python_app.auth import authentication_configured, require_login
 
 st.set_page_config(page_title="Fantasy GM", page_icon="🏈", layout="centered", initial_sidebar_state="collapsed")
@@ -162,7 +162,7 @@ else:
         logout.button("Log out", on_click=st.logout)
     areas = {
         "Plan": {"Team plan": home, "Roster": rosters, "League": rankings},
-        "Moves": {"Ideas": recommendations, "Waivers": waivers, "Evaluate": trade, "Journal": history},
+        "Moves": {"Ideas": recommendations, "Target": player_seeker, "Waivers": waivers, "Evaluate": trade, "Journal": history},
         "Market": {"Values": values, "Signals": projections, "Data": diagnostics},
         "Draft": {"Draft room": draft},
     }

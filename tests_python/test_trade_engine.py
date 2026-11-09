@@ -4,7 +4,7 @@ from dataclasses import replace
 from python_app.analytics import build_contexts, evaluate_trade, explain_trade, package_value
 from python_app.counteroffers import generate_counteroffers
 from python_app.models import DraftPick, League, Player, Roster
-from python_app.recommendations import Recommendation, _confidence, _depth_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _recommendation_tier, _reliable_depth_target, _return_packages, _team_diagnosis, diversify_recommendations, generate_recommendations, timed_generate_recommendations
+from python_app.recommendations import Recommendation, _confidence, _depth_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _recommendation_tier, _reliable_depth_target, _return_packages, _team_diagnosis, diversify_recommendations, generate_recommendations, generate_target_offers, timed_generate_recommendations
 
 
 class TradeEngineRegressionTests(unittest.TestCase):
@@ -301,6 +301,22 @@ class TradeEngineRegressionTests(unittest.TestCase):
         second = replace(first, receive_players=(self.b["rb"],), score=68, reason="Second use", objective="Starter plus depth")
         shortlist = diversify_recommendations([first, second], 5)
         self.assertEqual(shortlist, [first])
+
+    def test_player_seeker_anchors_every_offer_to_exact_target(self) -> None:
+        offers, performance = generate_target_offers(self.league, self.b["wr"].id)
+        self.assertGreater(performance.packages_evaluated, 0)
+        self.assertTrue(offers or performance.rejection_counts)
+        self.assertTrue(all(offer.receive_players == (self.b["wr"],) for offer in offers))
+        self.assertTrue(all(offer.partner.team_id == self.team_b.team_id for offer in offers))
+        self.assertTrue(all(offer.kind == "TARGET" for offer in offers))
+
+    def test_player_seeker_rejects_own_or_unknown_target(self) -> None:
+        own_offers, own_performance = generate_target_offers(self.league, self.a["wr"].id)
+        missing_offers, missing_performance = generate_target_offers(self.league, "missing")
+        self.assertEqual(own_offers, [])
+        self.assertEqual(missing_offers, [])
+        self.assertEqual(own_performance.rejection_counts, (("Target is not held by another roster", 1),))
+        self.assertEqual(missing_performance.rejection_counts, (("Target is not held by another roster", 1),))
 
 
 if __name__ == "__main__":
