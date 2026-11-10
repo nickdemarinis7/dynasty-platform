@@ -9,7 +9,7 @@ from .analytics import TeamContext, TradeResult
 from .models import DraftPick, League, Player, Roster
 from .value_system import pick_profile
 
-MODEL_VERSION = "trade-engine-2026.11.09.2"
+MODEL_VERSION = "trade-engine-2026.11.10.16"
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,9 @@ class CalibrationReport:
     mean_absolute_error: float | None
     directional_accuracy: float | None
     useful_feedback_rate: float | None
+    partner_observed: int
+    partner_brier_score: float | None
+    partner_fit_bias: float | None
     by_confidence: tuple[CalibrationSlice, ...]
     readiness: str
 
@@ -53,6 +56,16 @@ def build_calibration_report(decisions: list[dict[str, Any]]) -> CalibrationRepo
     ]
     feedback = [item.get("feedback") for item in decisions if item.get("feedback")]
     useful = sum(item == "Useful" for item in feedback)
+    partner_observations: list[tuple[float, float]] = []
+    for item in decisions:
+        if item.get("decision_type") != "trade" or item.get("status") not in {"accepted", "rejected", "completed"}:
+            continue
+        predicted_fit = (item.get("payload") or {}).get("prediction", {}).get("partner_fit")
+        if isinstance(predicted_fit, (int, float)):
+            accepted = 1.0 if item.get("status") in {"accepted", "completed"} else 0.0
+            partner_observations.append((float(predicted_fit) / 100, accepted))
+    brier = [(predicted - actual) ** 2 for predicted, actual in partner_observations]
+    bias = [predicted - actual for predicted, actual in partner_observations]
     labels = sorted({str((item.get("payload") or {}).get("confidence") or "Unrated") for item in decisions})
     slices: list[CalibrationSlice] = []
     for label in labels:
@@ -70,8 +83,30 @@ def build_calibration_report(decisions: list[dict[str, Any]]) -> CalibrationRepo
         observed=len(observed), mean_absolute_error=sum(errors) / len(errors) if errors else None,
         directional_accuracy=sum(directions) / len(directions) if directions else None,
         useful_feedback_rate=useful / len(feedback) if feedback else None,
+        partner_observed=len(partner_observations),
+        partner_brier_score=sum(brier) / len(brier) if brier else None,
+        partner_fit_bias=sum(bias) / len(bias) * 100 if bias else None,
         by_confidence=tuple(slices), readiness=readiness,
     )
+
+
+def journal_partner_tendencies(decisions: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """Extract shrinkage-ready manager outcomes from saved trade decisions."""
+    output: dict[str, dict[str, float]] = {}
+    for item in decisions:
+        payload = item.get("payload") or {}
+        partner = payload.get("partner") or {}
+        partner_id = str(partner.get("team_id") or "")
+        if not partner_id or item.get("decision_type") != "trade":
+            continue
+        row = output.setdefault(partner_id, {"journal_resolved": 0.0, "journal_accepted": 0.0})
+        if item.get("status") in {"accepted", "rejected", "completed"}:
+            row["journal_resolved"] += 1
+            if item.get("status") in {"accepted", "completed"}:
+                row["journal_accepted"] += 1
+        if item.get("feedback") == "Partner would not accept":
+            row["journal_partner_reject_feedback"] = row.get("journal_partner_reject_feedback", 0.0) + 1
+    return output
 
 
 def _asset(player: Player) -> dict[str, Any]:
@@ -100,6 +135,7 @@ def trade_snapshot(
             "model_version": MODEL_VERSION, "source": source, "league": league.name,
             "imported_at": league.imported_at, "week": league.current_week, "mode": league.mode,
             "team_context": {"record": team.record, "competitive_rank": context.league_rank, "asset_rank": context.asset_rank, "window": context.window, "playoff_probability": context.playoff_probability},
+            "partner": {"team_id": partner.team_id, "team_name": partner.team_name, "owner_name": partner.owner_name},
             "send_players": [_asset(player) for player in send_players], "send_picks": [_pick(pick, league) for pick in send_picks],
             "receive_players": [_asset(player) for player in receive_players], "receive_picks": [_pick(pick, league) for pick in receive_picks],
             "sends_label": ", ".join(sends) or "Nothing", "receives_label": ", ".join(receives) or "Nothing",

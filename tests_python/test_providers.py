@@ -1,6 +1,6 @@
 import unittest
 
-from python_app.providers import _league_mode, _parse_devy_prospects, _parse_weekly_projection_stats
+from python_app.providers import _league_mode, _parse_devy_prospects, _parse_secondary_market_values, _parse_trending_players, _parse_weekly_projection_stats
 
 
 class ProjectionProviderTests(unittest.TestCase):
@@ -35,6 +35,23 @@ class ProjectionProviderTests(unittest.TestCase):
     def test_invalid_projection_response_is_empty(self) -> None:
         self.assertEqual(_parse_weekly_projection_stats({"123": {"status": "active"}}), {})
         self.assertEqual(_parse_weekly_projection_stats("not-json-data"), {})
+
+    def test_secondary_market_values_use_requested_format_and_scale(self) -> None:
+        payload = {"players": [
+            {"id": "123", "value": {"sf_dynasty": 8200, "non_sf_dynasty": 6100}},
+            {"id": "missing", "value": {"non_sf_dynasty": 5000}},
+        ]}
+        self.assertEqual(_parse_secondary_market_values(payload, "sf_dynasty"), {"123": 82.0})
+
+    def test_trending_players_are_normalized_and_invalid_rows_ignored(self) -> None:
+        payload = [
+            {"player_id": "123", "count": 1450},
+            {"player_id": "456", "count": "82"},
+            {"player_id": None, "count": 99},
+            {"player_id": "bad", "count": "unknown"},
+        ]
+        self.assertEqual(_parse_trending_players(payload), {"123": 1450, "456": 82})
+        self.assertEqual(_parse_trending_players({"not": "a list"}), {})
 
 
 if __name__ == "__main__":

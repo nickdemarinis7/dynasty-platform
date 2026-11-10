@@ -1,7 +1,7 @@
 import unittest
 
 from python_app.analytics import build_contexts, evaluate_trade
-from python_app.journal import MODEL_VERSION, build_calibration_report, trade_snapshot, waiver_snapshot
+from python_app.journal import MODEL_VERSION, build_calibration_report, journal_partner_tendencies, trade_snapshot, waiver_snapshot
 from python_app.models import DraftPick, League, Player, Roster
 from python_app.waivers import WaiverRecommendation
 
@@ -31,6 +31,7 @@ class JournalSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["payload"]["send_players"][0]["value"], 50)
         self.assertEqual(snapshot["payload"]["receive_players"][0]["value"], 55)
         self.assertEqual(snapshot["payload"]["prediction"]["lineup_change"], result.lineup_a.points_gained)
+        self.assertEqual(snapshot["payload"]["partner"]["team_id"], self.team_b.team_id)
         self.assertEqual(snapshot["payload"]["score_breakdown"][0]["contribution"], 3.5)
         self.assertEqual(snapshot["status"], "considering")
 
@@ -85,6 +86,30 @@ class JournalSnapshotTests(unittest.TestCase):
         slices = {item.label: item for item in report.by_confidence}
         self.assertEqual(slices["A"].positive_rate, 1.0)
         self.assertEqual(slices["C"].positive_rate, 0.0)
+
+    def test_calibration_scores_partner_fit_predictions(self) -> None:
+        decisions = [
+            {"decision_type": "trade", "status": "accepted", "payload": {"prediction": {"partner_fit": 80}}},
+            {"decision_type": "trade", "status": "rejected", "payload": {"prediction": {"partner_fit": 60}}},
+            {"decision_type": "waiver", "status": "completed", "payload": {"prediction": {"partner_fit": 99}}},
+        ]
+        report = build_calibration_report(decisions)
+        self.assertEqual(report.partner_observed, 2)
+        self.assertAlmostEqual(report.partner_brier_score, 0.20)
+        self.assertAlmostEqual(report.partner_fit_bias, 20.0)
+
+    def test_partner_tendencies_group_outcomes_and_rejection_feedback(self) -> None:
+        decisions = [
+            {"decision_type": "trade", "status": "accepted", "feedback": None, "payload": {"partner": {"team_id": "2"}}},
+            {"decision_type": "trade", "status": "rejected", "feedback": "Partner would not accept", "payload": {"partner": {"team_id": "2"}}},
+            {"decision_type": "trade", "status": "considering", "feedback": "Partner would not accept", "payload": {"partner": {"team_id": "3"}}},
+        ]
+        learned = journal_partner_tendencies(decisions)
+        self.assertEqual(learned["2"]["journal_resolved"], 2)
+        self.assertEqual(learned["2"]["journal_accepted"], 1)
+        self.assertEqual(learned["2"]["journal_partner_reject_feedback"], 1)
+        self.assertEqual(learned["3"]["journal_resolved"], 0)
+        self.assertEqual(learned["3"]["journal_partner_reject_feedback"], 1)
 
 
 if __name__ == "__main__":

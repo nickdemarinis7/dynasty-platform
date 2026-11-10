@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import html
 import io
 
 import streamlit as st
 
 from .models import League, Roster
-from .analytics import active_roster_players, backtest_projection_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
-from .recommendations import generate_target_offers, recommendation_search_notes, timed_generate_recommendations
+from .analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup
+from .recommendations import generate_multi_step_paths, generate_sell_offers, generate_target_offers, recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
 from .quality import assess_league_readiness
@@ -17,7 +18,7 @@ from .auth import current_user_id
 from .storage import StorageError, delete_decision, durable_storage_configured, load_decisions, save_decision, update_decision
 from .waivers import generate_waiver_recommendations
 from .counteroffers import generate_counteroffers
-from .journal import build_calibration_report, trade_snapshot, waiver_snapshot
+from .journal import build_calibration_report, journal_partner_tendencies, trade_snapshot, waiver_snapshot
 from .diagnostics import build_diagnostic_report
 from .value_system import balance_label, format_value, pick_profile, value_profile
 
@@ -40,7 +41,25 @@ def _navigate_filtered(section: str, page: str, filter_key: str, filter_value: s
     _navigate(section, page)
 
 
-TRADE_FINDER_CACHE_VERSION = 9
+TRADE_FINDER_CACHE_VERSION = 24
+
+
+def _calibrated_trade_league(league: League) -> League:
+    try:
+        learned = journal_partner_tendencies(load_decisions(current_user_id(), league.id))
+    except StorageError:
+        return league
+    if not learned:
+        return league
+    tendencies = {team_id: dict(values) for team_id, values in league.manager_tendencies.items()}
+    for team_id, values in learned.items():
+        tendencies.setdefault(team_id, {}).update(values)
+    signature = ",".join(
+        f"{team_id}:{int(values.get('journal_resolved', 0))}:{int(values.get('journal_accepted', 0))}:"
+        f"{int(values.get('journal_partner_reject_feedback', 0))}"
+        for team_id, values in sorted(learned.items())
+    )
+    return replace(league, manager_tendencies=tendencies, imported_at=f"{league.imported_at or ''}|journal:{signature}")
 
 
 def _cached_trade_finder(league: League, target_position: str | None, risk_profile: str, engine_version: int) -> tuple[list[object], object]:
@@ -258,13 +277,14 @@ def values(league: League) -> None:
     ]
     market_source = next((source for source in league.source_health if source.source == "FantasyCalc"), None)
     freshness = f" · refreshed {market_source.observed_at}" if market_source and market_source.observed_at else ""
-    st.caption(f"{len(filtered)} rostered players · FantasyCalc format-adjusted market{freshness}")
+    st.caption(f"{len(filtered)} rostered players · 60% FantasyCalc league-adjusted market + 40% Stats Guy Fantasy consensus{freshness}")
+    st.caption("Secondary market and TE-premium data from [Stats Guy Fantasy](https://statsguyfantasy.com/).")
     st.caption("Asset tiers are relative to this league's rostered market—not projected lineup roles. Negotiation bands are heuristic ranges for trade discussion, not statistical confidence intervals.")
     _section("Market board")
     _data_list([
         (
             f"#{rank} · {player.name}",
-            f"{player.position}{position_ranks.get(player.id, '—')} · {player.team} · Age {player.age or '—'} · {value_profile(player, league).tier} · negotiation band {format_value(value_profile(player, league).low)}–{format_value(value_profile(player, league).high)}",
+            f"{player.position}{position_ranks.get(player.id, '—')} · {player.team} · Age {player.age or '—'} · {value_profile(player, league).tier} · negotiation band {format_value(value_profile(player, league).low)}–{format_value(value_profile(player, league).high)}{f' · source disagreement {value_profile(player, league).source_disagreement:.0f}%' if value_profile(player, league).source_count > 1 else ' · single source'}",
             format_value(player.value) if league.values_status == "live" else "—",
             "Market",
         )
@@ -367,10 +387,34 @@ def diagnostics(league: League) -> None:
                 st.write(f"**{item.position}** · {item.samples} samples · {item.blended_mae:.2f} MAE · {item.improvement:+.1%} vs season-average baseline")
     else:
         st.info("At least four completed weekly stat lines per player are needed before walk-forward projection validation is available.")
+    replay = backtest_recommendation_model(league)
+    _section("Recommendation replay")
+    if replay.samples:
+        _stat_grid([
+            ("Upgrade replays", replay.samples),
+            ("Positive next week", f"{replay.success_rate:.0%}"),
+            ("Actual lineup lift", f"{replay.average_actual_lift:+.2f}"),
+            ("Predicted lift", f"{replay.average_predicted_lift:+.2f}"),
+            ("False positives", f"{replay.false_positive_rate:.0%}"),
+            ("Role failures", f"{replay.role_failure_rate:.0%}"),
+        ])
+        st.caption(
+            f"{replay.readiness}. Walk-forward replay uses only earlier scoring to identify same-position lineup upgrades, "
+            "then measures the following week's optimized lineup. Historical prices and manager acceptance are not reconstructed."
+        )
+        with st.expander("Replay by position"):
+            for item in replay.by_position:
+                st.write(
+                    f"**{item.position}** · {item.samples} replays · {item.success_rate:.0%} positive · "
+                    f"{item.average_actual_lift:+.2f} actual lineup points · {item.false_positive_rate:.0%} false positives"
+                )
+    else:
+        st.info("Recommendation replay needs at least four completed weeks for multiple rostered players at the same position.")
     st.caption("Refresh the league from the top navigation after injuries, waivers, trades, or scoring corrections.")
 
 
 def recommendations(league: League) -> None:
+    league = _calibrated_trade_league(league)
     _page_header("Trade strategy", "Trade Finder", "Compare safe, balanced, and aggressive ways to improve your roster.")
     risk_profile = st.segmented_control(
         "Risk preference", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
@@ -408,7 +452,10 @@ def recommendations(league: League) -> None:
     if not ideas:
         st.info("No package matches that move objective and position. Choose another filter to see the available shortlist.")
         return
-    qualified_ideas = [idea for idea in ideas if idea.tier != "Exploratory" and idea.confidence in {"A", "B"}]
+    qualified_ideas = [
+        idea for idea in ideas
+        if idea.tier != "Exploratory" and idea.confidence in {"A", "B"} and idea.evaluation.acceptance_score >= 48
+    ]
     actionable_ideas = qualified_ideas[:5]
     alternative_ideas = qualified_ideas[5:8]
     review_ideas = [idea for idea in ideas if idea not in qualified_ideas and idea.confidence != "D"][:3]
@@ -466,6 +513,13 @@ def recommendations(league: League) -> None:
             market_balance = balance_label(fairness)
             partner_fit = "Strong" if idea.evaluation.acceptance_score >= 65 else "Neutral" if idea.evaluation.acceptance_score >= 48 else "Difficult"
             _stat_grid([("Market balance", market_balance), ("Your lineup", f"{idea.evaluation.lineup_a.points_gained:+.1f}"), ("Partner fit", partner_fit), ("Playoff lineup", f"{playoff_gain:+.1f}" if playoff_gain is not None else "Unavailable")])
+            score_range = f"{idea.score_low}–{idea.score_high}" if idea.score_high else str(idea.score)
+            st.caption(f"Team value {idea.team_value_score}/100 · Market value {idea.market_value_score}/100 · Overall recommendation {idea.score}/100 · confidence range {score_range}")
+            if idea.evaluation.championship_probability_before is not None:
+                st.caption(
+                    f"Scenario estimate: playoffs {idea.evaluation.playoff_probability_before:.1f}% → {idea.evaluation.playoff_probability_after:.1f}% · "
+                    f"championship {idea.evaluation.championship_probability_before:.1f}% → {idea.evaluation.championship_probability_after:.1f}% · not a forecast"
+                )
             if idea.cautions:
                 st.caption(f"Main risk: {idea.cautions[0]}")
             elif idea.evaluation.lineup_a.depth_change < 0:
@@ -510,9 +564,114 @@ def recommendations(league: League) -> None:
                     st.error(str(exc))
 
 
+def _render_multi_step_paths(paths: list[object]) -> None:
+    if not paths:
+        return
+    _section("Two-step acquisition paths")
+    st.caption("Execute step two only after step one completes. Each first move is scored for whether it remains defensible if the target deal falls through.")
+    for index, path in enumerate(paths, 1):
+        with st.container(border=True):
+            heading, score = st.columns([3, 1])
+            with heading:
+                _asset_heading(f"{index}. ACQUIRE {path.intermediary.name}, THEN CONVERT", f"Execution risk: {path.execution_risk}")
+            _compact_value(score, "Path score", f"{path.score}/100")
+            first_send = [player.name for player in path.first.send_players] + [pick.label for pick in path.first.send_picks]
+            first_receive = [player.name for player in path.first.receive_players] + [pick.label for pick in path.first.receive_picks]
+            second_send = [player.name for player in path.second.send_players] + [pick.label for pick in path.second.send_picks]
+            second_receive = [player.name for player in path.second.receive_players] + [pick.label for pick in path.second.receive_picks]
+            st.markdown(f"**Step 1 · {path.first.partner.team_name}**")
+            st.write(f"Send {', '.join(first_send)} → Receive {', '.join(first_receive)}")
+            st.caption(f"Partner fit {path.first.evaluation.acceptance_score}/100 · standalone score {path.first.score}/100")
+            st.markdown(f"**Step 2 · {path.second.partner.team_name}**")
+            st.write(f"Send {', '.join(second_send)} → Receive {', '.join(second_receive)}")
+            st.caption(f"Partner fit {path.second.evaluation.acceptance_score}/100 · offer score {path.second.score}/100")
+            _stat_grid([
+                ("Final lineup", f"{path.final_lineup_delta:+.1f}"),
+                ("Final playoffs", f"{path.final_playoff_delta:+.1f}" if path.final_playoff_delta is not None else "—"),
+                ("Stop after step 1", "Safe" if path.stop_after_step_one_safe else "Risky"),
+            ])
+            if not path.stop_after_step_one_safe:
+                st.warning("Step one is not attractive enough as a standalone move. Treat this as an aggressive, coordinated path only.")
+            st.button(
+                "Open step 1 in Trade Simulator", key=f"path-open-{path.intermediary.id}-{index}",
+                use_container_width=True, on_click=_load_recommendation, args=(path.first,),
+            )
+
+
+def _sell_seeker(league: League, my_team: Roster, risk_profile: str) -> None:
+    roster_players = {player.id: player for player in active_roster_players(my_team) if player.position in {"QB", "RB", "WR", "TE"}}
+    player_id = st.selectbox(
+        "Player to move", options=sorted(roster_players, key=lambda item: roster_players[item].name),
+        index=None, placeholder="Search your roster",
+        format_func=lambda item: f"{roster_players[item].name} · {roster_players[item].position} · Value {roster_players[item].value:.0f}",
+    )
+    if player_id is None:
+        st.caption("Select a player from your depth chart to find the best destinations and returns.")
+        return
+    player = roster_players[player_id]
+    with st.spinner(f"Finding markets for {player.name}…"):
+        offers, performance = generate_sell_offers(league, player_id, risk_profile=risk_profile)
+    st.markdown(
+        f'<div class="insight"><strong>Move {html.escape(player.name)} · {html.escape(player.position)}</strong><br>'
+        f'Market value {player.value:.0f} · {html.escape(risk_profile)} return construction</div>', unsafe_allow_html=True,
+    )
+    st.caption(f"{performance.packages_evaluated} returns evaluated · {performance.viable_candidates} viable · {performance.elapsed_ms:,} ms")
+    if not offers:
+        st.warning("No destination currently returns enough team value while clearing market, partner-fit, and roster-safety checks.")
+        with st.expander("What blocked the exits"):
+            for reason, count in performance.rejection_counts:
+                st.write(f"**{count}** · {reason}")
+        return
+    _section("Best destinations")
+    my_context = build_contexts(league)[my_team.team_id]
+    for index, idea in enumerate(offers, 1):
+        with st.container(border=True):
+            heading, score = st.columns([3, 1])
+            with heading:
+                _asset_heading(f"{index}. {idea.tier.upper()} · {idea.partner.team_name}", idea.reason)
+            _compact_value(score, f"Evidence {idea.confidence}", f"{idea.score}/100")
+            receives = [asset.name for asset in idea.receive_players] + [pick.label for pick in idea.receive_picks]
+            st.write(f"**Send:** {player.name}")
+            st.write(f"**Receive:** {', '.join(receives)}")
+            _stat_grid([
+                ("Market balance", balance_label(idea.evaluation.fairness)),
+                ("Your lineup", f"{idea.evaluation.lineup_a.points_gained:+.1f}"),
+                ("Partner fit", f"{idea.evaluation.acceptance_score}/100"),
+                ("Playoff lineup", f"{idea.evaluation.lineup_a.playoff_points_gained:+.1f}" if idea.evaluation.lineup_a.playoff_points_gained is not None else "—"),
+            ])
+            if idea.cautions:
+                st.caption(f"Main risk: {idea.cautions[0]}")
+            st.button("Open in Trade Simulator", key=f"sell-open-{player.id}-{index}", use_container_width=True, on_click=_load_recommendation, args=(idea,))
+            if st.button("Save to journal", key=f"sell-save-{player.id}-{index}", use_container_width=True):
+                decision = trade_snapshot(
+                    league, my_team, idea.partner, idea.send_players, idea.receive_players,
+                    idea.send_picks, idea.receive_picks, idea.evaluation, my_context,
+                    source="player_seller", confidence=idea.confidence, score=idea.score,
+                    score_breakdown=idea.score_breakdown,
+                )
+                try:
+                    save_decision(current_user_id(), decision)
+                    st.success("Sell option saved with its model snapshot.")
+                except StorageError as exc:
+                    st.error(str(exc))
+
+
 def player_seeker(league: League) -> None:
-    _page_header("Goal-directed trades", "Player Seeker", "Choose an exact player and build credible direct offers to acquire them.")
+    league = _calibrated_trade_league(league)
+    _page_header("Goal-directed trades", "Player Seeker", "Acquire an exact target, build a safe two-step path, or find the best market for a player you want to move.")
     my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+    mode = st.segmented_control("Objective", ["Acquire", "Move"], default="Acquire", key="seeker_objective")
+    risk_profile = st.segmented_control(
+        "Offer style", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
+        help="Conservative protects depth; Aggressive is more willing to pay for concentrated upside.",
+        key="seeker_risk_profile",
+    )
+    if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
+        st.info(f"Your week {league.trade_deadline_week} trade deadline has passed, so goal-directed trade paths are paused.")
+        return
+    if mode == "Move":
+        _sell_seeker(league, my_team, risk_profile)
+        return
     available = {
         player.id: (player, roster)
         for roster in league.rosters if roster.team_id != my_team.team_id
@@ -528,20 +687,16 @@ def player_seeker(league: League) -> None:
         placeholder="Search for a player",
         format_func=lambda player_id: f"{available[player_id][0].name} · {available[player_id][0].position} · {available[player_id][1].team_name}",
     )
-    risk_profile = st.segmented_control(
-        "Offer style", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
-        help="Conservative protects depth; Aggressive is more willing to pay for concentrated upside.",
-        key="seeker_risk_profile",
-    )
     if target_id is None:
         st.caption("Select any player held by another manager to calculate direct acquisition paths.")
         return
     target, owner = available[target_id]
-    if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
-        st.info(f"Your week {league.trade_deadline_week} trade deadline has passed, so acquisition paths are paused.")
-        return
     with st.spinner(f"Building paths to {target.name}…"):
         offers, performance = generate_target_offers(league, target_id, risk_profile=risk_profile)
+    multi_step_paths: list[object] = []
+    if not offers or max(idea.score for idea in offers) < 65:
+        with st.spinner(f"Checking safe two-step routes to {target.name}…"):
+            multi_step_paths = generate_multi_step_paths(league, target_id, risk_profile=risk_profile)
     st.markdown(
         f'<div class="insight"><strong>{html.escape(target.name)} · {html.escape(target.position)}</strong><br>'
         f'Rostered by {html.escape(owner.team_name)} · Market value {target.value:.0f}<br>'
@@ -549,12 +704,19 @@ def player_seeker(league: League) -> None:
         unsafe_allow_html=True,
     )
     st.caption(f"{performance.packages_evaluated} offers evaluated · {performance.viable_candidates} credible before diversification · {performance.elapsed_ms:,} ms")
-    if not offers:
+    if not offers and not multi_step_paths:
         st.warning("No credible direct offer clears the market, partner-fit, lineup, and roster-safety checks right now.")
         with st.expander("What blocked the direct paths"):
             for reason, count in performance.rejection_counts:
                 st.write(f"**{count}** · {reason}")
-        st.caption("A future release can use multi-step paths—first acquiring an asset this manager wants, then pursuing the target.")
+        st.caption("No safe two-step route was found either; the engine will not recommend getting stranded with an intermediary that hurts your roster.")
+        return
+    if not offers:
+        st.warning("No credible direct offer clears every gate. The paths below use a defensible intermediary required by the target manager.")
+        with st.expander("What blocked the direct paths"):
+            for reason, count in performance.rejection_counts:
+                st.write(f"**{count}** · {reason}")
+        _render_multi_step_paths(multi_step_paths)
         return
     _section("Best acquisition paths")
     my_context = build_contexts(league)[my_team.team_id]
@@ -565,8 +727,9 @@ def player_seeker(league: League) -> None:
                 _asset_heading(f"{index}. {idea.tier.upper()} · {owner.team_name}", idea.reason)
             _compact_value(score, f"Evidence {idea.confidence}", f"{idea.score}/100")
             sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
+            receives = [player.name for player in idea.receive_players] + [pick.label for pick in idea.receive_picks]
             st.write(f"**Offer:** {', '.join(sends)}")
-            st.write(f"**Target:** {target.name}")
+            st.write(f"**Receive:** {', '.join(receives)}")
             result = idea.evaluation
             _stat_grid([
                 ("Market balance", balance_label(result.fairness)),
@@ -574,6 +737,13 @@ def player_seeker(league: League) -> None:
                 ("Partner fit", f"{result.acceptance_score}/100"),
                 ("Playoff lineup", f"{result.lineup_a.playoff_points_gained:+.1f}" if result.lineup_a.playoff_points_gained is not None else "Unavailable"),
             ])
+            score_range = f"{idea.score_low}–{idea.score_high}" if idea.score_high else str(idea.score)
+            st.caption(f"Team value {idea.team_value_score}/100 · Market value {idea.market_value_score}/100 · Overall path {idea.score}/100 · confidence range {score_range}")
+            if result.championship_probability_before is not None:
+                st.caption(
+                    f"Scenario estimate: playoffs {result.playoff_probability_before:.1f}% → {result.playoff_probability_after:.1f}% · "
+                    f"championship {result.championship_probability_before:.1f}% → {result.championship_probability_after:.1f}% · not a forecast"
+                )
             if result.lineup_a.points_gained < 0:
                 st.caption(f"Main tradeoff: acquiring the target lowers the modeled current lineup by {abs(result.lineup_a.points_gained):.1f} PPG before future-value considerations.")
             elif idea.cautions:
@@ -602,6 +772,7 @@ def player_seeker(league: League) -> None:
                     st.success("Target offer saved with its model snapshot.")
                 except StorageError as exc:
                     st.error(str(exc))
+    _render_multi_step_paths(multi_step_paths)
 
 
 def waivers(league: League) -> None:
@@ -656,6 +827,7 @@ def waivers(league: League) -> None:
 
 
 def trade(league: League) -> None:
+    league = _calibrated_trade_league(league)
     _page_header("Deal room", "Trade Simulator", "Build a package, then see market fairness, team fit, and starting-lineup impact.")
     if league.values_status != "live":
         st.warning("Trade analysis requires current market values. Refresh the league when FantasyCalc is available.")
@@ -804,6 +976,14 @@ def history(league: League) -> None:
         ("Direction correct", f"{report.directional_accuracy:.0%}" if report.directional_accuracy is not None else "—"),
     ])
     st.caption(f"{report.readiness} · {report.resolved} resolved decisions · {report.observed} with observed lineup impact")
+    if report.partner_observed:
+        bias = report.partner_fit_bias or 0.0
+        direction = "optimistic" if bias > 1 else "conservative" if bias < -1 else "well centered"
+        st.caption(
+            f"Partner calibration · {report.partner_observed} resolved offers · "
+            f"Brier {report.partner_brier_score:.3f} (lower is better) · "
+            f"fit estimate {abs(bias):.1f} points {direction}"
+        )
     with st.expander("Calibration by evidence grade"):
         for item in report.by_confidence:
             outcome = f"{item.positive_rate:.0%} positive" if item.positive_rate is not None else "No resolved outcomes"

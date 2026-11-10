@@ -143,3 +143,10 @@ class League:
     # Completed-week player stat lines, keyed by week and then Sleeper player id.
     # The aggregate ``player_stats`` remains available for existing consumers.
     weekly_player_stats: dict[int, dict[str, dict[str, float]]] = field(default_factory=dict)
+    # Provider role metadata keyed by player id. Values may include depth-chart
+    # order/position, years of experience, and provider roster status.
+    player_roles: dict[str, dict[str, object]] = field(default_factory=dict)
+    market_source_values: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Timely structured availability/market signals keyed by player id. These
+    # are evidence inputs, not independent player valuations.
+    player_signals: dict[str, dict[str, object]] = field(default_factory=dict)

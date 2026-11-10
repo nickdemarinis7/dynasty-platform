@@ -5,8 +5,11 @@ import math
 import random
 
 from .models import DraftPick, League, Player, Roster
-from .value_system import pick_profile
+from .value_system import pick_profile, premium_value_cutoff
 from .scoring import score_stats
+
+
+_OUTCOME_BASELINE_CACHE: dict[tuple[object, ...], tuple[float, float]] = {}
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,10 @@ class TradeResult:
     fit_a: float
     fit_b: float
     acceptance_score: int
+    playoff_probability_before: float | None = None
+    playoff_probability_after: float | None = None
+    championship_probability_before: float | None = None
+    championship_probability_after: float | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +137,27 @@ class ProjectionBacktest:
     improvement: float | None
     directional_accuracy: float | None
     by_position: tuple[ProjectionBacktestSlice, ...]
+    readiness: str
+
+
+@dataclass(frozen=True)
+class RecommendationBacktestSlice:
+    position: str
+    samples: int
+    success_rate: float
+    average_actual_lift: float
+    false_positive_rate: float
+
+
+@dataclass(frozen=True)
+class RecommendationBacktest:
+    samples: int
+    success_rate: float | None
+    average_predicted_lift: float | None
+    average_actual_lift: float | None
+    false_positive_rate: float | None
+    role_failure_rate: float | None
+    by_position: tuple[RecommendationBacktestSlice, ...]
     readiness: str
 
 
@@ -264,6 +292,100 @@ def backtest_projection_model(league: League, minimum_history: int = 3) -> Proje
     return ProjectionBacktest(
         len(observations), round(blended_mae, 2), round(baseline_mae, 2), round(improvement, 3),
         round(sum(row[4] for row in observations) / len(observations), 3), slices, readiness,
+    )
+
+
+def backtest_recommendation_model(league: League, minimum_history: int = 3) -> RecommendationBacktest:
+    """Walk forward synthetic lineup upgrades using only prior-week production.
+
+    This validates player selection and lineup fit. Historical market prices,
+    ownership changes, and manager acceptance are not reconstructed, so this is
+    intentionally not presented as a full trade-market backtest.
+    """
+    players = {
+        player.id: replace(player, injury_status=None)
+        for roster in league.rosters for player in roster.players
+    }
+    if len(league.rosters) < 2:
+        return RecommendationBacktest(0, None, None, None, None, None, (), "Insufficient history")
+    histories: dict[str, list[float]] = {}
+    observations: list[tuple[str, float, float, bool]] = []
+    for _, weekly_stats in sorted(league.weekly_player_stats.items()):
+        scored = {
+            player_id: score_stats(stats, league.scoring_settings, players[player_id].position)
+            for player_id, stats in weekly_stats.items() if player_id in players
+        }
+        active_nfl_teams = {players[player_id].team for player_id in scored if players[player_id].team not in {"", "FA"}}
+        actual = {
+            player_id: scored.get(player_id, 0.0)
+            for player_id, player in players.items()
+            if player.team in active_nfl_teams
+        }
+        predicted = {
+            player_id: (sum(scores[-3:]) / min(3, len(scores))) * .70 + (sum(scores) / len(scores)) * .30
+            for player_id, scores in histories.items() if player_id in players and len(scores) >= minimum_history
+        }
+        if predicted:
+            prediction_league = replace(league, weekly_points=predicted, weekly_player_stats={}, player_stats={})
+            actual_league = replace(league, weekly_points=actual, weekly_player_stats={}, player_stats={})
+            for roster in league.rosters:
+                roster_players = tuple(players[player.id] for player in roster.players if player.id in predicted)
+                if not roster_players:
+                    continue
+                replay_roster = replace(roster, players=roster_players, reserve_player_ids=(), taxi_player_ids=())
+                before_predicted = optimize_lineup(replay_roster.players, prediction_league).projected_points
+                own_ids = {player.id for player in replay_roster.players}
+                external = [player for player_id, player in players.items() if player_id in predicted and player_id not in own_ids]
+                for position in ("QB", "RB", "WR", "TE"):
+                    incoming = max(
+                        (player for player in external if player.position == position),
+                        key=lambda player: predicted[player.id], default=None,
+                    )
+                    if incoming is None or incoming.id not in actual:
+                        continue
+                    best: tuple[float, Player, tuple[Player, ...]] | None = None
+                    for outgoing in (player for player in replay_roster.players if player.position == position and player.id in actual):
+                        after_players = tuple(player for player in replay_roster.players if player.id != outgoing.id) + (incoming,)
+                        predicted_lift = optimize_lineup(after_players, prediction_league).projected_points - before_predicted
+                        if best is None or predicted_lift > best[0]:
+                            best = (predicted_lift, outgoing, after_players)
+                    if best is None or best[0] < 1.5:
+                        continue
+                    predicted_lift, outgoing, after_players = best
+                    before_actual = optimize_lineup(replay_roster.players, actual_league).projected_points
+                    after_actual = optimize_lineup(after_players, actual_league).projected_points
+                    actual_lift = after_actual - before_actual
+                    incoming_role_failure = actual[incoming.id] < max(2.0, predicted[incoming.id] * .35)
+                    observations.append((position, predicted_lift, actual_lift, incoming_role_failure))
+        for player_id, score in actual.items():
+            histories.setdefault(player_id, []).append(score)
+
+    def summarize(position: str, rows: list[tuple[str, float, float, bool]]) -> RecommendationBacktestSlice:
+        return RecommendationBacktestSlice(
+            position=position,
+            samples=len(rows),
+            success_rate=round(sum(row[2] > 0 for row in rows) / len(rows), 3),
+            average_actual_lift=round(sum(row[2] for row in rows) / len(rows), 2),
+            false_positive_rate=round(sum(row[2] <= 0 for row in rows) / len(rows), 3),
+        )
+
+    slices = tuple(
+        summarize(position, [row for row in observations if row[0] == position])
+        for position in ("QB", "RB", "WR", "TE") if any(row[0] == position for row in observations)
+    )
+    if not observations:
+        return RecommendationBacktest(0, None, None, None, None, None, (), "Insufficient history")
+    sample_count = len(observations)
+    readiness = "Early signal" if sample_count < 40 else "Usable sample" if sample_count < 120 else "Strong sample"
+    return RecommendationBacktest(
+        samples=sample_count,
+        success_rate=round(sum(row[2] > 0 for row in observations) / sample_count, 3),
+        average_predicted_lift=round(sum(row[1] for row in observations) / sample_count, 2),
+        average_actual_lift=round(sum(row[2] for row in observations) / sample_count, 2),
+        false_positive_rate=round(sum(row[2] <= 0 for row in observations) / sample_count, 3),
+        role_failure_rate=round(sum(row[3] for row in observations) / sample_count, 3),
+        by_position=slices,
+        readiness=readiness,
     )
 
 
@@ -445,12 +567,33 @@ def lineup_impact(
 
 
 def package_value(players: list[Player], picks: list[DraftPick] | None = None, league: League | None = None) -> float:
-    values = sorted(
-        [player.value for player in players if player.value > 0]
-        + [(pick_profile(pick, league).adjusted_value if league else pick.value) for pick in (picks or []) if pick.value > 0],
-        reverse=True,
+    """Sum market assets without reapplying a consolidation premium.
+
+    FantasyCalc's nonlinear player curve is learned from completed trades,
+    including multi-player deals. Uneven player counts are handled separately
+    as a roster-spot adjustment in ``evaluate_trade``.
+    """
+    player_value = sum(player.value for player in players if player.value > 0)
+    pick_value = sum(
+        pick_profile(pick, league).adjusted_value if league else pick.value
+        for pick in (picks or []) if pick.value > 0
     )
-    return round(sum(value if index == 0 else value * max(0.75, 0.9 - (index - 1) * 0.05) for index, value in enumerate(values)), 1)
+    return round(player_value + pick_value, 1)
+
+
+def replacement_player_value(league: League) -> float:
+    """Estimate the option value of one newly opened active-roster spot."""
+    available = sorted((player.value for player in league.free_agents if player.value > 0), reverse=True)
+    if available:
+        # Avoid pricing the spot from a single anomalous free agent. The fifth
+        # best available player is a reasonable immediately-addable baseline.
+        observed = available[min(4, len(available) - 1)]
+    else:
+        # FantasyCalc's published dynasty baseline is roughly 425 on its raw
+        # scale; provider values in this app are divided by 100.
+        observed = 4.25
+    cap = max(2.0, premium_value_cutoff(league) * .08)
+    return round(max(0.5, min(observed, cap)), 2)
 
 
 def build_contexts(league: League) -> dict[str, TeamContext]:
@@ -729,6 +872,98 @@ def compute_projections(league: League) -> list[PlayerProjection]:
     return sorted(output, key=lambda projection: (projection.edge_score, projection.player.value), reverse=True)
 
 
+def _trade_outcome_probabilities(
+    team_a: Roster,
+    team_b: Roster,
+    a_gives: list[Player],
+    b_gives: list[Player],
+    league: League,
+) -> tuple[float, float, float, float]:
+    """Simulate playoff and title odds before and after a proposed trade."""
+    if not any(roster.games_played for roster in league.rosters):
+        return 0.0, 0.0, 0.0, 0.0
+
+    def traded(roster: Roster, outgoing: list[Player], incoming: list[Player]) -> Roster:
+        outgoing_ids = {player.id for player in outgoing}
+        players = tuple(player for player in roster.players if player.id not in outgoing_ids) + tuple(incoming)
+        return replace(roster, players=players)
+
+    after_a = traded(team_a, a_gives, b_gives)
+    after_b = traded(team_b, b_gives, a_gives)
+    after_rosters = tuple(
+        after_a if roster.team_id == team_a.team_id else after_b if roster.team_id == team_b.team_id else roster
+        for roster in league.rosters
+    )
+
+    def lineup_power(roster: Roster, scenario_league: League) -> float:
+        weeks = scenario_league.playoff_weekly_points
+        if weeks:
+            values = [
+                optimize_lineup(active_roster_players(roster), replace(scenario_league, weekly_points=points, playoff_weekly_points={})).projected_points
+                for points in weeks.values() if points
+            ]
+            if values:
+                return sum(values) / len(values)
+        projected = optimize_lineup(active_roster_players(roster), scenario_league).projected_points
+        return projected or roster.points_for / max(roster.games_played, 1)
+
+    def simulate(rosters: tuple[Roster, ...]) -> tuple[float, float]:
+        scenario = replace(league, rosters=rosters)
+        powers = {roster.team_id: lineup_power(roster, scenario) for roster in rosters}
+        qualified = titles = 0
+        simulations = 160
+        # Reuse the same deterministic random stream before and after every
+        # trade. This common-random-numbers design reduces variance in the
+        # reported delta and keeps the baseline identical across packages.
+        rng = random.Random(sum(ord(character) for character in league.id) + 17)
+
+        def win_probability(left: str, right: str) -> float:
+            # Weekly fantasy results are far noisier than point projections.
+            # A wider scale prevents a modest projected edge from becoming a
+            # near-certain playoff result.
+            return 1 / (1 + math.exp(-(powers[left] - powers[right]) / 18.0))
+
+        for _ in range(simulations):
+            wins = {roster.team_id: roster.wins + roster.ties * .5 for roster in rosters}
+            for _, left, right in league.remaining_matchups:
+                if left in wins and right in wins:
+                    wins[left if rng.random() < win_probability(left, right) else right] += 1
+            field = sorted(rosters, key=lambda roster: (wins[roster.team_id], roster.points_for, powers[roster.team_id]), reverse=True)[:league.playoff_teams]
+            playoff_ids = [roster.team_id for roster in field]
+            if team_a.team_id not in playoff_ids:
+                continue
+            qualified += 1
+            alive = playoff_ids
+            while len(alive) > 1:
+                next_round: list[str] = []
+                if len(alive) % 2:
+                    next_round.append(alive[0])
+                    alive = alive[1:]
+                for index in range(len(alive) // 2):
+                    left, right = alive[index], alive[-(index + 1)]
+                    next_round.append(left if rng.random() < win_probability(left, right) else right)
+                alive = next_round
+            if alive and alive[0] == team_a.team_id:
+                titles += 1
+        return round(qualified / simulations * 100, 1), round(titles / simulations * 100, 1)
+
+    baseline_key = (
+        league.id, league.imported_at, team_a.team_id, league.current_week,
+        tuple((roster.team_id, roster.wins, roster.losses, roster.ties, roster.points_for) for roster in league.rosters),
+        tuple(sorted((week, left, right) for week, left, right in league.remaining_matchups)),
+        tuple(sorted((week, tuple(sorted(points.items()))) for week, points in league.playoff_weekly_points.items())),
+    )
+    before = _OUTCOME_BASELINE_CACHE.get(baseline_key)
+    if before is None:
+        before = simulate(league.rosters)
+        if len(_OUTCOME_BASELINE_CACHE) >= 32:
+            _OUTCOME_BASELINE_CACHE.pop(next(iter(_OUTCOME_BASELINE_CACHE)))
+        _OUTCOME_BASELINE_CACHE[baseline_key] = before
+    before_playoffs, before_title = before
+    after_playoffs, after_title = simulate(after_rosters)
+    return before_playoffs, after_playoffs, before_title, after_title
+
+
 def evaluate_trade(
     team_a: Roster,
     team_b: Roster,
@@ -742,6 +977,12 @@ def evaluate_trade(
 ) -> TradeResult:
     value_a = package_value(a_gives, a_gives_picks, league)
     value_b = package_value(b_gives, b_gives_picks, league)
+    player_count_difference = len(a_gives) - len(b_gives)
+    roster_spot_value = replacement_player_value(league)
+    if player_count_difference > 0:
+        value_b = round(value_b + roster_spot_value * player_count_difference, 1)
+    elif player_count_difference < 0:
+        value_a = round(value_a + roster_spot_value * abs(player_count_difference), 1)
     difference = round(value_b - value_a, 1)
     fairness = round(difference / max(value_a, value_b, 1) * 100, 1)
     impact_a = lineup_impact(team_a, a_gives, b_gives, league, model_playoffs)
@@ -774,14 +1015,25 @@ def evaluate_trade(
     preference_bonus = min(5.0, sum(acquired_positions) / max(len(acquired_positions), 1) * 1.25) if acquired_positions else 0.0
     if a_picks and tendency.get("picks_acquired", 0) > 0:
         preference_bonus += min(3.0, tendency["picks_acquired"])
-    acceptance = round(max(0, min(100, 50 + opponent_market_edge + opponent_fit_edge * 2 + opponent_lineup * 2 + activity_bonus + preference_bonus)))
+    journal_resolved = float(tendency.get("journal_resolved", 0))
+    journal_accepted = float(tendency.get("journal_accepted", 0))
+    # Beta(2, 2) shrinkage prevents a tiny journal sample from dominating.
+    journal_rate = (journal_accepted + 2) / (journal_resolved + 4)
+    journal_weight = min(16.0, journal_resolved * 3.0)
+    journal_bonus = (journal_rate - .5) * journal_weight
+    journal_bonus -= min(6.0, float(tendency.get("journal_partner_reject_feedback", 0)) * 1.5)
+    acceptance = round(max(0, min(100, 50 + opponent_market_edge + opponent_fit_edge * 2 + opponent_lineup * 2 + activity_bonus + preference_bonus + journal_bonus)))
     if abs(fairness) <= 8:
         verdict = "Fair market value"
     elif fairness > 8:
         verdict = f"Favors {team_a.team_name}"
     else:
         verdict = f"Favors {team_b.team_name}"
-    return TradeResult(value_a, value_b, difference, fairness, impact_a, impact_b, verdict, fit_a, fit_b, acceptance)
+    outcome_odds = _trade_outcome_probabilities(team_a, team_b, a_gives, b_gives, league) if model_playoffs else (None, None, None, None)
+    return TradeResult(
+        value_a, value_b, difference, fairness, impact_a, impact_b, verdict, fit_a, fit_b, acceptance,
+        *outcome_odds,
+    )
 
 
 def explain_trade(

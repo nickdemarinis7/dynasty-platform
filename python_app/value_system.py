@@ -12,6 +12,8 @@ class ValueProfile:
     high: float
     tier: str
     percentile: int
+    source_count: int = 1
+    source_disagreement: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -102,12 +104,19 @@ def value_profile(player: Player, league: League) -> ValueProfile:
     # A continuous curve avoids artificial range jumps when two adjacent
     # players happen to fall on opposite sides of a tier label.
     uncertainty = .08 + (100 - rank) / 100 * .20
+    sources = list(league.market_source_values.get(player.id, {}).values())
+    disagreement = (
+        (max(sources) - min(sources)) / max(sum(sources) / len(sources), 1) * 100
+        if len(sources) >= 2 else 0.0
+    )
     return ValueProfile(
         player.value,
         round(max(0, player.value * (1 - uncertainty)), 1),
         round(player.value * (1 + uncertainty), 1),
         tier,
         rank,
+        len(sources) or 1,
+        round(disagreement, 1),
     )
 
 

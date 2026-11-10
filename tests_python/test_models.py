@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import active_roster_players, backtest_projection_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile
+from python_app.analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile
 from python_app.models import DevyProspect, DraftPick, League, Player, Roster
 from python_app.recommendations import generate_recommendations
 from python_app.strategy import build_team_plan
@@ -39,6 +39,14 @@ class RosterModelTests(unittest.TestCase):
         lower_width = (lower.high - lower.low) / lower.value
         upper_width = (upper.high - upper.low) / upper.value
         self.assertLess(abs(lower_width - upper_width), .01)
+
+    def test_value_profile_reports_cross_source_disagreement(self) -> None:
+        player = Player("p", "Player", "TE", "A", 24, 50)
+        roster = Roster("1", "A", "A", (player,))
+        league = replace(self._league((roster,)), market_source_values={"p": {"FantasyCalc": 40, "Stats Guy Fantasy": 60}})
+        profile = value_profile(player, league)
+        self.assertEqual(profile.source_count, 2)
+        self.assertEqual(profile.source_disagreement, 40.0)
 
     def test_core_protection_is_relative_to_market_not_fixed_scale(self) -> None:
         core = Player("core", "Core", "WR", "A", 24, 57.4)
@@ -389,6 +397,24 @@ class RosterModelTests(unittest.TestCase):
         report = backtest_projection_model(league)
         self.assertEqual(report.samples, 2)
         self.assertGreater(report.improvement, 0)
+        self.assertEqual(report.by_position[0].position, "WR")
+
+    def test_recommendation_backtest_measures_next_week_lineup_lift(self) -> None:
+        weak = Player("weak", "Weak WR", "WR", "A", 25, 30)
+        strong = Player("strong", "Strong WR", "WR", "B", 25, 50)
+        league = replace(
+            self._league((Roster("1", "A", "A", (weak,)), Roster("2", "B", "B", (strong,)))),
+            weekly_player_stats={
+                1: {"weak": {"rec_yd": 40}, "strong": {"rec_yd": 90}},
+                2: {"weak": {"rec_yd": 50}, "strong": {"rec_yd": 100}},
+                3: {"weak": {"rec_yd": 45}, "strong": {"rec_yd": 95}},
+                4: {"weak": {"rec_yd": 30}, "strong": {"rec_yd": 110}},
+            },
+        )
+        report = backtest_recommendation_model(league)
+        self.assertEqual(report.samples, 1)
+        self.assertEqual(report.success_rate, 1.0)
+        self.assertGreater(report.average_actual_lift, 0)
         self.assertEqual(report.by_position[0].position, "WR")
 
     def test_out_player_never_uses_healthy_projection_or_average(self) -> None:

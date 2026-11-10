@@ -62,6 +62,40 @@ def get_players() -> dict[str, dict[str, Any]]:
     return data
 
 
+def _parse_trending_players(data: Any) -> dict[str, int]:
+    if not isinstance(data, list):
+        return {}
+    output: dict[str, int] = {}
+    for row in data:
+        if not isinstance(row, dict) or row.get("player_id") is None:
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            output[str(row["player_id"])] = count
+    return output
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_player_trends(lookback_hours: int = 24) -> tuple[dict[str, int], dict[str, int]]:
+    """Return official Sleeper add/drop activity as a weak role-change signal."""
+    def load(kind: str) -> dict[str, int]:
+        try:
+            data = _get_json(
+                f"{SLEEPER_BASE}/players/nfl/trending/{kind}",
+                params={"lookback_hours": lookback_hours, "limit": 100},
+            )
+        except ProviderError:
+            return {}
+        return _parse_trending_players(data)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        additions, drops = pool.map(load, ("add", "drop"))
+    return additions, drops
+
+
 def _parse_devy_prospects(data: Any) -> tuple[DevyProspect, ...]:
     rows = data.get("data") if isinstance(data, dict) else None
     if not isinstance(rows, list):
@@ -213,6 +247,33 @@ def get_market_values(is_dynasty: bool, num_qbs: int, num_teams: int, ppr: float
     return {"players": values, "picks": picks}
 
 
+def _parse_secondary_market_values(data: Any, key: str) -> dict[str, float]:
+    rows = data.get("players") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    values: dict[str, float] = {}
+    for item in rows:
+        if not isinstance(item, dict) or not item.get("id") or not isinstance(item.get("value"), dict):
+            continue
+        raw = item["value"].get(key)
+        if isinstance(raw, (int, float)) and raw > 0:
+            values[str(item["id"])] = round(float(raw) / 100, 2)
+    return values
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_secondary_market_values(is_dynasty: bool, superflex: bool, te_premium: bool) -> dict[str, float]:
+    data = _get_json(
+        "https://api.statsguyfantasy.com/api/v1/players",
+        params={"tep": "tep" if te_premium else "std"},
+    )
+    key = f"{'sf' if superflex else 'non_sf'}_{'dynasty' if is_dynasty else 'redraft'}"
+    values = _parse_secondary_market_values(data, key)
+    if not values:
+        raise ProviderError("Stats Guy Fantasy returned no usable player values")
+    return values
+
+
 def _league_mode(league: dict[str, Any]) -> str:
     raw_type = (league.get("settings") or {}).get("type", league.get("type", 0))
     try:
@@ -314,15 +375,35 @@ def import_league(username: str, league_id: str) -> League:
     raw_waiver_budget = int(league_settings.get("waiver_budget") or 0)
     waiver_budget = raw_waiver_budget if raw_waiver_budget > 0 else None
 
+    fantasycalc_values: dict[str, float] = {}
+    secondary_values: dict[str, float] = {}
+    pick_values: dict[str, float] = {}
     try:
         market = get_market_values(mode != "redraft", 2 if superflex else 1, team_count, reception)
-        values = market["players"]
+        fantasycalc_values = market["players"]
         pick_values = market["picks"]
-        values_status = "live"
     except ProviderError:
-        values = {}
-        pick_values = {}
-        values_status = "unavailable"
+        pass
+    try:
+        secondary_values = get_secondary_market_values(mode != "redraft", superflex, te_premium)
+    except ProviderError:
+        pass
+    source_ids = set(fantasycalc_values) | set(secondary_values)
+    market_source_values = {
+        player_id: {
+            **({"FantasyCalc": fantasycalc_values[player_id]} if player_id in fantasycalc_values else {}),
+            **({"Stats Guy Fantasy": secondary_values[player_id]} if player_id in secondary_values else {}),
+        }
+        for player_id in source_ids
+    }
+    values = {
+        player_id: round(
+            fantasycalc_values[player_id] * .60 + secondary_values[player_id] * .40, 2,
+        ) if player_id in fantasycalc_values and player_id in secondary_values
+        else fantasycalc_values.get(player_id, secondary_values.get(player_id, 0))
+        for player_id in source_ids
+    }
+    values_status = "live" if values else "unavailable"
 
     if mode == "dynasty":
         try:
@@ -337,6 +418,34 @@ def import_league(username: str, league_id: str) -> League:
         str(player_id): str(raw.get("team"))
         for player_id, raw in player_data.items()
         if isinstance(raw, dict) and raw.get("team")
+    }
+    player_roles = {
+        str(player_id): {
+            "depth_chart_order": raw.get("depth_chart_order"),
+            "depth_chart_position": raw.get("depth_chart_position"),
+            "years_exp": raw.get("years_exp"),
+            "status": raw.get("status"),
+        }
+        for player_id, raw in player_data.items()
+        if isinstance(raw, dict)
+    }
+    trend_adds, trend_drops = get_player_trends()
+    signal_ids = set(player_data) | set(trend_adds) | set(trend_drops)
+    player_signals = {
+        player_id: {
+            "status": raw.get("status"),
+            "practice_participation": raw.get("practice_participation"),
+            "practice_description": raw.get("practice_description"),
+            "injury_body_part": raw.get("injury_body_part"),
+            "injury_notes": raw.get("injury_notes"),
+            "injury_start_date": raw.get("injury_start_date"),
+            "news_updated": raw.get("news_updated"),
+            "trending_adds_24h": trend_adds.get(player_id, 0),
+            "trending_drops_24h": trend_drops.get(player_id, 0),
+            "trend_window_hours": 24,
+        }
+        for player_id in signal_ids
+        if isinstance((raw := player_data.get(player_id, {})), dict)
     }
     players: dict[str, Player] = {}
     valid_positions = {"QB", "RB", "WR", "TE", "K", "DEF"}
@@ -475,9 +584,11 @@ def import_league(username: str, league_id: str) -> League:
         SourceHealth("Sleeper standings", "ready" if standings_available else "limited", "Current records and points scored loaded" if standings_available else "No completed games yet; direction uses roster evidence"),
         SourceHealth("Sleeper schedule", "ready" if remaining_matchups or current_week > regular_season_end else "limited", f"Loaded {len(remaining_matchups)} remaining matchups" if remaining_matchups else "Remaining schedule unavailable"),
         SourceHealth("Trade history", "ready" if transactions else "limited", f"Loaded {len(transactions)} completed league trades" if transactions else "No completed trades found this season"),
-        SourceHealth("FantasyCalc", "ready" if values_status == "live" else "unavailable", "Current market values loaded" if values_status == "live" else "Market values could not be loaded", datetime.now(timezone.utc).isoformat()),
+        SourceHealth("FantasyCalc", "ready" if fantasycalc_values else "unavailable", "Current trade-derived market values loaded" if fantasycalc_values else "FantasyCalc values could not be loaded", datetime.now(timezone.utc).isoformat()),
+        SourceHealth("Stats Guy Fantasy", "ready" if secondary_values else "limited", f"Loaded {'TE-premium' if te_premium else 'standard'} consensus values" if secondary_values else "Secondary market consensus is unavailable", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Sleeper stats", "ready" if len(stats_weeks) == expected_weeks else "limited", f"Loaded {len(stats_weeks)} of {expected_weeks} completed weeks"),
         SourceHealth("Sleeper projections", "ready" if weekly_points else "limited", f"Week {current_week} projections loaded" if weekly_points else f"Week {current_week} projections unavailable"),
+        SourceHealth("Sleeper role signals", "ready" if trend_adds or trend_drops else "limited", f"Loaded Sleeper's 24-hour add/drop window for {len(set(trend_adds) | set(trend_drops))} players" if trend_adds or trend_drops else "Player status is loaded, but trend activity is unavailable", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Playoff projections", "ready" if playoff_weekly_points else "limited", f"Loaded weeks {', '.join(map(str, playoff_weekly_points))}" if playoff_weekly_points else "Future playoff-week projections are not yet available"),
         SourceHealth("Draft picks", "ready" if mode == "redraft" or bool(pick_values) else "limited", "Market pick values loaded" if pick_values else "Unpriced picks are retained with no estimated value"),
         SourceHealth("Devy classes", "ready" if mode != "dynasty" or bool(devy_prospects) else "limited", f"Loaded {len(devy_prospects)} future prospects" if devy_prospects else "Future prospect class data is unavailable"),
@@ -503,4 +614,7 @@ def import_league(username: str, league_id: str) -> League:
         import_duration_ms=round((monotonic() - import_started) * 1000),
         devy_prospects=devy_prospects,
         weekly_player_stats=weekly_player_stats,
+        player_roles=player_roles,
+        market_source_values=market_source_values,
+        player_signals=player_signals,
     )
