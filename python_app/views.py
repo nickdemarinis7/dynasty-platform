@@ -67,12 +67,14 @@ def _calibrated_trade_league(league: League) -> League:
     return replace(league, manager_tendencies=tendencies, imported_at=f"{league.imported_at or ''}|journal:{signature}")
 
 
-def _cached_trade_finder(league: League, target_position: str | None, risk_profile: str, engine_version: int) -> tuple[list[object], object]:
+def _cached_trade_finder(league: League, target_position: str | None, risk_profile: str, engine_version: int) -> tuple[list[object], object, bool]:
     """Cache recommendation objects in-session without pickling live dataclasses."""
     cache_key = (engine_version, league.id, league.imported_at, target_position, risk_profile)
-    cached = st.session_state.get("_trade_finder_cache")
-    if cached and cached.get("key") == cache_key:
-        return cached["value"]
+    cache = st.session_state.get("_trade_finder_cache")
+    if not isinstance(cache, dict) or "key" in cache:
+        cache = {}
+    if cache_key in cache:
+        return (*cache[cache_key], True)
     value = timed_generate_recommendations(
         league,
         target_position=target_position,
@@ -80,8 +82,11 @@ def _cached_trade_finder(league: League, target_position: str | None, risk_profi
         include_review_candidates=True,
         risk_profile=risk_profile,
     )
-    st.session_state._trade_finder_cache = {"key": cache_key, "value": value}
-    return value
+    cache[cache_key] = value
+    while len(cache) > 8:
+        cache.pop(next(iter(cache)))
+    st.session_state._trade_finder_cache = cache
+    return (*value, False)
 
 
 def _page_header(kicker: str, title: str, description: str) -> None:
@@ -532,10 +537,18 @@ def recommendations(league: League) -> None:
     if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
         st.info(f"Your week {league.trade_deadline_week} trade deadline has passed. Trade Finder is paused so it does not present unavailable moves.")
         return
-    with st.spinner("Evaluating realistic packages…"):
-        all_ideas, search_performance = _cached_trade_finder(
+    with st.status("Building realistic trade ideas…", expanded=True) as search_status:
+        st.write("Screening market-balanced packages, then fully simulating the strongest finalists.")
+        all_ideas, search_performance, cache_hit = _cached_trade_finder(
             league, None if position == "ALL" else position, risk_profile, TRADE_FINDER_CACHE_VERSION,
         )
+        if cache_hit:
+            search_status.update(label="Loaded the saved search for this league and filter", state="complete", expanded=False)
+        else:
+            search_status.update(
+                label=f"Search complete · {search_performance.packages_evaluated} screened · {search_performance.full_evaluations} fully simulated",
+                state="complete", expanded=False,
+            )
     ideas = [idea for idea in all_ideas if show_experimental or (idea.confidence != "D" and idea.score >= 55)]
     if not ideas:
         st.info("No package currently offers enough strategic upside for this risk profile. Holding is preferable to forcing a trade.")

@@ -153,6 +153,9 @@ DARK_THEME_CSS = """
   .stApp {background:radial-gradient(circle at 92% 3%,rgba(185,245,66,.13),transparent 25rem),radial-gradient(circle at -8% 31%,rgba(112,96,235,.17),transparent 24rem),radial-gradient(circle at 105% 72%,rgba(10,148,160,.13),transparent 28rem),linear-gradient(180deg,#151b14 0,var(--canvas) 30rem);color:var(--ink);}
   .stApp p,.stApp li,.stApp label,.stApp [data-testid="stMarkdownContainer"],.stApp [data-testid="stWidgetLabel"] {color:var(--ink);}
   .stApp [data-testid="stCaptionContainer"],.stApp [data-testid="stCaptionContainer"] p {color:#aeb8aa!important;opacity:1!important;}
+  .stApp [data-testid="stAlert"],.stApp [data-testid="stAlert"] > div,.stApp [data-baseweb="notification"] {background:#1d2b27!important;background-image:none!important;border-color:#3c5149!important;color:#eef5ec!important;}
+  .stApp [data-testid="stAlert"] p,.stApp [data-testid="stAlert"] span,.stApp [data-testid="stAlert"] div,.stApp [data-baseweb="notification"] p,.stApp [data-baseweb="notification"] span {color:#eef5ec!important;opacity:1!important;}
+  .stApp [data-testid="stAlert"] svg,.stApp [data-baseweb="notification"] svg {fill:var(--accent)!important;color:var(--accent)!important;}
   .stApp [role="radiogroup"] label,.stApp [role="radiogroup"] label p,.stApp [data-testid="stRadio"] label,.stApp [data-testid="stRadio"] label p {color:#e9eee5!important;opacity:1!important;}
   .stApp input,.stApp textarea,.stApp input::placeholder,.stApp textarea::placeholder {color:var(--ink)!important;-webkit-text-fill-color:var(--ink);opacity:1;}
   .stApp input::placeholder,.stApp textarea::placeholder {color:#8f9a8b!important;-webkit-text-fill-color:#8f9a8b;}
