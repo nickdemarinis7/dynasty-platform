@@ -89,6 +89,16 @@ def _cached_trade_finder(league: League, target_position: str | None, risk_profi
     return (*value, False)
 
 
+def _cached_waiver_recommendations(league: League) -> tuple[list[object], bool]:
+    cache_key = (league.id, league.imported_at, league.current_week)
+    cached = st.session_state.get("_waiver_recommendation_cache")
+    if cached and cached.get("key") == cache_key:
+        return cached["value"], True
+    value = generate_waiver_recommendations(league)
+    st.session_state._waiver_recommendation_cache = {"key": cache_key, "value": value}
+    return value, False
+
+
 def _page_header(kicker: str, title: str, description: str) -> None:
     st.markdown(
         f'<div class="page-intro"><div class="app-kicker">{html.escape(kicker)}</div>'
@@ -993,7 +1003,16 @@ def player_seeker(league: League) -> None:
 def waivers(league: League) -> None:
     _page_header("Weekly moves", "Waiver Assistant", "Exact add/drop recommendations measured against your lineup, playoff weeks, depth, and dynasty timeline.")
     position = st.pills("Position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL", key="waiver_position")
-    ideas = generate_waiver_recommendations(league)
+    loading_slot = st.empty()
+    loading_slot.markdown(
+        '<div class="search-loading"><span class="search-spinner"></span><div>'
+        '<strong>Ranking waiver moves…</strong>'
+        '<span>Screening the player pool, then fully modeling the strongest add/drop finalists.</span>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+    ideas, _cache_hit = _cached_waiver_recommendations(league)
+    loading_slot.empty()
     if position != "ALL":
         ideas = [idea for idea in ideas if idea.add.position == position]
     if not league.free_agents:

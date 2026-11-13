@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .analytics import active_roster_players, build_contexts, lineup_impact, optimize_lineup, projected_points
 from .models import League, Player
@@ -103,7 +103,11 @@ def generate_waiver_recommendations(league: League, limit: int = 20) -> list[Wai
         choices: list[Player | None] = [None] if open_spot else list(drops)
         best: WaiverRecommendation | None = None
         for drop in choices:
-            impact = lineup_impact(roster, [drop] if drop else [], [add], league)
+            # Screen the broad add/drop pool against the current lineup first.
+            # Full remaining-season and playoff modeling is reserved for the
+            # finalists below; doing it for every pair makes large waiver pools
+            # needlessly expensive without improving candidate discovery.
+            impact = lineup_impact(roster, [drop] if drop else [], [add], league, model_playoffs=False)
             value_gain = add.value - (drop.value if drop else 0)
             need = context.position_needs.get(add.position, 0)
             is_stash = league.mode != "redraft" and add.age > 0 and add.age <= 24 and value_gain >= 4
@@ -174,4 +178,40 @@ def generate_waiver_recommendations(league: League, limit: int = 20) -> list[Wai
                 best = recommendation
         if best is not None:
             recommendations.append(best)
-    return sorted(recommendations, key=lambda item: (item.score, item.lineup_gain, item.value_gain), reverse=True)[:limit]
+    preliminary = sorted(
+        recommendations,
+        key=lambda item: (item.score, item.lineup_gain, item.value_gain),
+        reverse=True,
+    )[:max(limit + 10, 30)]
+    finalists: list[WaiverRecommendation] = []
+    for recommendation in preliminary:
+        impact = lineup_impact(
+            roster,
+            [recommendation.drop] if recommendation.drop else [],
+            [recommendation.add],
+            league,
+            model_playoffs=True,
+        )
+        playoff = impact.playoff_points_gained or 0
+        need = context.position_needs.get(recommendation.add.position, 0)
+        is_stash = recommendation.category == "DYNASTY STASH"
+        raw_score = 48 + impact.points_gained * 4 + playoff * 2 + impact.depth_change * .7 + recommendation.value_gain * .8 + need * .08
+        if is_stash:
+            raw_score += 6
+        score = round(max(0, min(100, raw_score)))
+        score = max(0, score - {"A": 0, "B": 2, "C": 6, "D": 12}[recommendation.confidence])
+        if impact.new_starters:
+            lineup_change = f"Enters lineup: {', '.join(impact.new_starters)}"
+            if impact.displaced_starters:
+                lineup_change += f" · Displaces: {', '.join(impact.displaced_starters)}"
+        else:
+            lineup_change = "No immediate starting-lineup change"
+        finalists.append(replace(
+            recommendation,
+            score=score,
+            lineup_gain=impact.points_gained,
+            playoff_gain=impact.playoff_points_gained,
+            depth_change=impact.depth_change,
+            lineup_change=lineup_change,
+        ))
+    return sorted(finalists, key=lambda item: (item.score, item.lineup_gain, item.value_gain), reverse=True)[:limit]
