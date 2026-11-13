@@ -89,6 +89,12 @@ st.markdown("""
   .final-verdict {display:flex;align-items:flex-start;gap:.55rem;background:var(--danger-soft);border:1px solid #efc4c0;border-left:4px solid var(--danger);border-radius:10px;padding:.65rem .72rem;margin:.75rem 0 .55rem;color:var(--danger);font-size:.76rem;line-height:1.4;}
   .final-verdict strong {white-space:nowrap;font-weight:900;}
   .final-verdict span {color:#74413c;}
+  .search-loading {display:flex;align-items:flex-start;gap:.75rem;background:linear-gradient(135deg,var(--panel),#edf3e8);border:1px solid var(--line);border-radius:14px;padding:.9rem 1rem;margin:.5rem 0;color:var(--ink);box-shadow:0 8px 24px rgba(25,35,22,.07);}
+  .search-loading div {display:flex;flex-direction:column;gap:.2rem;min-width:0;}
+  .search-loading strong {font-size:.84rem;font-weight:850;color:var(--ink);}
+  .search-loading span:not(.search-spinner) {font-size:.75rem;line-height:1.4;color:var(--muted);}
+  .search-spinner {flex:0 0 auto;width:1rem;height:1rem;margin-top:.08rem;border:2px solid #cbd5c4;border-top-color:var(--accent);border-radius:50%;animation:search-spin .8s linear infinite;}
+  @keyframes search-spin {to {transform:rotate(360deg);}}
   .decision-value {font-size:.87rem;font-weight:850;line-height:1.2;overflow-wrap:anywhere;}
   .decision-label {font-size:.59rem;color:#747c71;font-weight:820;letter-spacing:.075em;text-transform:uppercase;margin-top:.3rem;}
   .risk-callout {border-radius:10px;padding:.62rem .72rem;margin:.55rem 0 .75rem;background:var(--warning-soft);color:#6e410b;border:1px solid #f0d5a3;font-size:.78rem;line-height:1.42;}
@@ -219,6 +225,10 @@ DARK_THEME_CSS = """
   .decision-tile:nth-child(3) {background:linear-gradient(145deg,var(--cyan-soft),#203f40);border-color:#34595a;}
   .final-verdict {background:#3b2221;border-color:#67403c;color:#ffaaa3;}
   .final-verdict span {color:#e7bbb7;}
+  .search-loading {background:linear-gradient(135deg,#18231f,#1a2829);border-color:#3b4d45;box-shadow:0 10px 28px rgba(0,0,0,.18);}
+  .search-loading strong {color:#f1f6ee;}
+  .search-loading span:not(.search-spinner) {color:#b3beb0;}
+  .search-spinner {border-color:#4a594d;border-top-color:var(--accent);}
   .home-status-primary {background:#2c4018;color:#dafa9a;border-color:#526d2b;}
   .gm-brief {background:linear-gradient(135deg,#1b251c,#202c21);border-color:#354238;box-shadow:0 12px 30px rgba(0,0,0,.18);}
   .gm-brief-kicker,.gm-brief-action strong {color:var(--accent);}

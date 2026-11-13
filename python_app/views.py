@@ -537,18 +537,18 @@ def recommendations(league: League) -> None:
     if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
         st.info(f"Your week {league.trade_deadline_week} trade deadline has passed. Trade Finder is paused so it does not present unavailable moves.")
         return
-    with st.status("Building realistic trade ideas…", expanded=True) as search_status:
-        st.write("Screening market-balanced packages, then fully simulating the strongest finalists.")
-        all_ideas, search_performance, cache_hit = _cached_trade_finder(
-            league, None if position == "ALL" else position, risk_profile, TRADE_FINDER_CACHE_VERSION,
-        )
-        if cache_hit:
-            search_status.update(label="Loaded the saved search for this league and filter", state="complete", expanded=False)
-        else:
-            search_status.update(
-                label=f"Search complete · {search_performance.packages_evaluated} screened · {search_performance.full_evaluations} fully simulated",
-                state="complete", expanded=False,
-            )
+    loading_slot = st.empty()
+    loading_slot.markdown(
+        '<div class="search-loading"><span class="search-spinner"></span><div>'
+        '<strong>Building realistic trade ideas…</strong>'
+        '<span>Screening market-balanced packages, then fully simulating the strongest finalists.</span>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+    all_ideas, search_performance, _cache_hit = _cached_trade_finder(
+        league, None if position == "ALL" else position, risk_profile, TRADE_FINDER_CACHE_VERSION,
+    )
+    loading_slot.empty()
     ideas = [idea for idea in all_ideas if show_experimental or (idea.confidence != "D" and idea.score >= 55)]
     if not ideas:
         st.info("No package currently offers enough strategic upside for this risk profile. Holding is preferable to forcing a trade.")
