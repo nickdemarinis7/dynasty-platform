@@ -24,6 +24,7 @@ st.markdown("""
   .stApp {background:radial-gradient(circle at 92% 3%,rgba(185,245,66,.29),transparent 25rem),radial-gradient(circle at -8% 31%,rgba(102,87,217,.12),transparent 24rem),radial-gradient(circle at 105% 72%,rgba(8,127,140,.10),transparent 28rem),linear-gradient(180deg,#f8faF4 0,var(--canvas) 30rem);color:var(--ink);}
   .block-container {max-width:720px;padding:3rem 1.2rem 6rem;}
   [data-testid="stHeader"] {height:2.5rem;background:rgba(245,248,240,.78);backdrop-filter:blur(18px);border-bottom:1px solid rgba(16,19,15,.07);}
+  [data-testid="stElementContainer"][data-stale="true"] {display:none!important;}
   [data-testid="stMetric"] {background:transparent;border:0;border-radius:0;padding:.65rem;}
   [data-testid="stMetricLabel"] {font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;}
   div[data-testid="stVerticalBlockBorderWrapper"] {background:linear-gradient(145deg,rgba(255,255,255,.97),rgba(247,250,243,.93));border:1px solid rgba(73,91,61,.14);border-radius:18px;box-shadow:0 12px 34px rgba(30,40,24,.08);overflow:hidden;}
@@ -156,6 +157,9 @@ DARK_THEME_CSS = """
   .stApp [data-testid="stAlert"],.stApp [data-testid="stAlert"] > div,.stApp [data-baseweb="notification"] {background:#1d2b27!important;background-image:none!important;border-color:#3c5149!important;color:#eef5ec!important;}
   .stApp [data-testid="stAlert"] p,.stApp [data-testid="stAlert"] span,.stApp [data-testid="stAlert"] div,.stApp [data-baseweb="notification"] p,.stApp [data-baseweb="notification"] span {color:#eef5ec!important;opacity:1!important;}
   .stApp [data-testid="stAlert"] svg,.stApp [data-baseweb="notification"] svg {fill:var(--accent)!important;color:var(--accent)!important;}
+  .stApp [data-testid="stStatusWidget"],.stApp [data-testid="stStatusWidget"] > div,.stApp [data-testid="stStatusWidget"] details,.stApp [data-testid="stStatusWidget"] summary,.stApp [data-testid="stStatusWidget"] [role="button"] {background:#18231f!important;background-image:none!important;border-color:#3b4d45!important;color:#eef5ec!important;}
+  .stApp [data-testid="stStatusWidget"] p,.stApp [data-testid="stStatusWidget"] span,.stApp [data-testid="stStatusWidget"] div {color:#eef5ec!important;opacity:1!important;}
+  .stApp [data-testid="stStatusWidget"] svg {color:var(--accent)!important;}
   .stApp [role="radiogroup"] label,.stApp [role="radiogroup"] label p,.stApp [data-testid="stRadio"] label,.stApp [data-testid="stRadio"] label p {color:#e9eee5!important;opacity:1!important;}
   .stApp input,.stApp textarea,.stApp input::placeholder,.stApp textarea::placeholder {color:var(--ink)!important;-webkit-text-fill-color:var(--ink);opacity:1;}
   .stApp input::placeholder,.stApp textarea::placeholder {color:#8f9a8b!important;-webkit-text-fill-color:#8f9a8b;}
