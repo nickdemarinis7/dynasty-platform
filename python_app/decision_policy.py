@@ -1,0 +1,8 @@
+"""Shared interpretation thresholds for trade analysis and presentation."""
+
+MARKET_NOISE_PERCENT = 8.0
+MARKET_MEANINGFUL_PERCENT = 15.0
+MARKET_SUBSTANTIAL_PERCENT = 25.0
+LINEUP_UPGRADE_PPG = 2.0
+LINEUP_DECLINE_PPG = -1.0
+DEPTH_MATERIAL_CHANGE = 5.0

@@ -134,6 +134,7 @@ class League:
     remaining_matchups: tuple[tuple[int, str, str], ...] = field(default_factory=tuple)
     trade_deadline_week: int | None = None
     playoff_weekly_points: dict[int, dict[str, float]] = field(default_factory=dict)
+    regular_season_weekly_points: dict[int, dict[str, float]] = field(default_factory=dict)
     manager_tendencies: dict[str, dict[str, float]] = field(default_factory=dict)
     free_agents: tuple[Player, ...] = field(default_factory=tuple)
     active_roster_capacity: int = 0

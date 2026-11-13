@@ -5,7 +5,8 @@ import math
 import random
 
 from .models import DraftPick, League, Player, Roster
-from .value_system import pick_profile, premium_value_cutoff
+from .value_system import pick_profile, premium_value_cutoff, value_profile
+from .decision_policy import DEPTH_MATERIAL_CHANGE, LINEUP_DECLINE_PPG, LINEUP_UPGRADE_PPG, MARKET_NOISE_PERCENT
 from .scoring import score_stats
 
 
@@ -37,6 +38,10 @@ class LineupImpact:
     before_resilience: int = 0
     after_resilience: int = 0
     critical_positions: tuple[str, ...] = ()
+    remaining_season_points_gained: float | None = None
+    remaining_season_weeks_modeled: tuple[int, ...] = ()
+    introduced_coverage_warnings: tuple[str, ...] = ()
+    existing_coverage_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -167,6 +172,24 @@ class TradeNarrative:
     summary: str
     reasons: tuple[str, ...]
     primary_risk: str
+
+
+@dataclass(frozen=True)
+class TeamTradeAssessment:
+    label: str
+    action: str
+    current_label: str
+    remaining_label: str
+    playoff_label: str
+    depth_label: str
+    market_label: str
+
+
+@dataclass(frozen=True)
+class TradeMarketRange:
+    downside_fairness: float
+    base_fairness: float
+    upside_fairness: float
 
 
 def projection_profile(player: Player, league: League) -> ProjectionProfile:
@@ -390,6 +413,16 @@ def backtest_recommendation_model(league: League, minimum_history: int = 3) -> R
 
 
 def projected_points(player: Player, league: League) -> float:
+    signal = league.player_signals.get(player.id, {})
+    try:
+        bye_week = int(signal.get("bye_week") or 0)
+    except (TypeError, ValueError):
+        bye_week = 0
+    if bye_week and bye_week == league.current_week:
+        return 0.0
+    provider_status = str(signal.get("status") or "").strip().lower().replace(" ", "_")
+    if provider_status in {"retired", "suspended", "reserve", "injured_reserve", "pup", "nfi"}:
+        return 0.0
     weekly = league.weekly_points.get(player.id)
     if weekly is not None and weekly > 0:
         base = weekly
@@ -414,6 +447,11 @@ def projected_points(player: Player, league: League) -> float:
 def active_roster_players(roster: Roster) -> tuple[Player, ...]:
     inactive_ids = set(roster.reserve_player_ids) | set(roster.taxi_player_ids)
     return tuple(player for player in roster.players if player.id not in inactive_ids)
+
+
+def tradable_roster_players(roster: Roster) -> tuple[Player, ...]:
+    """Return every owned asset, including players currently on IR or taxi."""
+    return roster.players
 
 
 def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) -> Lineup:
@@ -511,6 +549,34 @@ def _depth_profile(players: tuple[Player, ...] | list[Player], league: League) -
     return float(profile.score), profile.warnings
 
 
+_ROSTER_BASELINE_CACHE: dict[tuple[object, ...], tuple[tuple[Player, ...], Lineup, DepthProfile]] = {}
+
+
+def _roster_baseline(roster: Roster, league: League) -> tuple[tuple[Player, ...], Lineup, DepthProfile]:
+    """Cache the unchanged side of repeated package comparisons."""
+    key = (
+        id(league),
+        league.id,
+        league.imported_at,
+        league.current_week,
+        roster.team_id,
+        tuple((player.id, player.value, player.injury_status) for player in roster.players),
+        roster.reserve_player_ids,
+        roster.taxi_player_ids,
+        tuple(sorted(league.weekly_points.items())),
+    )
+    cached = _ROSTER_BASELINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    active = active_roster_players(roster)
+    lineup = optimize_lineup(active, league)
+    value = (active, lineup, depth_profile(active, league, lineup))
+    if len(_ROSTER_BASELINE_CACHE) >= 128:
+        _ROSTER_BASELINE_CACHE.pop(next(iter(_ROSTER_BASELINE_CACHE)))
+    _ROSTER_BASELINE_CACHE[key] = value
+    return value
+
+
 def lineup_impact(
     roster: Roster,
     given: list[Player],
@@ -518,8 +584,7 @@ def lineup_impact(
     league: League,
     model_playoffs: bool = True,
 ) -> LineupImpact:
-    active_players = active_roster_players(roster)
-    before = optimize_lineup(active_players, league)
+    active_players, before, before_profile = _roster_baseline(roster, league)
     given_ids = {player.id for player in given}
     after_players = [player for player in active_players if player.id not in given_ids] + received
     after = optimize_lineup(after_players, league)
@@ -533,8 +598,20 @@ def lineup_impact(
     new = tuple(player.name for player in after.starters if player.id not in before_ids)
     replacements = tuple(player.name for player in after.starters if player.id not in before_ids and player.id not in received_ids)
     displaced = tuple(player.name for player in before.starters if player.id not in after_ids and player.id not in given_ids)
-    before_profile = depth_profile(active_players, league, before)
     after_profile = depth_profile(after_players, league, after)
+    before_position_scores = dict(before_profile.position_scores)
+    introduced_coverage: list[str] = []
+    existing_coverage: list[str] = []
+    for warning in after_profile.warnings:
+        position = warning.split(":", 1)[0]
+        after_score = dict(after_profile.position_scores).get(position, 0)
+        before_score = before_position_scores.get(position, 0)
+        if position not in before_profile.critical_positions and position in after_profile.critical_positions:
+            introduced_coverage.append(warning)
+        elif after_score <= before_score - 15:
+            introduced_coverage.append(warning)
+        else:
+            existing_coverage.append(warning)
     playoff_deltas: list[float] = []
     playoff_weeks: list[int] = []
     for week, points in sorted(league.playoff_weekly_points.items()) if model_playoffs else ():
@@ -546,6 +623,28 @@ def lineup_impact(
         playoff_deltas.append(week_after.projected_points - week_before.projected_points)
         playoff_weeks.append(week)
     playoff_gain = round(sum(playoff_deltas) / len(playoff_deltas), 1) if playoff_deltas else None
+    season_deltas: list[float] = []
+    season_weeks: list[int] = []
+    has_future_regular_week = any(
+        week > league.current_week and bool(points)
+        for week, points in league.regular_season_weekly_points.items()
+    )
+    regular_week_items = sorted(league.regular_season_weekly_points.items()) if model_playoffs and has_future_regular_week else ()
+    for week, points in regular_week_items:
+        if not points:
+            continue
+        week_league = replace(
+            league,
+            current_week=week,
+            weekly_points=points,
+            regular_season_weekly_points={},
+            playoff_weekly_points={},
+        )
+        week_before = optimize_lineup(active_players, week_league)
+        week_after = optimize_lineup(after_players, week_league)
+        season_deltas.append(week_after.projected_points - week_before.projected_points)
+        season_weeks.append(week)
+    remaining_season_gain = round(sum(season_deltas) / len(season_deltas), 1) if season_deltas else None
     return LineupImpact(
         before.projected_points,
         after.projected_points,
@@ -563,6 +662,10 @@ def lineup_impact(
         before_profile.score,
         after_profile.score,
         after_profile.critical_positions,
+        remaining_season_gain,
+        tuple(season_weeks),
+        tuple(introduced_coverage),
+        tuple(existing_coverage),
     )
 
 
@@ -579,6 +682,48 @@ def package_value(players: list[Player], picks: list[DraftPick] | None = None, l
         for pick in (picks or []) if pick.value > 0
     )
     return round(player_value + pick_value, 1)
+
+
+def trade_market_range(
+    a_gives: list[Player],
+    b_gives: list[Player],
+    league: League,
+    a_gives_picks: list[DraftPick] | None = None,
+    b_gives_picks: list[DraftPick] | None = None,
+) -> TradeMarketRange:
+    """Return downside/base/upside market fairness using negotiation ranges."""
+    def package_range(players: list[Player], picks: list[DraftPick]) -> tuple[float, float, float]:
+        profiles = [value_profile(player, league) for player in players]
+        pick_profiles = [pick_profile(pick, league) for pick in picks]
+        return (
+            sum(profile.low for profile in profiles) + sum(profile.low for profile in pick_profiles),
+            sum(profile.value for profile in profiles) + sum(profile.adjusted_value for profile in pick_profiles),
+            sum(profile.high for profile in profiles) + sum(profile.high for profile in pick_profiles),
+        )
+
+    sent = list(a_gives_picks or [])
+    received = list(b_gives_picks or [])
+    send_low, send_base, send_high = package_range(a_gives, sent)
+    receive_low, receive_base, receive_high = package_range(b_gives, received)
+    spot_value = replacement_player_value(league)
+    player_count_difference = len(a_gives) - len(b_gives)
+    if player_count_difference > 0:
+        receive_low += spot_value * player_count_difference
+        receive_base += spot_value * player_count_difference
+        receive_high += spot_value * player_count_difference
+    elif player_count_difference < 0:
+        send_low += spot_value * abs(player_count_difference)
+        send_base += spot_value * abs(player_count_difference)
+        send_high += spot_value * abs(player_count_difference)
+
+    def fairness(sent_value: float, received_value: float) -> float:
+        return round((received_value - sent_value) / max(sent_value, received_value, 1) * 100, 1)
+
+    return TradeMarketRange(
+        fairness(send_high, receive_low),
+        fairness(send_base, receive_base),
+        fairness(send_low, receive_high),
+    )
 
 
 def replacement_player_value(league: League) -> float:
@@ -974,6 +1119,7 @@ def evaluate_trade(
     b_gives_picks: list[DraftPick] | None = None,
     contexts: dict[str, TeamContext] | None = None,
     model_playoffs: bool = True,
+    model_outcomes: bool = True,
 ) -> TradeResult:
     value_a = package_value(a_gives, a_gives_picks, league)
     value_b = package_value(b_gives, b_gives_picks, league)
@@ -1023,13 +1169,13 @@ def evaluate_trade(
     journal_bonus = (journal_rate - .5) * journal_weight
     journal_bonus -= min(6.0, float(tendency.get("journal_partner_reject_feedback", 0)) * 1.5)
     acceptance = round(max(0, min(100, 50 + opponent_market_edge + opponent_fit_edge * 2 + opponent_lineup * 2 + activity_bonus + preference_bonus + journal_bonus)))
-    if abs(fairness) <= 8:
+    if abs(fairness) < MARKET_NOISE_PERCENT:
         verdict = "Fair market value"
     elif fairness > 8:
         verdict = f"Favors {team_a.team_name}"
     else:
         verdict = f"Favors {team_b.team_name}"
-    outcome_odds = _trade_outcome_probabilities(team_a, team_b, a_gives, b_gives, league) if model_playoffs else (None, None, None, None)
+    outcome_odds = _trade_outcome_probabilities(team_a, team_b, a_gives, b_gives, league) if model_playoffs and model_outcomes else (None, None, None, None)
     return TradeResult(
         value_a, value_b, difference, fairness, impact_a, impact_b, verdict, fit_a, fit_b, acceptance,
         *outcome_odds,
@@ -1046,17 +1192,23 @@ def explain_trade(
     impact = result.lineup_a
     incoming_positions = sorted({player.position for player in received})
     outgoing_positions = sorted({player.position for player in given})
-    new_starters = ", ".join(impact.new_starters)
+    received_names = {player.name for player in received}
+    incoming_starters = tuple(name for name in impact.new_starters if name in received_names)
+    new_starters = ", ".join(incoming_starters)
+    internal_replacements = ", ".join(impact.internal_replacements)
     displaced = ", ".join(impact.displaced_starters)
     reasons: list[str] = []
     if new_starters:
-        verb = "enters" if len(impact.new_starters) == 1 else "enter"
-        starter_note = f"{new_starters} {verb} your optimized lineup"
+        verb = "enters" if len(incoming_starters) == 1 else "enter"
+        starter_note = f"Incoming asset{'s' if len(incoming_starters) != 1 else ''} {new_starters} {verb} your optimized lineup"
         if displaced:
             starter_note += f", displacing {displaced}"
         reasons.append(starter_note + ".")
     elif received:
         reasons.append("The incoming players do not currently change your optimized starters.")
+    if internal_replacements:
+        verb = "moves" if len(impact.internal_replacements) == 1 else "move"
+        reasons.append(f"Your existing bench player{'s' if len(impact.internal_replacements) != 1 else ''} {internal_replacements} {verb} into the lineup to replace outgoing starters.")
     if incoming_positions and outgoing_positions:
         shared = sorted(set(incoming_positions) & set(outgoing_positions))
         added = sorted(set(incoming_positions) - set(outgoing_positions))
@@ -1074,9 +1226,9 @@ def explain_trade(
         reasons.append(f"Roster resilience improves from {impact.before_resilience} to {impact.after_resilience}.")
     elif impact.depth_change <= -5:
         reasons.append(f"Roster resilience falls from {impact.before_resilience} to {impact.after_resilience}.")
-    if result.fairness > 5:
+    if result.fairness > MARKET_NOISE_PERCENT:
         reasons.append("The market-value side of the deal favors you.")
-    elif result.fairness < -5:
+    elif result.fairness < -MARKET_NOISE_PERCENT:
         reasons.append("You pay a market premium for the roster improvement.")
 
     if impact.points_gained < -1 or (impact.depth_change < -10 and context.window in {"Win Now", "Competing"}):
@@ -1106,3 +1258,41 @@ def explain_trade(
         else f"This trade is best viewed as a {label.lower()}, not just a market-value comparison."
     )
     return TradeNarrative(label, summary, tuple(reasons), risk)
+
+
+def assess_team_trade(result: TradeResult) -> TeamTradeAssessment:
+    """Translate model outputs into a direct, threshold-based team decision."""
+    impact = result.lineup_a
+    current = impact.points_gained
+    playoff = impact.playoff_points_gained
+    remaining = impact.remaining_season_points_gained
+    depth = impact.depth_change
+
+    current_label = "Positive" if current >= LINEUP_UPGRADE_PPG else "Negative" if current <= LINEUP_DECLINE_PPG else "Neutral"
+    remaining_label = "Unavailable" if remaining is None else "Positive" if remaining >= LINEUP_UPGRADE_PPG else "Negative" if remaining <= LINEUP_DECLINE_PPG else "Neutral"
+    playoff_label = "Unavailable" if playoff is None else "Positive" if playoff >= LINEUP_UPGRADE_PPG else "Negative" if playoff <= LINEUP_DECLINE_PPG else "Neutral"
+    depth_label = "Positive" if depth >= DEPTH_MATERIAL_CHANGE else "Negative" if depth <= -DEPTH_MATERIAL_CHANGE or impact.coverage_warnings else "Neutral"
+    market_label = "Positive" if result.fairness >= MARKET_NOISE_PERCENT else "Negative" if result.fairness <= -MARKET_NOISE_PERCENT else "Within noise"
+
+    meaningful_upside = current >= LINEUP_UPGRADE_PPG or (remaining is not None and remaining >= LINEUP_UPGRADE_PPG) or (playoff is not None and playoff >= LINEUP_UPGRADE_PPG)
+    meaningful_decline = current <= LINEUP_DECLINE_PPG or (remaining is not None and remaining <= LINEUP_DECLINE_PPG) or (playoff is not None and playoff <= LINEUP_DECLINE_PPG)
+    roster_risk = depth <= -DEPTH_MATERIAL_CHANGE or bool(impact.coverage_warnings)
+    if meaningful_upside and not roster_risk:
+        label = "Makes your team better"
+        action = "Worth pursuing if the player-availability assumptions still hold."
+    elif meaningful_upside:
+        label = "Conditional upgrade"
+        action = "The lineup upside is real, but only pursue it if you can accept or repair the depth risk."
+    elif meaningful_decline:
+        label = "Makes your team worse"
+        action = "Pass unless the market-value return is part of a deliberate second move."
+    elif roster_risk:
+        label = "No clear improvement"
+        action = "The lineup is essentially unchanged while roster protection gets worse."
+    elif result.fairness >= MARKET_NOISE_PERCENT:
+        label = "Value gain, limited team impact"
+        action = "Reasonable as an asset-value move, but it does not materially improve this lineup today."
+    else:
+        label = "Mostly lateral"
+        action = "There is not enough team-level benefit to prioritize this deal."
+    return TeamTradeAssessment(label, action, current_label, remaining_label, playoff_label, depth_label, market_label)

@@ -1,10 +1,10 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import build_contexts, evaluate_trade, explain_trade, package_value, replacement_player_value
+from python_app.analytics import active_roster_players, assess_team_trade, build_contexts, evaluate_trade, explain_trade, lineup_impact, package_value, projected_points, replacement_player_value, trade_market_range
 from python_app.counteroffers import generate_counteroffers
 from python_app.models import DraftPick, League, Player, Roster
-from python_app.recommendations import Recommendation, _combined_role_risk, _confidence, _depth_score, _evidence_adjusted_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _qb_role_risk, _recommendation_tier, _reliable_depth_target, _rental_pick_blocked, _return_packages, _score, _score_range, _signal_role_risk, _team_diagnosis, _usage_role_risk, diversify_recommendations, generate_multi_step_paths, generate_recommendations, generate_sell_offers, generate_target_offers, timed_generate_recommendations
+from python_app.recommendations import Recommendation, _combined_role_risk, _confidence, _depth_score, _evidence_adjusted_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _qb_role_risk, _recommendation_tier, _reliable_depth_target, _rental_pick_blocked, _return_packages, _score, _score_range, _signal_role_risk, _target_offer_packages, _team_diagnosis, _usage_role_risk, _waiver_alternative_penalty, diversify_recommendations, generate_multi_step_paths, generate_recommendations, generate_sell_offers, generate_target_offers, timed_generate_recommendations
 
 
 class TradeEngineRegressionTests(unittest.TestCase):
@@ -41,6 +41,14 @@ class TradeEngineRegressionTests(unittest.TestCase):
     def test_package_value_preserves_provider_market_values(self) -> None:
         self.assertEqual(package_value([self.a["rb"], self.a["wr"]]), self.a["rb"].value + self.a["wr"].value)
 
+    def test_ir_player_remains_available_as_a_trade_asset(self) -> None:
+        ir_asset = replace(self.a["wr"], id="ir-asset", value=50, injury_status="IR")
+        mine = replace(self.team_a, players=(*self.team_a.players, ir_asset), reserve_player_ids=(ir_asset.id,))
+        league = replace(self.league, rosters=(mine, self.team_b))
+        packages = _target_offer_packages(50, mine, self.team_b, league, build_contexts(league))
+        self.assertTrue(any(ir_asset in players for players, _ in packages))
+        self.assertNotIn(ir_asset, active_roster_players(mine))
+
     def test_uneven_player_trade_prices_the_open_roster_spot(self) -> None:
         outgoing = [replace(self.a["rb"], value=40), replace(self.a["wr"], value=20)]
         incoming = [replace(self.b["wr"], value=60)]
@@ -53,6 +61,49 @@ class TradeEngineRegressionTests(unittest.TestCase):
         left = replace(self.a["rb"], value=50)
         result = evaluate_trade(self.team_a, self.team_b, [left], [self.b["rb"]], self.league)
         self.assertAlmostEqual(result.fairness, 0, delta=0.1)
+
+    def test_bye_week_player_does_not_fall_back_to_recent_scoring(self) -> None:
+        player = self.a["wr"]
+        league = replace(
+            self.league,
+            current_week=8,
+            weekly_points={},
+            weekly_player_stats={7: {player.id: {"rec": 8, "rec_yd": 100, "rec_td": 1}}},
+            player_signals={player.id: {"bye_week": 8}},
+        )
+        self.assertEqual(projected_points(player, league), 0)
+
+    def test_market_range_contains_base_trade_fairness(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["rb"]], [self.b["wr"]], self.league)
+        value_range = trade_market_range([self.a["rb"]], [self.b["wr"]], self.league)
+        self.assertAlmostEqual(value_range.base_fairness, result.fairness, delta=.1)
+        self.assertLess(value_range.downside_fairness, value_range.base_fairness)
+        self.assertGreater(value_range.upside_fairness, value_range.base_fairness)
+
+    def test_depth_trade_is_penalized_when_waiver_pool_has_similar_production(self) -> None:
+        target = replace(self.b["rb"], id="target", value=20)
+        free = replace(self.b["bench"], id="free", value=8)
+        weekly = {**self.league.weekly_points, target.id: 10, free.id: 9}
+        league = replace(self.league, weekly_points=weekly, free_agents=(free,))
+        penalty, warning = _waiver_alternative_penalty(target, league)
+        self.assertEqual(penalty, 20)
+        self.assertIn(free.name, warning or "")
+
+    def test_existing_coverage_problem_is_not_attributed_to_unchanged_trade(self) -> None:
+        impact = lineup_impact(self.team_a, [], [], self.league)
+        self.assertFalse(impact.introduced_coverage_warnings)
+        self.assertEqual(impact.existing_coverage_warnings, impact.coverage_warnings)
+
+    def test_removing_last_playable_backup_is_attributed_to_trade(self) -> None:
+        backup = Player("a-wr-backup", "A WR Backup", "WR", "A", 24, 16)
+        roster = replace(self.team_a, players=(*self.team_a.players, backup))
+        league = replace(
+            self.league,
+            rosters=(roster, self.team_b),
+            weekly_points={**self.league.weekly_points, backup.id: 5},
+        )
+        impact = lineup_impact(roster, [backup], [], league)
+        self.assertTrue(any(warning.startswith("WR:") for warning in impact.introduced_coverage_warnings))
 
     def test_review_gate_can_surface_safe_lateral_starter_idea(self) -> None:
         result = evaluate_trade(self.team_a, self.team_b, [self.a["bench"]], [self.b["bench"]], self.league)
@@ -128,6 +179,34 @@ class TradeEngineRegressionTests(unittest.TestCase):
         self.assertIn("replaces outgoing RB value while adding QB", combined)
         self.assertEqual(narrative.label, "Useful idea with roster risk")
 
+    def test_team_assessment_calls_playoff_gain_with_depth_risk_conditional(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["wr"]], self.league)
+        result = replace(result, lineup_a=replace(
+            result.lineup_a,
+            points_gained=.2,
+            playoff_points_gained=2.4,
+            depth_change=-3,
+            coverage_warnings=("WR: no reliable replacement",),
+        ))
+        assessment = assess_team_trade(result)
+        self.assertEqual(assessment.label, "Conditional upgrade")
+        self.assertEqual(assessment.current_label, "Neutral")
+        self.assertEqual(assessment.playoff_label, "Positive")
+        self.assertEqual(assessment.depth_label, "Negative")
+
+    def test_team_assessment_rejects_lateral_trade_that_weakens_depth(self) -> None:
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["wr"]], self.league)
+        result = replace(result, lineup_a=replace(
+            result.lineup_a,
+            points_gained=.1,
+            playoff_points_gained=.4,
+            depth_change=-8,
+            coverage_warnings=(),
+        ))
+        assessment = assess_team_trade(result)
+        self.assertEqual(assessment.label, "No clear improvement")
+        self.assertIn("gets worse", assessment.action)
+
     def test_pick_changes_market_value_but_not_lineup_directly(self) -> None:
         result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["rb"]], self.league, [], [self.pick_b])
         without_pick = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["rb"]], self.league)
@@ -142,6 +221,26 @@ class TradeEngineRegressionTests(unittest.TestCase):
         result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["wr"]], league)
         self.assertGreater(result.lineup_a.points_gained, 0)
         self.assertLess(result.lineup_a.playoff_points_gained, 0)
+
+    def test_remaining_season_impact_averages_available_regular_weeks(self) -> None:
+        week_11 = dict(self.league.weekly_points)
+        week_12 = dict(self.league.weekly_points)
+        week_11.update({"a-wr": 8, "b-wr": 18})
+        week_12.update({"a-wr": 12, "b-wr": 16})
+        league = replace(self.league, regular_season_weekly_points={11: week_11, 12: week_12})
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["wr"]], league)
+        self.assertEqual(result.lineup_a.remaining_season_weeks_modeled, (11, 12))
+        self.assertGreater(result.lineup_a.remaining_season_points_gained, 0)
+
+    def test_remaining_season_is_unavailable_when_only_current_week_exists(self) -> None:
+        league = replace(
+            self.league,
+            current_week=10,
+            regular_season_weekly_points={10: self.league.weekly_points},
+        )
+        result = evaluate_trade(self.team_a, self.team_b, [self.a["wr"]], [self.b["wr"]], league)
+        self.assertIsNone(result.lineup_a.remaining_season_points_gained)
+        self.assertEqual(result.lineup_a.remaining_season_weeks_modeled, ())
 
     def test_reusing_contexts_does_not_change_evaluation(self) -> None:
         normal = evaluate_trade(self.team_a, self.team_b, [self.a["rb"]], [self.b["wr"]], self.league)
@@ -444,6 +543,7 @@ class TradeEngineRegressionTests(unittest.TestCase):
         ideas, performance = timed_generate_recommendations(self.league, include_low_confidence=True)
         self.assertEqual(performance.recommendations_returned, len(ideas))
         self.assertGreater(performance.packages_evaluated, 0)
+        self.assertLessEqual(performance.full_evaluations, performance.packages_evaluated)
         self.assertGreaterEqual(performance.elapsed_ms, 0)
         self.assertTrue(performance.team_diagnosis)
         self.assertGreater(sum(count for _, count in performance.rejection_counts), 0)

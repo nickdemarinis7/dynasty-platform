@@ -1,6 +1,6 @@
 """Deterministic human-sense audit for recommendation output.
 
-Run with: python3 -m tests_python.recommendation_audit
+Run from the repository root with: python3 -m tests_python.recommendation_audit
 """
 from __future__ import annotations
 

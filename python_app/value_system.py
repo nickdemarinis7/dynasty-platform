@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .models import DraftPick, League, Player, Roster
+from .decision_policy import MARKET_MEANINGFUL_PERCENT, MARKET_NOISE_PERCENT, MARKET_SUBSTANTIAL_PERCENT
 
 
 @dataclass(frozen=True)
@@ -206,12 +207,12 @@ def premium_value_cutoff(league: League, minimum_percentile: float = .90) -> flo
 
 def balance_label(fairness: float) -> str:
     magnitude = abs(fairness)
-    if magnitude <= 5:
+    if magnitude < MARKET_NOISE_PERCENT:
         return "Roughly even"
     direction = "Receive" if fairness > 0 else "Give"
-    if magnitude <= 12:
+    if magnitude <= MARKET_MEANINGFUL_PERCENT:
         return f"{direction} a little more"
-    if magnitude <= 20:
+    if magnitude <= MARKET_SUBSTANTIAL_PERCENT:
         return f"{direction} meaningfully more"
     return f"{direction} substantially more"
 

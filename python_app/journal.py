@@ -9,7 +9,7 @@ from .analytics import TeamContext, TradeResult
 from .models import DraftPick, League, Player, Roster
 from .value_system import pick_profile
 
-MODEL_VERSION = "trade-engine-2026.11.10.16"
+MODEL_VERSION = "trade-engine-2026.11.12.18"
 
 
 @dataclass(frozen=True)

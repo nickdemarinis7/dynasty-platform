@@ -1,7 +1,7 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile
+from python_app.analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile, tradable_roster_players
 from python_app.models import DevyProspect, DraftPick, League, Player, Roster
 from python_app.recommendations import generate_recommendations
 from python_app.strategy import build_team_plan
@@ -225,6 +225,7 @@ class RosterModelTests(unittest.TestCase):
         reserve = Player("reserve", "Reserve RB", "RB", "A", 26, 30)
         roster = Roster("1", "A", "A", (starter, taxi, reserve), reserve_player_ids=("reserve",), taxi_player_ids=("taxi",))
         self.assertEqual(active_roster_players(roster), (starter,))
+        self.assertEqual(tradable_roster_players(roster), (starter, taxi, reserve))
         league = replace(self._league((roster,)), roster_slots=(("RB", 1),), weekly_points={"starter": 14, "taxi": 8, "reserve": 9})
         profile = depth_profile(active_roster_players(roster), league)
         self.assertIn("RB", profile.critical_positions)

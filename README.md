@@ -53,9 +53,11 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market values, projected early/middle/late pick pricing, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, decision journaling, a quality-gated Trade Finder, a waiver claim plan, a live-draft board, market signals, rosters, power rankings, and player values. Recommendation calibration and historical validation remain active development milestones.
+Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market values, projected early/middle/late pick pricing, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, decision journaling, a quality-gated Trade Finder, Player Seeker and player-sale paths, scenario estimates, a waiver claim plan, a live-draft board, market signals, rosters, power rankings, and player values.
 
-### Legacy Next.js application
+### Legacy Next.js reference application
+
+This code is retained for UI and parity reference only. It is not the production application, and recommendation changes should be made in `python_app/`.
 
 ### Prerequisites
 - Node.js 18+ 
@@ -154,7 +156,7 @@ The app automatically detects your league settings:
 
 ### Data Storage
 
-Without cloud credentials, imported league data and decision-journal entries remain in the Streamlit session and can be exported as CSV. Production deployments can enable native OIDC authentication and user-scoped Supabase history. The journal preserves model inputs, predictions, outcomes, and feedback for trade and waiver calibration. The application automatically selects durable storage when those secrets are present.
+Without cloud credentials, imported league data and decision-journal entries remain in the Streamlit session and can be exported as CSV. Production deployments can enable native OIDC authentication and user-scoped Supabase history. The journal preserves model inputs, predictions, outcomes, and feedback for trade and waiver calibration. Durable storage is fail-closed: Supabase service-role credentials are accepted only when OIDC is also configured and the user is signed in.
 
 ## 🚢 Deployment
 
@@ -180,6 +182,9 @@ Each push to the selected branch will redeploy the Streamlit app.
 4. In Streamlit Community Cloud, paste the same settings into the app's **Secrets** configuration, changing `redirect_uri` to the deployed callback URL.
 
 `service_role_key` is a server-only credential. Never commit it, place it in browser code, or substitute it with a public example value. The real `secrets.toml` is ignored by Git.
+
+See [Fantasy GM privacy and data handling](docs/PRIVACY.md) for stored-data,
+operational-logging, export, and deletion behavior.
 
 ### Install on iPhone
 

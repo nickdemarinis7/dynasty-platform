@@ -4,6 +4,8 @@ from typing import Any
 import requests
 import streamlit as st
 
+from .auth import authentication_configured, durable_storage_credentials_configured
+
 
 class StorageError(RuntimeError):
     """Persistent storage could not complete an operation."""
@@ -20,13 +22,20 @@ def _config() -> tuple[str, str] | None:
 
 
 def durable_storage_configured() -> bool:
-    return _config() is not None
+    """Only expose service-role storage when an authenticated identity is active."""
+    return bool(
+        _config() is not None
+        and authentication_configured()
+        and st.user.is_logged_in
+    )
 
 
 def _request(method: str, path: str, *, params: dict[str, str] | None = None, json: Any = None) -> Any:
     config = _config()
     if not config:
         raise StorageError("Durable storage is not configured")
+    if not authentication_configured() or not st.user.is_logged_in:
+        raise StorageError("Durable storage requires an authenticated user")
     url, key = config
     try:
         response = requests.request(
@@ -40,6 +49,8 @@ def _request(method: str, path: str, *, params: dict[str, str] | None = None, js
 
 
 def load_trades(user_id: str) -> list[dict[str, Any]]:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         return list(st.session_state.get("saved_trades", []))
     rows = _request("GET", "saved_trades", params={"user_id": f"eq.{user_id}", "select": "*", "order": "saved_at.desc"})
@@ -47,6 +58,8 @@ def load_trades(user_id: str) -> list[dict[str, Any]]:
 
 
 def save_trade(user_id: str, trade: dict[str, Any]) -> None:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         st.session_state.setdefault("saved_trades", []).insert(0, trade)
         return
@@ -54,6 +67,8 @@ def save_trade(user_id: str, trade: dict[str, Any]) -> None:
 
 
 def delete_trade(user_id: str, trade_id: str) -> None:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         saved = st.session_state.get("saved_trades", [])
         st.session_state.saved_trades = [trade for trade in saved if trade.get("id") != trade_id]
@@ -62,6 +77,8 @@ def delete_trade(user_id: str, trade_id: str) -> None:
 
 
 def load_decisions(user_id: str, league_id: str | None = None) -> list[dict[str, Any]]:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         rows = list(st.session_state.get("decision_journal", []))
         return [row for row in rows if league_id is None or row.get("league_id") == league_id]
@@ -73,6 +90,8 @@ def load_decisions(user_id: str, league_id: str | None = None) -> list[dict[str,
 
 
 def save_decision(user_id: str, decision: dict[str, Any]) -> None:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         st.session_state.setdefault("decision_journal", []).insert(0, decision)
         return
@@ -80,6 +99,8 @@ def save_decision(user_id: str, decision: dict[str, Any]) -> None:
 
 
 def update_decision(user_id: str, decision_id: str, updates: dict[str, Any]) -> None:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         rows = st.session_state.get("decision_journal", [])
         st.session_state.decision_journal = [{**row, **updates} if row.get("id") == decision_id else row for row in rows]
@@ -88,7 +109,22 @@ def update_decision(user_id: str, decision_id: str, updates: dict[str, Any]) -> 
 
 
 def delete_decision(user_id: str, decision_id: str) -> None:
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
     if not durable_storage_configured():
         st.session_state.decision_journal = [row for row in st.session_state.get("decision_journal", []) if row.get("id") != decision_id]
         return
     _request("DELETE", "decision_journal", params={"id": f"eq.{decision_id}", "user_id": f"eq.{user_id}"})
+
+
+def delete_all_user_data(user_id: str) -> None:
+    """Delete every saved trade and journal entry owned by one identity."""
+    if durable_storage_credentials_configured() and not durable_storage_configured():
+        raise StorageError("Durable storage requires an authenticated user")
+    if not durable_storage_configured():
+        st.session_state.pop("saved_trades", None)
+        st.session_state.pop("decision_journal", None)
+        return
+    params = {"user_id": f"eq.{user_id}"}
+    _request("DELETE", "saved_trades", params=params)
+    _request("DELETE", "decision_journal", params=params)

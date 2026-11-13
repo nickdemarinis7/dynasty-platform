@@ -44,7 +44,15 @@ def build_team_plan(league: League) -> TeamPlan:
     )[:3]
 
     if league.mode == "redraft":
-        headline = f"Compete for this season; concentrate value in starters and address {priorities[0]} first."
+        if context.contender_confidence == "Long shot":
+            direction = "Playoff chase"
+            headline = f"Keep the playoff path alive without overpaying; add immediate {priorities[0]} production and reassess weekly."
+        elif context.contender_confidence in {"In the hunt", "Fragile contender"}:
+            direction = "Playoff push"
+            headline = f"Improve this season's starting lineup while protecting usable depth; address {priorities[0]} first."
+        else:
+            direction = "Win Now"
+            headline = f"Compete for this season; concentrate value in starters and address {priorities[0]} first."
     elif context.window in {"Win Now", "Competing"}:
         if context.record_rank is not None:
             odds = f" with {context.playoff_probability}% simulated playoff odds" if context.playoff_probability is not None else ""
@@ -77,4 +85,4 @@ def build_team_plan(league: League) -> TeamPlan:
         actions.append("Keep future picks unless the return clearly changes the starting lineup.")
     else:
         actions.append("Prefer current-week role and availability over long-term age value.")
-    return TeamPlan(context.window, headline, strongest, priorities, protect, shop, tuple(actions))
+    return TeamPlan(direction if league.mode == "redraft" else context.window, headline, strongest, priorities, protect, shop, tuple(actions))

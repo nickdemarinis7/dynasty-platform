@@ -7,8 +7,11 @@ from time import monotonic
 
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .models import DevyProspect, DraftPick, League, Player, Roster, SourceHealth
+from .observability import record_event
 from .scoring import score_stats, unsupported_scoring_settings
 
 SLEEPER_BASE = "https://api.sleeper.app/v1"
@@ -17,17 +20,38 @@ TRADYR_DEVY_URL = "https://api.tradyr.app/v1/devy"
 TIMEOUT = 20
 
 
+def _provider_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+_PROVIDER_SESSION = _provider_session()
+
+
 class ProviderError(RuntimeError):
     """A remote provider returned unusable data."""
 
 
 def _get_json(url: str, *, params: dict[str, Any] | None = None) -> Any:
+    host = url.split("/")[2]
     try:
-        response = requests.get(url, params=params, timeout=TIMEOUT)
+        response = _PROVIDER_SESSION.get(url, params=params, timeout=TIMEOUT)
         response.raise_for_status()
         return response.json()
     except (requests.RequestException, ValueError) as exc:
-        raise ProviderError(f"Could not load data from {url.split('/')[2]}") from exc
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        record_event("provider_request_failed", provider=host, status=status, error=type(exc).__name__)
+        raise ProviderError(f"Could not load data from {host}") from exc
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -439,6 +463,7 @@ def import_league(username: str, league_id: str) -> League:
             "injury_body_part": raw.get("injury_body_part"),
             "injury_notes": raw.get("injury_notes"),
             "injury_start_date": raw.get("injury_start_date"),
+            "bye_week": raw.get("bye_week"),
             "news_updated": raw.get("news_updated"),
             "trending_adds_24h": trend_adds.get(player_id, 0),
             "trending_drops_24h": trend_drops.get(player_id, 0),
@@ -566,16 +591,28 @@ def import_league(username: str, league_id: str) -> League:
         player_id: round(score_stats(raw, scoring_settings, str(player_data.get(player_id, {}).get("position") or "")), 2)
         for player_id, raw in weekly_stats.items()
     }
-    playoff_weeks = range(playoff_week_start, min(17, playoff_week_start + 2) + 1)
-    playoff_weekly_points: dict[int, dict[str, float]] = {}
-    for week in playoff_weeks:
+    future_weeks = range(current_week + 1, min(17, playoff_week_start + 2) + 1)
+
+    def score_projection_week(week: int) -> tuple[int, dict[str, float]]:
         projected = get_weekly_projection_stats(str(state["season"]), week)
-        scored = {
+        return week, {
             player_id: round(score_stats(raw, scoring_settings, str(player_data.get(player_id, {}).get("position") or "")), 2)
             for player_id, raw in projected.items()
         }
-        if scored:
-            playoff_weekly_points[week] = scored
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        future_projection_points = dict(pool.map(score_projection_week, future_weeks))
+    regular_season_weekly_points = {current_week: weekly_points} if weekly_points and current_week <= regular_season_end else {}
+    regular_season_weekly_points.update({
+        week: points for week, points in future_projection_points.items()
+        if current_week < week <= regular_season_end and points
+    })
+    playoff_weeks = range(playoff_week_start, min(17, playoff_week_start + 2) + 1)
+    playoff_weekly_points = {
+        week: future_projection_points[week]
+        for week in playoff_weeks
+        if future_projection_points.get(week)
+    }
     expected_weeks = max(0, min(18, current_week - 1))
     unsupported_scoring = unsupported_scoring_settings(scoring_settings)
     standings_available = any(roster.games_played for roster in rosters)
@@ -588,13 +625,14 @@ def import_league(username: str, league_id: str) -> League:
         SourceHealth("Stats Guy Fantasy", "ready" if secondary_values else "limited", f"Loaded {'TE-premium' if te_premium else 'standard'} consensus values" if secondary_values else "Secondary market consensus is unavailable", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Sleeper stats", "ready" if len(stats_weeks) == expected_weeks else "limited", f"Loaded {len(stats_weeks)} of {expected_weeks} completed weeks"),
         SourceHealth("Sleeper projections", "ready" if weekly_points else "limited", f"Week {current_week} projections loaded" if weekly_points else f"Week {current_week} projections unavailable"),
+        SourceHealth("Remaining-season projections", "ready" if len(regular_season_weekly_points) > 1 else "limited", f"Loaded weeks {', '.join(map(str, regular_season_weekly_points))}" if regular_season_weekly_points else "Future regular-season projections are not yet available"),
         SourceHealth("Sleeper role signals", "ready" if trend_adds or trend_drops else "limited", f"Loaded Sleeper's 24-hour add/drop window for {len(set(trend_adds) | set(trend_drops))} players" if trend_adds or trend_drops else "Player status is loaded, but trend activity is unavailable", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Playoff projections", "ready" if playoff_weekly_points else "limited", f"Loaded weeks {', '.join(map(str, playoff_weekly_points))}" if playoff_weekly_points else "Future playoff-week projections are not yet available"),
         SourceHealth("Draft picks", "ready" if mode == "redraft" or bool(pick_values) else "limited", "Market pick values loaded" if pick_values else "Unpriced picks are retained with no estimated value"),
         SourceHealth("Devy classes", "ready" if mode != "dynasty" or bool(devy_prospects) else "limited", f"Loaded {len(devy_prospects)} future prospects" if devy_prospects else "Future prospect class data is unavailable"),
         SourceHealth("League scoring", "limited" if unsupported_scoring else "ready", f"{len(unsupported_scoring)} threshold bonus rules are disclosed but not modeled" if unsupported_scoring else "Imported scoring rules are supported"),
     )
-    return League(
+    result = League(
         id=str(league["league_id"]), name=str(league.get("name") or "Sleeper League"),
         season=str(league.get("season") or ""), mode=mode, team_count=team_count,
         superflex=superflex, te_premium=te_premium, scoring=scoring,
@@ -607,6 +645,7 @@ def import_league(username: str, league_id: str) -> League:
         remaining_matchups=remaining_matchups,
         trade_deadline_week=trade_deadline_week,
         playoff_weekly_points=playoff_weekly_points,
+        regular_season_weekly_points=regular_season_weekly_points,
         manager_tendencies=manager_tendencies,
         free_agents=tuple(free_agents),
         active_roster_capacity=sum(count for slot, count in _roster_slots(positions) if slot not in {"IR"}),
@@ -618,3 +657,11 @@ def import_league(username: str, league_id: str) -> League:
         market_source_values=market_source_values,
         player_signals=player_signals,
     )
+    record_event(
+        "league_import_completed",
+        duration_ms=result.import_duration_ms,
+        teams=len(result.rosters),
+        players=sum(len(roster.players) for roster in result.rosters) + len(result.free_agents),
+        mode=result.mode,
+    )
+    return result

@@ -1,47 +1,45 @@
-# Platform strategy: mobile web first, Python when justified
+# Platform strategy: Streamlit product, one recommendation engine
 
 ## Decision
 
-Fantasy GM will remain a mobile-first Next.js application deployed on Vercel.
-Analytical operations used by the UI are exposed through `src/lib/analytics`.
-The algorithms remain in TypeScript until a workload clearly benefits from a
-separate Python service.
+Fantasy GM's production application is the Python/Streamlit app rooted at
+`streamlit_app.py`. Its models, projections, and recommendation logic in
+`python_app/` are the canonical product implementation.
 
-We will not rewrite the application in Streamlit. Streamlit is useful for
-internal analysis and prototypes, but it does not offer the UI control required
-for the product's iPhone-first navigation and interaction model.
+The Next.js application in `src/` is a legacy reference implementation. It is
+kept temporarily for UI and parity reference, but it is not a second production
+surface and new recommendation behavior must not be implemented there first.
 
 ## Why this is the durable default
 
-- One deployable application is simpler to operate and debug.
-- Local calculations avoid network latency and service availability failures.
-- Existing domain logic has deterministic automated tests.
-- Next.js provides the installable, responsive interface the product needs.
-- The analytics facade prevents screens from coupling to engine file layout.
+- One deployable application and one engine avoid recommendation drift.
+- The Python engine supports the simulation, calibration, and optimization work
+  that now defines the product.
+- Streamlit provides the current mobile-oriented UI, OIDC integration, caching,
+  and Community Cloud deployment path.
+- Deterministic engine tests and recommendation audits exercise the shipped code.
 
-## When to introduce Python
+## When to introduce another web client
 
-Create a FastAPI service only when at least one of these is true:
+Move beyond Streamlit only when measured product needs justify the additional
+client/API boundary, such as:
 
-- optimization requires OR-Tools or another Python-native solver;
-- projections use pandas, NumPy, scikit-learn, or trained model artifacts;
-- calculations exceed practical browser/serverless execution limits;
-- shared scheduled data processing or centralized persisted results are needed.
+- interaction or accessibility requirements that Streamlit cannot meet;
+- authenticated multi-user workflows requiring a dedicated API;
+- background jobs or centralized historical computation;
+- measured traffic or latency that requires independently scaling the engine.
 
 ## Migration path
 
-1. Define versioned JSON request and response schemas for one operation.
-2. Add parity fixtures that both TypeScript and Python must pass.
-3. Port one expensive operation, starting with lineup/package optimization.
-4. Call it server-side through a timeout-protected adapter with validation.
-5. Retain the TypeScript implementation as a fallback until parity and
-   production reliability are established.
-6. Port additional operations only when their measured benefit exceeds the
-   operational cost of another service.
+1. Define versioned request and response schemas around the Python engine.
+2. Preserve the existing Python test fixtures as contract tests.
+3. Expose only the required operations through an authenticated API.
+4. Build a new client against those contracts without duplicating engine logic.
+5. Cut over only after accessibility, mobile, performance, and recommendation
+   parity are demonstrated.
 
 ## Hosting
 
-- Web application: Vercel
-- Optional future Python analytics service: a container host such as Render,
-  Railway, Fly.io, or a managed cloud container platform
-- Streamlit: reserved for internal dashboards or model-development tools
+- Production application: Streamlit Community Cloud
+- Optional durable storage: Supabase, available only with OIDC authentication
+- Legacy Next.js application: local/reference use; not a supported deployment
