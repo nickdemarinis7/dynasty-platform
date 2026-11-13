@@ -158,6 +158,7 @@ DARK_THEME_CSS = """
   .stApp [data-testid="stAlert"] p,.stApp [data-testid="stAlert"] span,.stApp [data-testid="stAlert"] div,.stApp [data-baseweb="notification"] p,.stApp [data-baseweb="notification"] span {color:#eef5ec!important;opacity:1!important;}
   .stApp [data-testid="stAlert"] svg,.stApp [data-baseweb="notification"] svg {fill:var(--accent)!important;color:var(--accent)!important;}
   .stApp [data-testid="stStatusWidget"],.stApp [data-testid="stStatusWidget"] > div,.stApp [data-testid="stStatusWidget"] details,.stApp [data-testid="stStatusWidget"] summary,.stApp [data-testid="stStatusWidget"] [role="button"] {background:#18231f!important;background-image:none!important;border-color:#3b4d45!important;color:#eef5ec!important;}
+  .stApp [data-testid="stStatusWidget"] * {background-color:transparent!important;background-image:none!important;}
   .stApp [data-testid="stStatusWidget"] p,.stApp [data-testid="stStatusWidget"] span,.stApp [data-testid="stStatusWidget"] div {color:#eef5ec!important;opacity:1!important;}
   .stApp [data-testid="stStatusWidget"] svg {color:var(--accent)!important;}
   .stApp [role="radiogroup"] label,.stApp [role="radiogroup"] label p,.stApp [data-testid="stRadio"] label,.stApp [data-testid="stRadio"] label p {color:#e9eee5!important;opacity:1!important;}
