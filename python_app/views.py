@@ -47,7 +47,7 @@ def _clear_trade_partner_assets() -> None:
         st.session_state.pop(key, None)
 
 
-TRADE_FINDER_CACHE_VERSION = 30
+TRADE_FINDER_CACHE_VERSION = 31
 _HOSTED_GENERATION_CACHE: dict[tuple[object, ...], object] = {}
 
 

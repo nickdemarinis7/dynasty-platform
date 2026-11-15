@@ -465,44 +465,68 @@ def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) 
     if not slots:
         return Lineup((), tuple(available), 0.0)
 
-    # Exact maximum-weight assignment. Process masks from most-filled to least-
-    # filled so a player added during this iteration cannot be selected again.
-    # Dense arrays avoid copying a state dictionary for every rostered player,
-    # which matters because recommendation generation invokes this thousands of
-    # times on hosted hardware.
-    state_count = 1 << len(slots)
-    scores = [float("-inf")] * state_count
-    assignments: list[tuple[int, ...] | None] = [None] * state_count
-    scores[0] = 0.0
-    assignments[0] = ()
-    masks_descending = sorted(range(state_count), key=int.bit_count, reverse=True)
-    eligible_masks = {
-        position: sum(1 << index for index, slot in enumerate(slots) if position in eligibility[slot])
-        for position in {player.position for player in available}
-    }
+    # Exact maximum-weight bipartite matching via successive shortest augmenting
+    # paths. Unlike slot-mask DP, this is polynomial in roster and lineup size;
+    # large superflex leagues no longer pay an exponential 2**starter_slots cost.
+    player_count, slot_count = len(available), len(slots)
+    source = 0
+    player_offset = 1
+    slot_offset = player_offset + player_count
+    sink = slot_offset + slot_count
+    graph: list[list[list[float | int]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(left: int, right: int, capacity: int, cost: float) -> list[float | int]:
+        forward: list[float | int] = [right, len(graph[right]), capacity, cost]
+        backward: list[float | int] = [left, len(graph[left]), 0, -cost]
+        graph[left].append(forward)
+        graph[right].append(backward)
+        return forward
+
+    assignment_edges: list[tuple[int, list[float | int]]] = []
     for player_index, player in enumerate(available):
-        points = player_points[player.id]
-        eligible_mask = eligible_masks.get(player.position, 0)
-        if not eligible_mask:
-            continue
-        for mask in masks_descending:
-            assignment = assignments[mask]
-            if assignment is None:
-                continue
-            open_bits = eligible_mask & ~mask
-            while open_bits:
-                bit = open_bits & -open_bits
-                open_bits -= bit
-                next_mask = mask | bit
-                candidate_score = scores[mask] + points
-                if candidate_score > scores[next_mask]:
-                    scores[next_mask] = candidate_score
-                    assignments[next_mask] = assignment + (player_index,)
-    best_mask = max(
-        (mask for mask, assignment in enumerate(assignments) if assignment is not None),
-        key=lambda mask: (scores[mask], mask.bit_count()),
-    )
-    starter_indices = assignments[best_mask] or ()
+        player_node = player_offset + player_index
+        add_edge(source, player_node, 1, 0.0)
+        for slot_index, slot in enumerate(slots):
+            if player.position in eligibility[slot]:
+                edge = add_edge(player_node, slot_offset + slot_index, 1, -player_points[player.id])
+                assignment_edges.append((player_index, edge))
+    for slot_index in range(slot_count):
+        add_edge(slot_offset + slot_index, sink, 1, 0.0)
+
+    for _ in range(slot_count):
+        distance = [float("inf")] * len(graph)
+        previous: list[tuple[int, int] | None] = [None] * len(graph)
+        in_queue = [False] * len(graph)
+        distance[source] = 0.0
+        queue = [source]
+        in_queue[source] = True
+        cursor = 0
+        while cursor < len(queue):
+            node = queue[cursor]
+            cursor += 1
+            in_queue[node] = False
+            for edge_index, edge in enumerate(graph[node]):
+                target, _, capacity, cost = edge
+                target = int(target)
+                if int(capacity) <= 0 or distance[node] + float(cost) >= distance[target] - 1e-9:
+                    continue
+                distance[target] = distance[node] + float(cost)
+                previous[target] = (node, edge_index)
+                if not in_queue[target]:
+                    queue.append(target)
+                    in_queue[target] = True
+        if previous[sink] is None:
+            break
+        node = sink
+        while node != source:
+            prior, edge_index = previous[node] or (source, 0)
+            edge = graph[prior][edge_index]
+            reverse_index = int(edge[1])
+            edge[2] = int(edge[2]) - 1
+            graph[node][reverse_index][2] = int(graph[node][reverse_index][2]) + 1
+            node = prior
+
+    starter_indices = tuple(sorted({player_index for player_index, edge in assignment_edges if int(edge[2]) == 0}))
     starter_set = set(starter_indices)
     starters = tuple(player for index, player in enumerate(available) if index in starter_set)
     bench = tuple(player for index, player in enumerate(available) if index not in starter_set)
