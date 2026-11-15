@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from dataclasses import replace
 import html
 import io
@@ -47,6 +48,17 @@ def _clear_trade_partner_assets() -> None:
 
 
 TRADE_FINDER_CACHE_VERSION = 30
+_HOSTED_GENERATION_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def _shared_generation_cache(key: tuple[object, ...], builder: Callable[[], object]) -> tuple[object, bool]:
+    if key in _HOSTED_GENERATION_CACHE:
+        return _HOSTED_GENERATION_CACHE[key], True
+    value = builder()
+    if len(_HOSTED_GENERATION_CACHE) >= 48:
+        _HOSTED_GENERATION_CACHE.pop(next(iter(_HOSTED_GENERATION_CACHE)))
+    _HOSTED_GENERATION_CACHE[key] = value
+    return value, False
 
 
 def _calibrated_trade_league(league: League) -> League:
@@ -69,34 +81,49 @@ def _calibrated_trade_league(league: League) -> League:
 
 def _cached_trade_finder(league: League, target_position: str | None, risk_profile: str, engine_version: int) -> tuple[list[object], object, bool]:
     """Cache recommendation objects in-session without pickling live dataclasses."""
-    cache_key = (engine_version, league.id, league.imported_at, target_position, risk_profile)
+    cache_key = ("finder", engine_version, league.id, league.my_team_id, league.imported_at, target_position, risk_profile)
     cache = st.session_state.get("_trade_finder_cache")
     if not isinstance(cache, dict) or "key" in cache:
         cache = {}
     if cache_key in cache:
         return (*cache[cache_key], True)
-    value = timed_generate_recommendations(
-        league,
-        target_position=target_position,
-        include_low_confidence=True,
-        include_review_candidates=True,
-        risk_profile=risk_profile,
+    value, shared_hit = _shared_generation_cache(
+        cache_key,
+        lambda: timed_generate_recommendations(
+            league,
+            target_position=target_position,
+            include_low_confidence=True,
+            include_review_candidates=True,
+            risk_profile=risk_profile,
+        ),
     )
     cache[cache_key] = value
     while len(cache) > 8:
         cache.pop(next(iter(cache)))
     st.session_state._trade_finder_cache = cache
-    return (*value, False)
+    return (*value, shared_hit)
 
 
 def _cached_waiver_recommendations(league: League) -> tuple[list[object], bool]:
-    cache_key = (league.id, league.imported_at, league.current_week)
+    cache_key = ("waivers", league.id, league.my_team_id, league.imported_at, league.current_week)
     cached = st.session_state.get("_waiver_recommendation_cache")
     if cached and cached.get("key") == cache_key:
         return cached["value"], True
-    value = generate_waiver_recommendations(league)
+    value, shared_hit = _shared_generation_cache(cache_key, lambda: generate_waiver_recommendations(league))
     st.session_state._waiver_recommendation_cache = {"key": cache_key, "value": value}
-    return value, False
+    return value, shared_hit
+
+
+def _cached_goal_directed_generation(kind: str, league: League, asset_id: str, risk_profile: str, builder: Callable[[], object]) -> tuple[object, bool]:
+    cache_key = (kind, league.id, league.my_team_id, league.imported_at, asset_id, risk_profile)
+    session_cache = st.session_state.setdefault("_goal_directed_cache", {})
+    if cache_key in session_cache:
+        return session_cache[cache_key], True
+    value, shared_hit = _shared_generation_cache(cache_key, builder)
+    session_cache[cache_key] = value
+    while len(session_cache) > 12:
+        session_cache.pop(next(iter(session_cache)))
+    return value, shared_hit
 
 
 def _page_header(kicker: str, title: str, description: str) -> None:
@@ -816,7 +843,11 @@ def _sell_seeker(league: League, my_team: Roster, risk_profile: str) -> None:
         return
     player = roster_players[player_id]
     with st.spinner(f"Finding markets for {player.name}…"):
-        offers, performance = generate_sell_offers(league, player_id, risk_profile=risk_profile)
+        generated, _cache_hit = _cached_goal_directed_generation(
+            "sell", league, player_id, risk_profile,
+            lambda: generate_sell_offers(league, player_id, risk_profile=risk_profile),
+        )
+        offers, performance = generated
     st.markdown(
         f'<div class="insight"><strong>Move {html.escape(player.name)} · {html.escape(player.position)}</strong><br>'
         f'Market value {player.value:.0f} · {html.escape(risk_profile)} return construction</div>', unsafe_allow_html=True,
@@ -909,11 +940,19 @@ def player_seeker(league: League) -> None:
         return
     target, owner = available[target_id]
     with st.spinner(f"Building paths to {target.name}…"):
-        offers, performance = generate_target_offers(league, target_id, risk_profile=risk_profile)
+        generated, _cache_hit = _cached_goal_directed_generation(
+            "target", league, target_id, risk_profile,
+            lambda: generate_target_offers(league, target_id, risk_profile=risk_profile),
+        )
+        offers, performance = generated
     multi_step_paths: list[object] = []
     if not offers or max(idea.score for idea in offers) < 65:
         with st.spinner(f"Checking safe two-step routes to {target.name}…"):
-            multi_step_paths = generate_multi_step_paths(league, target_id, risk_profile=risk_profile)
+            generated_paths, _paths_cache_hit = _cached_goal_directed_generation(
+                "multi-step", league, target_id, risk_profile,
+                lambda: generate_multi_step_paths(league, target_id, risk_profile=risk_profile),
+            )
+            multi_step_paths = generated_paths
     st.markdown(
         f'<div class="insight"><strong>{html.escape(target.name)} · {html.escape(target.position)}</strong><br>'
         f'Rostered by {html.escape(owner.team_name)} · Market value {target.value:.0f}<br>'

@@ -455,7 +455,8 @@ def tradable_roster_players(roster: Roster) -> tuple[Player, ...]:
 
 
 def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) -> Lineup:
-    available = sorted(players, key=lambda player: (projected_points(player, league), player.value, player.id), reverse=True)
+    player_points = {player.id: projected_points(player, league) for player in players}
+    available = sorted(players, key=lambda player: (player_points[player.id], player.value, player.id), reverse=True)
     eligibility = {
         "QB": {"QB"}, "RB": {"RB"}, "WR": {"WR"}, "TE": {"TE"}, "K": {"K"}, "DEF": {"DEF"},
         "FLEX": {"RB", "WR", "TE"}, "SUPERFLEX": {"QB", "RB", "WR", "TE"},
@@ -464,29 +465,48 @@ def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) 
     if not slots:
         return Lineup((), tuple(available), 0.0)
 
-    # Exact maximum-weight assignment. A player is considered once and can fill
-    # at most one slot, so FLEX/SUPERFLEX ordering cannot change the result.
-    # Typical fantasy lineups have <= 12 slots, keeping this bitmask DP small.
-    states: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    # Exact maximum-weight assignment. Process masks from most-filled to least-
+    # filled so a player added during this iteration cannot be selected again.
+    # Dense arrays avoid copying a state dictionary for every rostered player,
+    # which matters because recommendation generation invokes this thousands of
+    # times on hosted hardware.
+    state_count = 1 << len(slots)
+    scores = [float("-inf")] * state_count
+    assignments: list[tuple[int, ...] | None] = [None] * state_count
+    scores[0] = 0.0
+    assignments[0] = ()
+    masks_descending = sorted(range(state_count), key=int.bit_count, reverse=True)
+    eligible_masks = {
+        position: sum(1 << index for index, slot in enumerate(slots) if position in eligibility[slot])
+        for position in {player.position for player in available}
+    }
     for player_index, player in enumerate(available):
-        points = projected_points(player, league)
-        updated = dict(states)
-        for mask, (score, assignments) in states.items():
-            for slot_index, slot in enumerate(slots):
-                bit = 1 << slot_index
-                if mask & bit or player.position not in eligibility[slot]:
-                    continue
+        points = player_points[player.id]
+        eligible_mask = eligible_masks.get(player.position, 0)
+        if not eligible_mask:
+            continue
+        for mask in masks_descending:
+            assignment = assignments[mask]
+            if assignment is None:
+                continue
+            open_bits = eligible_mask & ~mask
+            while open_bits:
+                bit = open_bits & -open_bits
+                open_bits -= bit
                 next_mask = mask | bit
-                candidate = (score + points, assignments + (player_index,))
-                existing = updated.get(next_mask)
-                if existing is None or candidate[0] > existing[0]:
-                    updated[next_mask] = candidate
-        states = updated
-    _, (_, starter_indices) = max(states.items(), key=lambda item: (item[1][0], item[0].bit_count()))
+                candidate_score = scores[mask] + points
+                if candidate_score > scores[next_mask]:
+                    scores[next_mask] = candidate_score
+                    assignments[next_mask] = assignment + (player_index,)
+    best_mask = max(
+        (mask for mask, assignment in enumerate(assignments) if assignment is not None),
+        key=lambda mask: (scores[mask], mask.bit_count()),
+    )
+    starter_indices = assignments[best_mask] or ()
     starter_set = set(starter_indices)
     starters = tuple(player for index, player in enumerate(available) if index in starter_set)
     bench = tuple(player for index, player in enumerate(available) if index not in starter_set)
-    total = round(sum(projected_points(player, league) for player in starters), 1)
+    total = round(sum(player_points[player.id] for player in starters), 1)
     return Lineup(starters, bench, total)
 
 
