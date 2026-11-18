@@ -821,10 +821,12 @@ def _passes_qb_asset_safety(
     incoming_qbs = [player for player in receive_players if player.position == "QB"]
     if "QB" in result.lineup_a.critical_positions:
         return False
-    if len(send_players) >= 2 and result.lineup_a.points_gained < 6:
-        return False
+    # Redraft has no multi-year QB asset-preservation problem. Once the move
+    # leaves a playable QB lineup, judge it by immediate team impact below.
     if league.mode == "redraft":
         return True
+    if len(send_players) >= 2 and result.lineup_a.points_gained < 6:
+        return False
     if not incoming_qbs and result.lineup_a.points_gained < 8:
         return False
     outgoing_value = max(player.value for player in outgoing_qbs)
@@ -888,7 +890,11 @@ def _hard_gate_reason(
         return "Lineup decline"
     if result.lineup_a.depth_change < -25:
         return "Severe depth loss"
-    if result.lineup_a.critical_positions and result.lineup_a.after_resilience < 35:
+    if (
+        result.lineup_a.critical_positions
+        and result.lineup_a.after_resilience < 35
+        and result.lineup_a.introduced_coverage_warnings
+    ):
         return "Critical roster coverage"
     firsts = [pick for pick in send_picks if pick.round == 1]
     if firsts and target is not None:
@@ -902,11 +908,24 @@ def _recommendation_tier(
     result: TradeResult,
     score: int,
     risk_profile: RiskProfile,
+    league_mode: str = "dynasty",
 ) -> str | None:
     """Classify viable packages without turning ordinary costs into vetoes."""
     current = result.lineup_a.points_gained
     playoff = result.lineup_a.playoff_points_gained or 0
     depth = result.lineup_a.depth_change
+    if league_mode == "redraft":
+        # A one-to-two point weekly gain is meaningful over the remaining
+        # schedule even when no long-term asset appreciation is involved.
+        if score >= 68 and result.acceptance_score >= 48 and abs(result.fairness) <= 15 and current >= 1 and depth >= -10:
+            return "Best fit"
+        if risk_profile == "Aggressive" and score >= 58 and result.acceptance_score >= 42 and (current >= 1.5 or playoff >= 2.5) and depth >= -20:
+            return "Aggressive upside"
+        if score >= 56 and result.acceptance_score >= 45 and abs(result.fairness) <= 18 and current >= 1 and depth >= (-6 if risk_profile == "Conservative" else -14):
+            return "Safe option" if risk_profile == "Conservative" else "Balanced option"
+        if score >= 50 and result.acceptance_score >= 38 and (current >= .5 or playoff >= 1.5) and depth >= -18:
+            return "Exploratory"
+        return None
     if score >= 72 and result.acceptance_score >= 48 and abs(result.fairness) <= 12 and current >= 1 and depth >= -10 and not result.lineup_a.critical_positions:
         return "Best fit"
     if risk_profile == "Aggressive" and score >= 56 and (current >= 2 or playoff >= 4) and depth >= -20:
@@ -983,7 +1002,10 @@ def generate_recommendations(
         _metrics["team_diagnosis"] = diagnosis
     projections = {projection.player.id: projection for projection in compute_projections(league)}
     outlooks = {profile.player.id: profile for profile in compute_projection_profiles(league)}
-    anchors = _anchor_ids(my_team, league)
+    # Dynasty anchors protect long-lived franchise assets. In redraft every
+    # asset expires at season end, so starters may be exchanged when the move
+    # improves this roster and remains viable for the partner.
+    anchors = set() if league.mode == "redraft" else _anchor_ids(my_team, league)
     ideas: list[Recommendation] = []
     # Playoff-lineup optimization is the expensive stage. Bound it explicitly
     # so large leagues cannot turn a recommendation request into a minutes-long
@@ -994,7 +1016,11 @@ def generate_recommendations(
     needs = sorted(my_context.position_needs.items(), key=lambda item: item[1], reverse=True)
     expendable = [player for player in my_team.players if player.id not in anchors and player.value >= 10]
     for position, need in needs:
-        minimum_need = 0 if diagnosis == "Underperforming contender" or risk_profile == "Aggressive" else 10 if risk_profile == "Balanced" else 20
+        minimum_need = (
+            0 if league.mode == "redraft" or diagnosis == "Underperforming contender" or risk_profile == "Aggressive"
+            else 10 if risk_profile == "Balanced"
+            else 20
+        )
         if need < minimum_need:
             continue
         # Expensive simulations are budgeted, so visit the rosters with the
@@ -1076,7 +1102,7 @@ def generate_recommendations(
                             send_players=send_players, receive_players=receive_players,
                             role_risk_penalty=combined_role_penalty,
                         )
-                        tier = _recommendation_tier(result, score, risk_profile)
+                        tier = _recommendation_tier(result, score, risk_profile, league.mode)
                         if tier is None:
                             reject("Insufficient strategic upside")
                             continue
@@ -1100,7 +1126,7 @@ def generate_recommendations(
                             continue
                         score, confidence_adjustment = _evidence_adjusted_score(score, confidence)
                         breakdown = (*breakdown, ("Evidence confidence", confidence_adjustment))
-                        tier = _recommendation_tier(result, score, risk_profile)
+                        tier = _recommendation_tier(result, score, risk_profile, league.mode)
                         if tier is None:
                             if score >= 48 and include_review_candidates:
                                 tier = "Exploratory"
@@ -1180,7 +1206,7 @@ def generate_recommendations(
                         send_players=send_players, receive_players=receive_players,
                         role_risk_penalty=role_penalty,
                     )
-                    tier = _recommendation_tier(result, score, risk_profile)
+                    tier = _recommendation_tier(result, score, risk_profile, league.mode)
                     if tier is None:
                         reject("Insufficient strategic upside")
                         continue
@@ -1248,7 +1274,7 @@ def generate_recommendations(
                         continue
                     score, confidence_adjustment = _evidence_adjusted_score(score, confidence)
                     breakdown = (*breakdown, ("Evidence confidence", confidence_adjustment))
-                    tier = _recommendation_tier(result, score, risk_profile)
+                    tier = _recommendation_tier(result, score, risk_profile, league.mode)
                     if tier is None:
                         if score >= 48 and include_review_candidates:
                             tier = "Exploratory"

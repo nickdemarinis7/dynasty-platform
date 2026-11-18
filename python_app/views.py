@@ -47,7 +47,7 @@ def _clear_trade_partner_assets() -> None:
         st.session_state.pop(key, None)
 
 
-TRADE_FINDER_CACHE_VERSION = 34
+TRADE_FINDER_CACHE_VERSION = 35
 
 RISK_PROFILE_COPY = {
     "Conservative": "Protects depth and market value; avoids meaningful overpays and fragile roster construction.",

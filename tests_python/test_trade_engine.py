@@ -632,6 +632,29 @@ class TradeEngineRegressionTests(unittest.TestCase):
         self.assertEqual(_recommendation_tier(upside, 60, "Conservative"), "Exploratory")
         self.assertIsNone(_hard_gate_reason(upside, [self.a["rb"]], [self.b["wr"]], [], self.league, self.b["wr"]))
 
+    def test_redraft_can_surface_a_short_horizon_starter_swap(self) -> None:
+        redraft = replace(
+            self.league,
+            mode="redraft",
+            manager_tendencies={
+                self.team_b.team_id: {
+                    "trades": 4,
+                    "journal_resolved": 10,
+                    "journal_accepted": 8,
+                },
+            },
+        )
+        ideas = generate_recommendations(
+            redraft,
+            include_low_confidence=True,
+            include_review_candidates=True,
+            risk_profile="Balanced",
+        )
+        self.assertTrue(ideas)
+        self.assertTrue(any(idea.tier == "Balanced option" for idea in ideas))
+        self.assertTrue(all(not idea.send_picks and not idea.receive_picks for idea in ideas))
+        self.assertTrue(any(idea.evaluation.lineup_a.points_gained >= 1 for idea in ideas))
+
     def test_bottom_record_with_top_scoring_is_underperforming_contender(self) -> None:
         context = replace(
             build_contexts(self.league)[self.team_a.team_id],
