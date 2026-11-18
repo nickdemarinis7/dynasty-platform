@@ -196,10 +196,6 @@ def get_season_stats_snapshot(season: str, through_week: int) -> tuple[dict[str,
     return totals, successful
 
 
-def get_season_stats(season: str) -> dict[str, dict[str, float]]:
-    return get_season_stats_snapshot(season, 18)[0]
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_weekly_projection_stats(season: str, week: int) -> dict[str, dict[str, float]]:
     try:
@@ -234,11 +230,6 @@ def _parse_weekly_projection_stats(data: Any) -> dict[str, dict[str, float]]:
         for player_id, item in rows
         if isinstance(item, dict) and isinstance(item.get("stats"), dict)
     }
-
-
-def get_weekly_points(season: str, week: int, scoring: str) -> dict[str, float]:
-    reception = 1.0 if scoring == "ppr" else 0.5 if scoring == "half_ppr" else 0.0
-    return {player_id: score_stats(stats, {"rec": reception}, "") for player_id, stats in get_weekly_projection_stats(season, week).items()}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -367,16 +358,28 @@ def get_league_transactions(league_id: str, through_week: int) -> tuple[dict[str
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def import_league(username: str, league_id: str) -> League:
     import_started = monotonic()
-    user = get_user(username)
-    league = _get_json(f"{SLEEPER_BASE}/league/{league_id}")
-    rosters_data = _get_json(f"{SLEEPER_BASE}/league/{league_id}/rosters")
-    users_data = _get_json(f"{SLEEPER_BASE}/league/{league_id}/users")
-    try:
-        traded_picks = _get_json(f"{SLEEPER_BASE}/league/{league_id}/traded_picks")
-    except ProviderError:
-        traded_picks = []
+    def optional_traded_picks() -> Any:
+        try:
+            return _get_json(f"{SLEEPER_BASE}/league/{league_id}/traded_picks")
+        except ProviderError:
+            return []
+
+    # These Sleeper resources are independent. Fetching them serially made a
+    # cold hosted import pay five network round trips before analysis started.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        user_future = pool.submit(get_user, username)
+        league_future = pool.submit(_get_json, f"{SLEEPER_BASE}/league/{league_id}")
+        rosters_future = pool.submit(_get_json, f"{SLEEPER_BASE}/league/{league_id}/rosters")
+        users_future = pool.submit(_get_json, f"{SLEEPER_BASE}/league/{league_id}/users")
+        picks_future = pool.submit(optional_traded_picks)
+        user = user_future.result()
+        league = league_future.result()
+        rosters_data = rosters_future.result()
+        users_data = users_future.result()
+        traded_picks = picks_future.result()
     if not isinstance(league, dict) or not isinstance(rosters_data, list) or not isinstance(users_data, list):
         raise ProviderError("Sleeper returned incomplete league data")
 
@@ -399,19 +402,40 @@ def import_league(username: str, league_id: str) -> League:
     raw_waiver_budget = int(league_settings.get("waiver_budget") or 0)
     waiver_budget = raw_waiver_budget if raw_waiver_budget > 0 else None
 
-    fantasycalc_values: dict[str, float] = {}
-    secondary_values: dict[str, float] = {}
-    pick_values: dict[str, float] = {}
-    try:
-        market = get_market_values(mode != "redraft", 2 if superflex else 1, team_count, reception)
-        fantasycalc_values = market["players"]
-        pick_values = market["picks"]
-    except ProviderError:
-        pass
-    try:
-        secondary_values = get_secondary_market_values(mode != "redraft", superflex, te_premium)
-    except ProviderError:
-        pass
+    def primary_market() -> tuple[dict[str, float], dict[str, float]]:
+        try:
+            market = get_market_values(mode != "redraft", 2 if superflex else 1, team_count, reception)
+            return market["players"], market["picks"]
+        except ProviderError:
+            return {}, {}
+
+    def secondary_market() -> dict[str, float]:
+        try:
+            return get_secondary_market_values(mode != "redraft", superflex, te_premium)
+        except ProviderError:
+            return {}
+
+    def devy_market() -> tuple[DevyProspect, ...]:
+        if mode != "dynasty":
+            return ()
+        try:
+            return get_devy_prospects()
+        except ProviderError:
+            return ()
+
+    # Market feeds, the NFL player catalog, and crowd trends do not depend on
+    # one another. Parallel cold loads substantially reduce hosted startup.
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        primary_future = pool.submit(primary_market)
+        secondary_future = pool.submit(secondary_market)
+        devy_future = pool.submit(devy_market)
+        players_future = pool.submit(get_players)
+        trends_future = pool.submit(get_player_trends)
+        fantasycalc_values, pick_values = primary_future.result()
+        secondary_values = secondary_future.result()
+        devy_prospects = devy_future.result()
+        player_data = players_future.result()
+        trend_adds, trend_drops = trends_future.result()
     source_ids = set(fantasycalc_values) | set(secondary_values)
     market_source_values = {
         player_id: {
@@ -429,15 +453,6 @@ def import_league(username: str, league_id: str) -> League:
     }
     values_status = "live" if values else "unavailable"
 
-    if mode == "dynasty":
-        try:
-            devy_prospects = get_devy_prospects()
-        except ProviderError:
-            devy_prospects = ()
-    else:
-        devy_prospects = ()
-
-    player_data = get_players()
     player_teams = {
         str(player_id): str(raw.get("team"))
         for player_id, raw in player_data.items()
@@ -453,7 +468,6 @@ def import_league(username: str, league_id: str) -> League:
         for player_id, raw in player_data.items()
         if isinstance(raw, dict)
     }
-    trend_adds, trend_drops = get_player_trends()
     signal_ids = set(player_data) | set(trend_adds) | set(trend_drops)
     player_signals = {
         player_id: {

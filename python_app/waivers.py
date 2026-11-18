@@ -182,7 +182,7 @@ def generate_waiver_recommendations(league: League, limit: int = 20) -> list[Wai
         recommendations,
         key=lambda item: (item.score, item.lineup_gain, item.value_gain),
         reverse=True,
-    )[:max(limit + 10, 30)]
+    )[:min(12, max(limit, 8))]
     finalists: list[WaiverRecommendation] = []
     for recommendation in preliminary:
         impact = lineup_impact(

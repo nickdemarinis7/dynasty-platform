@@ -1,10 +1,11 @@
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from python_app.analytics import active_roster_players, assess_team_trade, build_contexts, evaluate_trade, explain_trade, lineup_impact, package_value, projected_points, replacement_player_value, trade_market_range
 from python_app.counteroffers import generate_counteroffers
 from python_app.models import DraftPick, League, Player, Roster
-from python_app.recommendations import Recommendation, _combined_role_risk, _confidence, _depth_score, _evidence_adjusted_score, _hard_gate_reason, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _qb_role_risk, _recommendation_tier, _reliable_depth_target, _rental_pick_blocked, _return_packages, _score, _score_range, _signal_role_risk, _target_offer_packages, _team_diagnosis, _usage_role_risk, _waiver_alternative_penalty, diversify_recommendations, generate_multi_step_paths, generate_recommendations, generate_sell_offers, generate_target_offers, timed_generate_recommendations
+from python_app.recommendations import Recommendation, _apply_recommendation, _buy_objective, _combined_role_risk, _confidence, _depth_score, _evidence_adjusted_score, _hard_gate_reason, _is_roster_rebalance, _passes_final_review_value, _passes_qb_asset_safety, _passes_review_gates, _pick_return_packages, _qb_role_risk, _rebalance_packages, _recommendation_tier, _reliable_depth_target, _rental_pick_blocked, _return_packages, _score, _score_range, _signal_role_risk, _target_offer_packages, _team_diagnosis, _usage_role_risk, _waiver_alternative_penalty, diversify_recommendations, generate_multi_step_paths, generate_recommendations, generate_sell_offers, generate_target_offers, generate_trade_ladders, timed_generate_recommendations
 
 
 class TradeEngineRegressionTests(unittest.TestCase):
@@ -40,6 +41,43 @@ class TradeEngineRegressionTests(unittest.TestCase):
 
     def test_package_value_preserves_provider_market_values(self) -> None:
         self.assertEqual(package_value([self.a["rb"], self.a["wr"]]), self.a["rb"].value + self.a["wr"].value)
+
+    def test_cross_position_upgrade_and_downgrade_is_roster_rebalance(self) -> None:
+        sends = (replace(self.a["rb"], value=65), replace(self.a["wr"], value=30))
+        receives = (replace(self.b["rb"], value=40), replace(self.b["wr"], value=60))
+        self.assertTrue(_is_roster_rebalance(sends, receives))
+        self.assertEqual(_buy_objective(sends, receives, ()), "Roster rebalance")
+
+    def test_rebalance_constructor_converts_surplus_into_position_upgrade(self) -> None:
+        my_rb = Player("my-rb", "My Strong RB", "RB", "A", 25, 65)
+        my_rb_depth = Player("my-rb-depth", "My RB Depth", "RB", "A", 24, 35)
+        my_wr = Player("my-wr", "My Weak WR", "WR", "A", 25, 30)
+        my_depth = Player("my-depth", "My Trade Chip", "WR", "A", 23, 15)
+        partner_rb = Player("their-rb", "Their Replacement RB", "RB", "B", 24, 40)
+        partner_wr = Player("their-wr", "Their Strong WR", "WR", "B", 25, 60)
+        partner_wr_depth = Player("their-wr-depth", "Their WR Depth", "WR", "B", 24, 35)
+        mine = Roster("1", "Mine", "Me", (my_rb, my_rb_depth, my_wr, my_depth), wins=6, losses=3, points_for=900)
+        other = Roster("2", "Other", "Them", (partner_rb, partner_wr, partner_wr_depth), wins=5, losses=4, points_for=880)
+        weekly = {
+            my_rb.id: 18, my_rb_depth.id: 12, my_wr.id: 10, my_depth.id: 5,
+            partner_rb.id: 14, partner_wr.id: 16, partner_wr_depth.id: 11,
+        }
+        league = League(
+            "rebalance", "Rebalance", "2026", "dynasty", 2, False, False, "half_ppr",
+            (("RB", 1), ("WR", 1), ("FLEX", 1), ("BN", 3)), "1", (mine, other), "live",
+            weekly_points=weekly, playoff_weekly_points={15: weekly, 16: weekly},
+        )
+        packages = _rebalance_packages(partner_wr, mine, other, league, build_contexts(league))
+        self.assertTrue(any(
+            {player.id for player in sends} == {my_rb.id, my_wr.id}
+            and {player.id for player in receives} == {partner_rb.id, partner_wr.id}
+            for sends, receives in packages
+        ))
+        ideas = generate_recommendations(
+            league, include_low_confidence=True, include_review_candidates=True,
+        )
+        rebalance = next(idea for idea in ideas if idea.objective == "Roster rebalance")
+        self.assertTrue(any("Follow-on path" in item for item in rebalance.evidence))
 
     def test_ir_player_remains_available_as_a_trade_asset(self) -> None:
         ir_asset = replace(self.a["wr"], id="ir-asset", value=50, injury_status="IR")
@@ -282,6 +320,40 @@ class TradeEngineRegressionTests(unittest.TestCase):
             self.assertIn(path.intermediary.id, {player.id for player in path.first.receive_players})
             self.assertIn(path.intermediary.id, {player.id for player in path.second.send_players})
             self.assertTrue(path.stop_after_step_one_safe)
+
+    def test_trade_ladder_recycles_acquired_asset_and_scores_final_roster(self) -> None:
+        from tests_python.recommendation_audit import build_audit_league
+        league = build_audit_league()
+        initial = generate_recommendations(league, include_low_confidence=True, include_review_candidates=True)
+        first = next(idea for idea in initial if idea.objective == "Roster rebalance")
+        first = replace(
+            first, review_only=False, score=65, tier="Balanced option",
+            evaluation=replace(
+                first.evaluation, acceptance_score=55,
+                lineup_a=replace(first.evaluation.lineup_a, after_resilience=55, depth_change=0, points_gained=1),
+            ),
+        )
+        hypothetical = _apply_recommendation(league, first)
+        follow_ups = generate_recommendations(
+            hypothetical, limit=30, include_low_confidence=True, include_review_candidates=True,
+        )
+        acquired_ids = {player.id for player in first.receive_players}
+        second = next(
+            idea for idea in follow_ups
+            if acquired_ids & {player.id for player in idea.send_players}
+        )
+        second = replace(
+            second, review_only=False, score=65, tier="Balanced option",
+            evaluation=replace(second.evaluation, acceptance_score=55),
+        )
+        with patch("python_app.recommendations.generate_recommendations", return_value=[second]):
+            paths = generate_trade_ladders(league, [first], limit=1)
+        self.assertEqual(len(paths), 1)
+        path = paths[0]
+        self.assertIn(path.intermediary.id, acquired_ids)
+        self.assertIn(path.intermediary.id, {player.id for player in path.second.send_players})
+        self.assertGreaterEqual(path.final_lineup_delta, 1.5)
+        self.assertTrue(path.stop_after_step_one_safe)
 
     def test_counteroffers_are_deterministic_and_unique(self) -> None:
         first = generate_counteroffers(self.team_a, self.team_b, [self.a["bench"]], [self.b["wr"]], self.league)
@@ -585,6 +657,21 @@ class TradeEngineRegressionTests(unittest.TestCase):
         self.assertTrue(all(self.b["wr"] in offer.receive_players for offer in offers))
         self.assertTrue(all(offer.partner.team_id == self.team_b.team_id for offer in offers))
         self.assertTrue(all(offer.kind == "TARGET" for offer in offers))
+
+    def test_player_seeker_offer_styles_build_materially_different_cost_bands(self) -> None:
+        contexts = build_contexts(self.league)
+        conservative = _target_offer_packages(
+            50, self.team_a, self.team_b, self.league, contexts, "Conservative",
+        )
+        aggressive = _target_offer_packages(
+            50, self.team_a, self.team_b, self.league, contexts, "Aggressive",
+        )
+        conservative_values = [package_value(players, picks, self.league) for players, picks in conservative]
+        aggressive_values = [package_value(players, picks, self.league) for players, picks in aggressive]
+        self.assertTrue(conservative_values)
+        self.assertTrue(aggressive_values)
+        self.assertLessEqual(max(conservative_values), 50 * 1.18)
+        self.assertGreater(max(aggressive_values), max(conservative_values))
 
     def test_player_seeker_rejects_own_or_unknown_target(self) -> None:
         own_offers, own_performance = generate_target_offers(self.league, self.a["wr"].id)

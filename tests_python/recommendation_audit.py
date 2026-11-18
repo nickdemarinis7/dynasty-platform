@@ -4,6 +4,11 @@ Run from the repository root with: python3 -m tests_python.recommendation_audit
 """
 from __future__ import annotations
 
+if __package__ in {None, ""}:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from python_app.models import DraftPick, League, Player, Roster
 from python_app.recommendations import generate_target_offers, timed_generate_recommendations
 

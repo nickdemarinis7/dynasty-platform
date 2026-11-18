@@ -52,7 +52,7 @@ class StreamlitSmokeTests(unittest.TestCase):
         app.run(timeout=15)
         self.assertFalse(app.exception)
         self.assertEqual(app.session_state["color_mode"], "Dark")
-        theme_button = next(button for button in app.button if button.label == "☾")
+        theme_button = next(button for button in app.button if button.label == ":material/dark_mode:")
         theme_button.click().run(timeout=15)
         self.assertEqual(app.session_state["color_mode"], "Light")
 
@@ -62,11 +62,17 @@ class StreamlitSmokeTests(unittest.TestCase):
         app.session_state["league"] = _connected_league()
         app.session_state["username"] = "me"
         app.session_state["color_mode"] = "Dark"
+        app.session_state["connection_username"] = "me"
+        app.session_state["connection_season"] = "2026"
+        app.session_state["league_choices"] = [{
+            "league_id": "qa", "name": "QA League", "season": "2026", "total_rosters": 2,
+        }]
         app.run(timeout=15)
-        next(button for button in app.button if button.label == "Switch").click().run(timeout=15)
+        next(button for button in app.button if button.label == ":material/swap_horiz:").click().run(timeout=15)
         self.assertEqual(app.session_state["color_mode"], "Dark")
         self.assertNotIn("league", app.session_state)
-        self.assertTrue(any(item.label == "Sleeper username" for item in app.text_input))
+        self.assertTrue(app.radio)
+        self.assertFalse(any(item.label == "Sleeper username" for item in app.text_input))
 
     def test_connected_primary_routes_render_without_exceptions(self) -> None:
         routes = (

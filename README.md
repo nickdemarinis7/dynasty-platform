@@ -55,30 +55,6 @@ streamlit run streamlit_app.py
 
 Open [http://localhost:8501](http://localhost:8501). The Python app includes live Sleeper league import, FantasyCalc market values, projected early/middle/late pick pricing, traded-pick ownership, source-health reporting, scored weekly and season production data, optimized lineups, a contextual Trade Simulator, recommendation-to-simulator handoff, decision journaling, a quality-gated Trade Finder, Player Seeker and player-sale paths, scenario estimates, a waiver claim plan, a live-draft board, market signals, rosters, power rankings, and player values.
 
-### Legacy Next.js reference application
-
-This code is retained for UI and parity reference only. It is not the production application, and recommendation changes should be made in `python_app/`.
-
-### Prerequisites
-- Node.js 18+ 
-- npm or yarn
-
-### Installation
-
-```bash
-# Clone the repository
-git clone <your-repo-url>
-cd windsurf-project-2
-
-# Install dependencies
-npm install
-
-# Run development server
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) to view the app.
-
 ### Import Your League
 
 1. Click "Import League" in the navigation
@@ -92,7 +68,6 @@ Open [http://localhost:3000](http://localhost:3000) to view the app.
 - **Primary app:** Python 3.13 + Streamlit
 - **HTTP/data:** Requests + public Sleeper and FantasyCalc APIs
 - **Optional persistence:** Supabase with OIDC authentication
-- **Legacy reference implementation:** Next.js, TypeScript, Tailwind, Zustand
 - **APIs:** 
   - Sleeper API (league data)
   - FantasyCalc API (dynasty values)
@@ -100,30 +75,9 @@ Open [http://localhost:3000](http://localhost:3000) to view the app.
 
 ## 📁 Project Structure
 
-```
-src/
-├── app/                    # Next.js app router pages
-│   ├── league/            # League import
-│   ├── rosters/           # Roster management
-│   ├── rankings/          # Power rankings
-│   ├── values/            # Player values
-│   ├── trade/             # Trade simulator & history
-│   ├── recommendations/   # Trade finder
-│   └── projections/       # Edge intelligence
-├── components/            # React components
-│   └── ui/               # shadcn/ui components
-├── lib/                   # Core logic
-│   ├── sleeper-api.ts    # Sleeper API wrapper
-│   ├── fantasycalc.ts    # FantasyCalc integration
-│   ├── trade-engine.ts   # Trade evaluation
-│   ├── projections.ts    # Player projections
-│   └── lineup-optimizer.ts # Lineup optimization
-└── store/                 # Zustand state management
-
-docs/
-├── archive/              # Development notes
-└── development/          # Test scripts
-```
+The production application lives in `streamlit_app.py` and `python_app/`.
+Automated regression coverage lives in `tests_python/`; deployment and privacy
+documentation lives in `docs/`.
 
 ## 🎮 Usage
 
@@ -193,7 +147,7 @@ operational-logging, export, and deletion behavior.
 3. Choose **Add to Home Screen**.
 4. Launch **Fantasy GM** from the new home-screen icon.
 
-The Streamlit layout is mobile-first and can be saved as a Safari home-screen shortcut. Streamlit does not currently provide the same full PWA shell as the legacy Next.js version, so it will still behave as a hosted web application.
+The Streamlit layout is mobile-first and can be saved as a Safari home-screen shortcut. It behaves as a hosted web application rather than a full offline PWA.
 
 ## 📝 License
 

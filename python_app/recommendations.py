@@ -199,11 +199,37 @@ def _team_diagnosis(context: TeamContext, league: League) -> str:
 def _buy_objective(send_players: tuple[Player, ...], receive_players: tuple[Player, ...], receive_picks: tuple[DraftPick, ...]) -> str:
     if receive_picks:
         return "Balanced package"
+    if _is_roster_rebalance(send_players, receive_players):
+        return "Roster rebalance"
     if len(send_players) >= 2 and len(receive_players) == 1:
         return "Consolidation"
     if len(receive_players) >= 2:
         return "Starter plus depth"
     return "Starter upgrade"
+
+
+def _positional_value_changes(
+    send_players: tuple[Player, ...] | list[Player],
+    receive_players: tuple[Player, ...] | list[Player],
+) -> dict[str, float]:
+    """Compare the best asset exchanged at each shared position."""
+    positions = {player.position for player in send_players} & {player.position for player in receive_players}
+    return {
+        position: max(player.value for player in receive_players if player.position == position)
+        - max(player.value for player in send_players if player.position == position)
+        for position in positions
+    }
+
+
+def _is_roster_rebalance(
+    send_players: tuple[Player, ...] | list[Player],
+    receive_players: tuple[Player, ...] | list[Player],
+) -> bool:
+    """Identify a deliberate upgrade at one position funded by a downgrade at another."""
+    if len(send_players) < 2 or len(receive_players) < 2:
+        return False
+    changes = _positional_value_changes(send_players, receive_players)
+    return any(change >= 3 for change in changes.values()) and any(change <= -3 for change in changes.values())
 
 
 def _strategic_summary(result: TradeResult, context: TeamContext) -> str:
@@ -325,6 +351,14 @@ def _score(
     internal_replacements = len(result.lineup_a.internal_replacements)
     uncovered_starters = max(0, len(result.lineup_a.outgoing_starters) - internal_replacements)
     replaceability = internal_replacements * 1.5 - uncovered_starters * 1.75
+    rebalance = 0.0
+    if _is_roster_rebalance(send_players, receive_players) and lineup >= .5:
+        changes = _positional_value_changes(send_players, receive_players)
+        upgrade = max(changes.values(), default=0.0)
+        concession = abs(min(changes.values(), default=0.0))
+        # Reward useful conversion, not arbitrary four-player churn. The
+        # lineup and resilience components still decide whether it worked.
+        rebalance = min(7.0, 2.0 + min(upgrade, concession) * .12)
     churn = -8.0 if lineup < 1 and playoff < 2 and not is_sell else 0.0
     components = (
         ("Base team utility", 45.0),
@@ -335,6 +369,7 @@ def _score(
         ("Roster resilience", depth * depth_weight),
         ("Championship leverage", leverage),
         ("Starter concentration", consolidation),
+        ("Positional rebalancing", rebalance),
         ("Internal replaceability", replaceability),
         ("Recent role stability", -role_risk_penalty),
         ("Positional need", target_need * .10),
@@ -630,6 +665,94 @@ def _return_packages(target: Player, partner: Roster, league: League) -> list[tu
     return packages
 
 
+def _rebalance_packages(
+    target: Player,
+    my_team: Roster,
+    partner: Roster,
+    league: League,
+    contexts: dict[str, TeamContext],
+    anchors: set[str] | None = None,
+) -> list[tuple[list[Player], list[Player]]]:
+    """Build two-position swaps that turn surplus into a targeted upgrade.
+
+    Shape: our lesser asset at the target position plus a surplus-position
+    asset, for the target plus a usable downgrade at the surplus position.
+    """
+    my_context = contexts[my_team.team_id]
+    partner_context = contexts[partner.team_id]
+    protected = anchors or set()
+    target_need = my_context.position_needs.get(target.position, 0)
+    if target_need < 10:
+        return []
+
+    available_mine = tradable_roster_players(my_team)
+    weak_assets = sorted(
+        (
+            player for player in available_mine
+            if player.position == target.position
+            and player.id != target.id
+            and 8 <= player.value <= target.value * .92
+        ),
+        key=lambda player: (player.id in protected, abs(player.value - target.value * .55)),
+    )[:5]
+    if not weak_assets:
+        return []
+
+    packages: list[tuple[list[Player], list[Player]]] = []
+    for surplus_position in ("QB", "RB", "WR", "TE"):
+        if surplus_position == target.position:
+            continue
+        # It should be meaningfully easier for us to concede value here than
+        # at the position being acquired.
+        if my_context.position_needs.get(surplus_position, 100) > max(35, target_need - 15):
+            continue
+        surplus_assets = sorted(
+            (
+                player for player in available_mine
+                if player.position == surplus_position and player.value >= 15
+            ),
+            key=lambda player: (player.id in protected, -player.value),
+        )[:6]
+        replacements = sorted(
+            (
+                player for player in tradable_roster_players(partner)
+                if player.id != target.id
+                and player.position == surplus_position
+                and player.value >= 8
+            ),
+            key=lambda player: (
+                partner_context.position_needs.get(player.position, 0),
+                -player.value,
+            ),
+        )[:6]
+        for weak_asset in weak_assets:
+            for surplus_asset in surplus_assets:
+                for replacement in replacements:
+                    concession = surplus_asset.value - replacement.value
+                    upgrade = target.value - weak_asset.value
+                    if not (3 <= concession <= max(35, surplus_asset.value * .55)):
+                        continue
+                    if upgrade < 3 or upgrade < concession * .55:
+                        continue
+                    sent_value = weak_asset.value + surplus_asset.value
+                    received_value = target.value + replacement.value
+                    if not (.72 * received_value <= sent_value <= 1.28 * received_value):
+                        continue
+                    packages.append(([weak_asset, surplus_asset], [target, replacement]))
+
+    unique: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[list[Player], list[Player]]] = {}
+    for sends, receives in packages:
+        key = (tuple(sorted(player.id for player in sends)), tuple(sorted(player.id for player in receives)))
+        unique[key] = (sends, receives)
+    return sorted(
+        unique.values(),
+        key=lambda package: (
+            abs(package_value(package[0], league=league) - package_value(package[1], league=league)),
+            sum(player.id in protected for player in package[0]),
+        ),
+    )[:8]
+
+
 def _pick_return_packages(player: Player, partner: Roster, league: League) -> list[tuple[DraftPick, ...]]:
     """Find bounded future-capital returns for a rebuilding sale."""
     priced = [pick for pick in partner.draft_picks if pick_profile(pick, league).adjusted_value > 0]
@@ -647,55 +770,6 @@ def _pick_return_packages(player: Player, partner: Roster, league: League) -> li
             tuple((pick.year, pick.round, pick.original_owner) for pick in package),
         ),
     )[:8]
-
-
-def _passes_quality_gates(
-    result: TradeResult,
-    send_players: list[Player],
-    send_picks: list[DraftPick],
-    target: Player,
-    league: League,
-    user_context: TeamContext,
-    partner_context: TeamContext,
-) -> bool:
-    """Keep merely legal trades out of the actionable recommendation set."""
-    if result.acceptance_score < 45 or result.lineup_a.points_gained < 1:
-        return False
-    if result.fairness > 15 or result.fairness < -12:
-        return False
-    if result.lineup_a.depth_change < -10 and result.lineup_a.points_gained < 5:
-        return False
-    if result.lineup_a.critical_positions and result.lineup_a.after_resilience < 50:
-        return False
-    if user_context.window in {"Win Now", "Competing"}:
-        if result.lineup_a.after_resilience < 55 or result.lineup_a.depth_change < -8:
-            return False
-
-    if any(player.position == "QB" for player in send_players) and target.position != "QB":
-        qb_warning = any(warning.startswith("QB:") for warning in result.lineup_a.coverage_warnings)
-        if qb_warning or (target.value < premium_value_cutoff(league) and result.lineup_a.points_gained < 5):
-            return False
-    firsts = [pick for pick in send_picks if pick.round == 1]
-    if firsts:
-        # Firsts should buy durable, premium assets—not turn small weekly gains
-        # from ordinary starters into recommendations.
-        if target.value < max(premium_value_cutoff(league), max(pick_profile(pick, league).adjusted_value for pick in firsts) * 1.75):
-            return False
-        if result.fairness < -8:
-            return False
-        if result.lineup_a.points_gained < 3.5 and (result.lineup_a.playoff_points_gained or 0) < 5:
-            return False
-
-    elite_outgoing = max((player.value for player in send_players), default=0)
-    if send_picks and elite_outgoing >= premium_value_cutoff(league) and target.value < elite_outgoing * 1.15:
-        return False
-
-    # A contender has little reason to trade away a starter for a package that
-    # does not improve its lineup. Rebuilders may rationally prefer value/picks.
-    if partner_context.window in {"Win Now", "Competing"} and send_players:
-        if not result.lineup_b.received_player_starts or result.lineup_b.points_gained < -1:
-            return False
-    return True
 
 
 def _passes_review_gates(
@@ -911,6 +985,11 @@ def generate_recommendations(
     outlooks = {profile.player.id: profile for profile in compute_projection_profiles(league)}
     anchors = _anchor_ids(my_team, league)
     ideas: list[Recommendation] = []
+    # Playoff-lineup optimization is the expensive stage. Bound it explicitly
+    # so large leagues cannot turn a recommendation request into a minutes-long
+    # exhaustive search. Aggressive mode receives the wider search beam.
+    full_evaluation_budget = {"Conservative": 24, "Balanced": 32, "Aggressive": 44}[risk_profile]
+    full_evaluations_used = 0
 
     needs = sorted(my_context.position_needs.items(), key=lambda item: item[1], reverse=True)
     expendable = [player for player in my_team.players if player.id not in anchors and player.value >= 10]
@@ -918,9 +997,22 @@ def generate_recommendations(
         minimum_need = 0 if diagnosis == "Underperforming contender" or risk_profile == "Aggressive" else 10 if risk_profile == "Balanced" else 20
         if need < minimum_need:
             continue
-        for partner in league.rosters:
-            if partner.team_id == my_team.team_id:
-                continue
+        # Expensive simulations are budgeted, so visit the rosters with the
+        # strongest relevant targets first instead of inheriting Sleeper's
+        # arbitrary roster order.
+        partners = sorted(
+            (partner for partner in league.rosters if partner.team_id != my_team.team_id),
+            key=lambda partner: max(
+                (
+                    projected_points(player, league),
+                    player.value,
+                )
+                for player in partner.players
+                if player.position == position and player.value >= 15
+            ) if any(player.position == position and player.value >= 15 for player in partner.players) else (0.0, 0.0),
+            reverse=True,
+        )
+        for partner in partners:
             targets = sorted(
                 (player for player in partner.players if player.position == position and player.value >= 15),
                 key=lambda player: (projected_points(player, league), player.value),
@@ -958,6 +1050,9 @@ def generate_recommendations(
                         if full_evaluations_by_return.get(return_key, 0) >= 1:
                             reject("Staged simulation limit")
                             continue
+                        if full_evaluations_used >= full_evaluation_budget:
+                            reject("Full-simulation budget")
+                            continue
                         full_evaluations_by_return[return_key] = full_evaluations_by_return.get(return_key, 0) + 1
                         # Playoff-week optimization is substantially more expensive.
                         # Run it only after the package clears current-week, market,
@@ -966,6 +1061,7 @@ def generate_recommendations(
                             my_team, partner, send_players, list(receive_players), league,
                             send_picks, list(receive_picks), contexts, model_outcomes=False,
                         )
+                        full_evaluations_used += 1
                         if _metrics is not None:
                             _metrics["full_evaluations"] += 1
                         combined_role_penalty, role_warnings = _combined_role_risk(target, league)
@@ -1027,8 +1123,172 @@ def generate_recommendations(
                         candidates.append(recommendation)
                         if _metrics is not None:
                             _metrics["viable_candidates"] += 1
+
+                # Deliberately test cross-position 2-for-2 swaps. These are
+                # not target-plus-throw-in packages: one position improves
+                # while a surplus position accepts a controlled downgrade.
+                rebalance_screen: list[tuple[float, list[Player], list[Player], TradeResult]] = []
+                for send_players, receive_players in _rebalance_packages(
+                    target, my_team, partner, league, contexts, anchors,
+                ):
+                    result = evaluate_trade(
+                        my_team, partner, send_players, receive_players, league,
+                        contexts=contexts, model_playoffs=False,
+                    )
+                    if _metrics is not None:
+                        _metrics["packages_evaluated"] += 1
+                    gate_reason = _hard_gate_reason(
+                        result, send_players, receive_players, (), league, target, my_context,
+                    )
+                    if gate_reason in {"Critical roster coverage", "Severe depth loss"} and (
+                        result.lineup_a.points_gained >= 1
+                        and result.lineup_a.depth_change >= -10
+                    ):
+                        # A rebalance that returns a player at the conceded
+                        # position can carry a disclosed coverage caution when
+                        # the net depth effect remains bounded.
+                        gate_reason = None
+                    if gate_reason:
+                        reject(gate_reason)
+                        continue
+                    screen_score = (
+                        result.lineup_a.points_gained * 4
+                        + result.lineup_b.points_gained * 1.5
+                        + result.acceptance_score * .10
+                        - abs(result.fairness) * .25
+                        + max(0, result.lineup_a.depth_change) * .10
+                    )
+                    rebalance_screen.append((screen_score, send_players, receive_players, result))
+
+                for _, send_players, receive_players, _ in sorted(rebalance_screen, reverse=True, key=lambda item: item[0])[:2]:
+                    result = evaluate_trade(
+                        my_team, partner, send_players, receive_players, league,
+                        contexts=contexts, model_outcomes=False,
+                    )
+                    if _metrics is not None:
+                        _metrics["full_evaluations"] += 1
+                    if result.lineup_a.points_gained < .5 or result.lineup_b.points_gained < -2:
+                        reject("Rebalance does not improve both roster shapes")
+                        continue
+                    role_signals = [_combined_role_risk(player, league) for player in receive_players]
+                    role_penalty = max((penalty for penalty, _ in role_signals), default=0.0)
+                    if role_penalty >= 18 and risk_profile != "Aggressive":
+                        reject("Unstable starting role")
+                        continue
+                    score, team_score, market_score, breakdown = _score(
+                        result, need, risk_profile=risk_profile, context=my_context,
+                        send_players=send_players, receive_players=receive_players,
+                        role_risk_penalty=role_penalty,
+                    )
+                    tier = _recommendation_tier(result, score, risk_profile)
+                    if tier is None:
+                        reject("Insufficient strategic upside")
+                        continue
+                    if tier == "Exploratory" and not include_review_candidates:
+                        reject("Exploratory hidden")
+                        continue
+                    changes = _positional_value_changes(send_players, receive_players)
+                    upgrade_position = max(changes, key=changes.get)
+                    concession_position = min(changes, key=changes.get)
+                    incoming_upgrade = max(
+                        (player for player in receive_players if player.position == upgrade_position),
+                        key=lambda player: player.value,
+                    )
+                    outgoing_upgrade = max(
+                        (player for player in send_players if player.position == upgrade_position),
+                        key=lambda player: player.value,
+                    )
+                    incoming_replacement = max(
+                        (player for player in receive_players if player.position == concession_position),
+                        key=lambda player: player.value,
+                    )
+                    outgoing_surplus = max(
+                        (player for player in send_players if player.position == concession_position),
+                        key=lambda player: player.value,
+                    )
+                    reason = (
+                        f"Converts surplus at {concession_position} into a {upgrade_position} upgrade: "
+                        f"{outgoing_upgrade.name} becomes {incoming_upgrade.name}, while "
+                        f"{incoming_replacement.name} keeps {concession_position} usable after moving {outgoing_surplus.name}. "
+                        f"{_strategic_summary(result, my_context)}"
+                    )
+                    evidence, cautions = _evidence(result, league, my_context, partner)
+                    post_trade_players = [
+                        player for player in active_roster_players(my_team)
+                        if player.id not in {asset.id for asset in send_players}
+                    ] + list(receive_players)
+                    post_trade_starters = {
+                        player.id for player in optimize_lineup(post_trade_players, league).starters
+                    }
+                    follow_on_chips = sorted(
+                        (
+                            player for player in post_trade_players
+                            if player.id not in post_trade_starters
+                            and player.id not in {asset.id for asset in receive_players}
+                            and player.value >= 10
+                        ),
+                        key=lambda player: player.value,
+                        reverse=True,
+                    )
+                    if follow_on_chips:
+                        evidence = (
+                            f"Follow-on path: {follow_on_chips[0].name} remains as depth that could later be paired with "
+                            f"{incoming_replacement.name} to pursue another {concession_position} upgrade; reassess after this trade clears.",
+                            *evidence,
+                        )
+                    for _, warnings in reversed(role_signals):
+                        for warning in reversed(warnings):
+                            cautions = (warning + "; verify the latest status before offering.", *cautions)
+                    confidence_assets = tuple(send_players) + tuple(receive_players)
+                    confidence, confidence_reasons = _confidence(
+                        league, my_context, partner, confidence_assets, outlooks,
+                    )
+                    if confidence not in {"A", "B"} and not include_low_confidence:
+                        reject("Evidence confidence")
+                        continue
+                    score, confidence_adjustment = _evidence_adjusted_score(score, confidence)
+                    breakdown = (*breakdown, ("Evidence confidence", confidence_adjustment))
+                    tier = _recommendation_tier(result, score, risk_profile)
+                    if tier is None:
+                        if score >= 48 and include_review_candidates:
+                            tier = "Exploratory"
+                        else:
+                            reject("Insufficient evidence-adjusted upside")
+                            continue
+                    if tier == "Exploratory" and not include_review_candidates:
+                        reject("Exploratory hidden")
+                        continue
+                    score_low, score_high = _score_range(score, confidence, team_score, market_score)
+                    candidates.append(Recommendation(
+                        kind="REBALANCE", partner=partner,
+                        send_players=tuple(send_players), send_picks=(),
+                        receive_players=tuple(receive_players), receive_picks=(),
+                        evaluation=result, score=score, reason=reason,
+                        objective="Roster rebalance", tier=tier,
+                        team_value_score=team_score, market_value_score=market_score,
+                        score_low=score_low, score_high=score_high,
+                        evidence=evidence, cautions=cautions, confidence=confidence,
+                        confidence_reasons=confidence_reasons, score_breakdown=breakdown,
+                        review_only=tier == "Exploratory",
+                    ))
+                    if _metrics is not None:
+                        _metrics["viable_candidates"] += 1
                 if candidates:
-                    ideas.append(max(candidates, key=lambda idea: (idea.score, idea.evaluation.acceptance_score)))
+                    # Preserve the best construction for each strategic shape.
+                    # Otherwise a conventional 2-for-1 aimed at the same star
+                    # can silently crowd out a valid roster-rebalance path.
+                    best_by_objective: dict[str, Recommendation] = {}
+                    for candidate in candidates:
+                        current = best_by_objective.get(candidate.objective)
+                        if current is None or (
+                            candidate.score,
+                            candidate.evaluation.acceptance_score,
+                        ) > (
+                            current.score,
+                            current.evaluation.acceptance_score,
+                        ):
+                            best_by_objective[candidate.objective] = candidate
+                    ideas.extend(best_by_objective.values())
 
     if league.mode != "redraft" and (my_context.resilience_score < 65 or my_context.critical_positions):
         depth_positions = set(my_context.critical_positions) or {position for position, need in needs if need >= 50}
@@ -1283,6 +1543,7 @@ def _target_offer_packages(
     partner: Roster,
     league: League,
     contexts: dict[str, TeamContext],
+    risk_profile: RiskProfile = "Balanced",
 ) -> list[tuple[list[Player], list[DraftPick]]]:
     """Build bounded, market-plausible offers for one explicitly selected player."""
     partner_needs = contexts[partner.team_id].position_needs
@@ -1304,10 +1565,15 @@ def _target_offer_packages(
         candidates.extend(([player], [pick]) for player in players[:10] for pick in priced_picks)
         candidates.extend(([], [first, second]) for first, second in combinations(priced_picks, 2))
 
+    minimum_ratio, maximum_ratio = {
+        "Conservative": (.78, 1.18),
+        "Balanced": (.64, 1.42),
+        "Aggressive": (.50, 1.70),
+    }[risk_profile]
     viable: dict[tuple[tuple[str, ...], tuple[tuple[int, int, str], ...]], tuple[list[Player], list[DraftPick]]] = {}
     for send_players, send_picks in candidates:
         offered = package_value(send_players, send_picks, league)
-        if not (.50 * target_value <= offered <= 1.55 * target_value):
+        if not (minimum_ratio * target_value <= offered <= maximum_ratio * target_value):
             continue
         key = (
             tuple(sorted(player.id for player in send_players)),
@@ -1317,7 +1583,7 @@ def _target_offer_packages(
     return sorted(
         viable.values(),
         key=lambda package: abs(package_value(package[0], package[1], league) - target_value),
-    )[:30]
+    )[:{"Conservative": 16, "Balanced": 22, "Aggressive": 30}[risk_profile]]
 
 
 def generate_target_offers(
@@ -1344,11 +1610,15 @@ def generate_target_offers(
     outlooks = {profile.player.id: profile for profile in compute_projection_profiles(league)}
     rejections: dict[str, int] = {}
     evaluated = 0
+    full_evaluated = 0
+    full_evaluation_budget = {"Conservative": 14, "Balanced": 20, "Aggressive": 28}[risk_profile]
     viable = 0
     offers: list[Recommendation] = []
     need = my_context.position_needs.get(target.position, 0)
     for receive_players, receive_picks, return_value in _return_packages(target, owner, league):
-        for send_players, send_picks in _target_offer_packages(return_value, my_team, owner, league, contexts):
+        for send_players, send_picks in _target_offer_packages(
+            return_value, my_team, owner, league, contexts, risk_profile,
+        ):
             if required_send_player_id and required_send_player_id not in {player.id for player in send_players}:
                 continue
             result = evaluate_trade(
@@ -1366,10 +1636,14 @@ def generate_target_offers(
             if reason:
                 rejections[reason] = rejections.get(reason, 0) + 1
                 continue
+            if full_evaluated >= full_evaluation_budget:
+                rejections["Full-simulation budget"] = rejections.get("Full-simulation budget", 0) + 1
+                continue
             result = evaluate_trade(
                 my_team, owner, send_players, list(receive_players), league,
                 send_picks, list(receive_picks), contexts,
             )
+            full_evaluated += 1
             combined_role_penalty, role_warnings = _combined_role_risk(target, league)
             if combined_role_penalty >= 18 and (
                 risk_profile != "Aggressive"
@@ -1384,7 +1658,17 @@ def generate_target_offers(
             )
             # A target search may tolerate a small present-lineup cost for a prized
             # dynasty asset, but it should never describe a lowball as a path.
-            if score < 50 or result.acceptance_score < 45 or abs(result.fairness) > 18:
+            minimum_score, minimum_acceptance, fairness_limit, depth_floor = {
+                "Conservative": (56, 50, 10, -6),
+                "Balanced": (50, 45, 18, -14),
+                "Aggressive": (46, 42, 28, -24),
+            }[risk_profile]
+            if (
+                score < minimum_score
+                or result.acceptance_score < minimum_acceptance
+                or abs(result.fairness) > fairness_limit
+                or result.lineup_a.depth_change < depth_floor
+            ):
                 rejections["Insufficient two-sided fit"] = rejections.get("Insufficient two-sided fit", 0) + 1
                 continue
             tier = (
@@ -1552,6 +1836,130 @@ def generate_multi_step_paths(
     unique: dict[tuple[str, str, str], MultiStepPath] = {}
     for path in sorted(paths, key=lambda item: (item.score, item.final_lineup_delta), reverse=True):
         key = (path.intermediary.id, path.first.partner.team_id, path.second.partner.team_id)
+        unique.setdefault(key, path)
+    return list(unique.values())[:limit]
+
+
+def generate_trade_ladders(
+    league: League,
+    first_moves: list[Recommendation] | None = None,
+    limit: int = 3,
+    risk_profile: RiskProfile = "Balanced",
+) -> list[MultiStepPath]:
+    """Turn safe roster moves into sequential, asset-recycling upgrade paths.
+
+    Unlike target-specific multi-step paths, this planner starts with the best
+    available portfolio moves, rebuilds the league after step one, and searches
+    the new market for a second trade that reuses an acquired player.
+    """
+    my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+    original_lineup = optimize_lineup(active_roster_players(my_team), league).projected_points
+    original_playoff = _average_playoff_lineup(my_team, league)
+    original_resilience = build_contexts(league)[my_team.team_id].resilience_score
+    if first_moves is None:
+        first_moves = generate_recommendations(
+            league, limit=12, include_low_confidence=False,
+            include_review_candidates=False, risk_profile=risk_profile,
+        )
+
+    safe_first_moves = [
+        idea for idea in first_moves
+        if idea.kind not in {"SELL"}
+        and not idea.review_only
+        and idea.score >= 55
+        and idea.evaluation.acceptance_score >= 45
+        and idea.evaluation.lineup_a.points_gained >= 0
+        and idea.evaluation.lineup_a.depth_change >= -8
+        and idea.evaluation.lineup_a.after_resilience >= 45
+        and idea.receive_players
+    ]
+    safe_first_moves.sort(
+        key=lambda idea: (
+            idea.objective == "Roster rebalance",
+            idea.score,
+            idea.evaluation.lineup_a.points_gained,
+        ),
+        reverse=True,
+    )
+
+    paths: list[MultiStepPath] = []
+    # A bounded two-path beam captures the useful sequential idea without
+    # multiplying a full-league search across every plausible first move.
+    for first in safe_first_moves[:2]:
+        acquired_ids = {player.id for player in first.receive_players}
+        hypothetical = _apply_recommendation(league, first)
+        hypothetical_context = build_contexts(hypothetical)[hypothetical.my_team_id]
+        next_position = max(
+            hypothetical_context.position_needs,
+            key=hypothetical_context.position_needs.get,
+            default=None,
+        )
+        second_moves = generate_recommendations(
+            hypothetical, limit=8, target_position=next_position,
+            include_low_confidence=False, include_review_candidates=False,
+            risk_profile=risk_profile,
+        )
+        second_moves = [
+            idea for idea in second_moves
+            if acquired_ids & {player.id for player in idea.send_players}
+            and not idea.review_only
+            and idea.score >= 55
+            and idea.evaluation.acceptance_score >= 45
+            and idea.evaluation.lineup_a.points_gained >= .5
+        ]
+        for second in second_moves[:3]:
+            recycled_ids = acquired_ids & {player.id for player in second.send_players}
+            intermediary = max(
+                (player for player in first.receive_players if player.id in recycled_ids),
+                key=lambda player: player.value,
+            )
+            final_league = _apply_recommendation(hypothetical, second)
+            final_team = next(roster for roster in final_league.rosters if roster.team_id == league.my_team_id)
+            final_lineup = optimize_lineup(active_roster_players(final_team), final_league).projected_points
+            final_playoff = _average_playoff_lineup(final_team, final_league)
+            final_context = build_contexts(final_league)[final_team.team_id]
+            lineup_delta = round(final_lineup - original_lineup, 1)
+            playoff_delta = round(final_playoff - original_playoff, 1) if original_playoff is not None and final_playoff is not None else None
+            if lineup_delta < 1.5:
+                continue
+            if final_context.resilience_score < 45 or final_context.resilience_score < original_resilience - 8:
+                continue
+            acceptance_floor = min(first.evaluation.acceptance_score, second.evaluation.acceptance_score)
+            execution_risk = (
+                "Lower" if acceptance_floor >= 65
+                else "Moderate" if acceptance_floor >= 50
+                else "High"
+            )
+            path_score = round(max(0, min(100,
+                first.score * .28
+                + second.score * .42
+                + min(18, lineup_delta * 2.5)
+                + (5 if playoff_delta is not None and playoff_delta >= 3 else 0)
+                + (4 if first.objective == "Roster rebalance" else 0)
+                + (3 if final_context.resilience_score > original_resilience else 0)
+                - (4 if execution_risk == "Moderate" else 9 if execution_risk == "High" else 0)
+            )))
+            if path_score < 55:
+                continue
+            paths.append(MultiStepPath(
+                intermediary=intermediary,
+                first=first,
+                second=second,
+                score=path_score,
+                final_lineup_delta=lineup_delta,
+                final_playoff_delta=playoff_delta,
+                stop_after_step_one_safe=True,
+                execution_risk=execution_risk,
+            ))
+
+    unique: dict[tuple[str, str, str, tuple[str, ...]], MultiStepPath] = {}
+    for path in sorted(paths, key=lambda item: (item.score, item.final_lineup_delta), reverse=True):
+        key = (
+            path.intermediary.id,
+            path.first.partner.team_id,
+            path.second.partner.team_id,
+            tuple(sorted(player.id for player in path.second.receive_players)),
+        )
         unique.setdefault(key, path)
     return list(unique.values())[:limit]
 

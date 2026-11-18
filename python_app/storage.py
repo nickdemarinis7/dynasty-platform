@@ -48,34 +48,6 @@ def _request(method: str, path: str, *, params: dict[str, str] | None = None, js
         raise StorageError("Saved-trade storage is temporarily unavailable") from exc
 
 
-def load_trades(user_id: str) -> list[dict[str, Any]]:
-    if durable_storage_credentials_configured() and not durable_storage_configured():
-        raise StorageError("Durable storage requires an authenticated user")
-    if not durable_storage_configured():
-        return list(st.session_state.get("saved_trades", []))
-    rows = _request("GET", "saved_trades", params={"user_id": f"eq.{user_id}", "select": "*", "order": "saved_at.desc"})
-    return rows if isinstance(rows, list) else []
-
-
-def save_trade(user_id: str, trade: dict[str, Any]) -> None:
-    if durable_storage_credentials_configured() and not durable_storage_configured():
-        raise StorageError("Durable storage requires an authenticated user")
-    if not durable_storage_configured():
-        st.session_state.setdefault("saved_trades", []).insert(0, trade)
-        return
-    _request("POST", "saved_trades", json={**trade, "user_id": user_id})
-
-
-def delete_trade(user_id: str, trade_id: str) -> None:
-    if durable_storage_credentials_configured() and not durable_storage_configured():
-        raise StorageError("Durable storage requires an authenticated user")
-    if not durable_storage_configured():
-        saved = st.session_state.get("saved_trades", [])
-        st.session_state.saved_trades = [trade for trade in saved if trade.get("id") != trade_id]
-        return
-    _request("DELETE", "saved_trades", params={"id": f"eq.{trade_id}", "user_id": f"eq.{user_id}"})
-
-
 def load_decisions(user_id: str, league_id: str | None = None) -> list[dict[str, Any]]:
     if durable_storage_credentials_configured() and not durable_storage_configured():
         raise StorageError("Durable storage requires an authenticated user")

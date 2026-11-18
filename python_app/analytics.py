@@ -11,6 +11,7 @@ from .scoring import score_stats
 
 
 _OUTCOME_BASELINE_CACHE: dict[tuple[object, ...], tuple[float, float]] = {}
+_LINEUP_CACHE: dict[tuple[object, ...], Lineup] = {}
 
 
 @dataclass(frozen=True)
@@ -455,6 +456,30 @@ def tradable_roster_players(roster: Roster) -> tuple[Player, ...]:
 
 
 def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) -> Lineup:
+    # Trade and waiver searches compare thousands of packages against the same
+    # handful of roster/weekly-projection states. Cache the exact optimizer at
+    # that boundary so repeated evaluations do not rebuild the matching graph.
+    player_signature = tuple(sorted(
+        (
+            player.id,
+            player.position,
+            player.value,
+            player.injury_status,
+            league.weekly_points.get(player.id),
+        )
+        for player in players
+    ))
+    cache_key = (
+        league.id,
+        league.imported_at,
+        league.current_week,
+        league.roster_slots,
+        league.scoring,
+        player_signature,
+    )
+    cached = _LINEUP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     player_points = {player.id: projected_points(player, league) for player in players}
     available = sorted(players, key=lambda player: (player_points[player.id], player.value, player.id), reverse=True)
     eligibility = {
@@ -463,7 +488,9 @@ def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) 
     }
     slots = [slot for slot, count in league.roster_slots if slot in eligibility for _ in range(count)]
     if not slots:
-        return Lineup((), tuple(available), 0.0)
+        result = Lineup((), tuple(available), 0.0)
+        _LINEUP_CACHE[cache_key] = result
+        return result
 
     # Exact maximum-weight bipartite matching via successive shortest augmenting
     # paths. Unlike slot-mask DP, this is polynomial in roster and lineup size;
@@ -531,7 +558,13 @@ def optimize_lineup(players: tuple[Player, ...] | list[Player], league: League) 
     starters = tuple(player for index, player in enumerate(available) if index in starter_set)
     bench = tuple(player for index, player in enumerate(available) if index not in starter_set)
     total = round(sum(player_points[player.id] for player in starters), 1)
-    return Lineup(starters, bench, total)
+    result = Lineup(starters, bench, total)
+    if len(_LINEUP_CACHE) >= 4096:
+        # FIFO is sufficient: entries are naturally grouped by a league import
+        # and old imports become cold as soon as the user refreshes.
+        _LINEUP_CACHE.pop(next(iter(_LINEUP_CACHE)))
+    _LINEUP_CACHE[cache_key] = result
+    return result
 
 
 def depth_profile(players: tuple[Player, ...] | list[Player], league: League, lineup: Lineup | None = None) -> DepthProfile:
@@ -586,11 +619,6 @@ def depth_profile(players: tuple[Player, ...] | list[Player], league: League, li
     score = max(0, min(100, score))
     label = "Strong" if score >= 75 and not critical else "Stable" if score >= 60 and len(critical) <= 1 else "Thin" if score >= 40 else "Critical"
     return DepthProfile(score, label, playable_backups, tuple(critical), tuple(warnings), tuple(position_scores), injury_exposure)
-
-
-def _depth_profile(players: tuple[Player, ...] | list[Player], league: League) -> tuple[float, tuple[str, ...]]:
-    profile = depth_profile(players, league)
-    return float(profile.score), profile.warnings
 
 
 _ROSTER_BASELINE_CACHE: dict[tuple[object, ...], tuple[tuple[Player, ...], Lineup, DepthProfile]] = {}

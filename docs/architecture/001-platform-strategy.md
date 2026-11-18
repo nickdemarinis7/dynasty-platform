@@ -6,9 +6,9 @@ Fantasy GM's production application is the Python/Streamlit app rooted at
 `streamlit_app.py`. Its models, projections, and recommendation logic in
 `python_app/` are the canonical product implementation.
 
-The Next.js application in `src/` is a legacy reference implementation. It is
-kept temporarily for UI and parity reference, but it is not a second production
-surface and new recommendation behavior must not be implemented there first.
+Historical alternative frontend code is not retained in the production
+repository. Any future client must use a defined API contract rather than
+duplicating the recommendation engine.
 
 ## Why this is the durable default
 
@@ -42,4 +42,3 @@ client/API boundary, such as:
 
 - Production application: Streamlit Community Cloud
 - Optional durable storage: Supabase, available only with OIDC authentication
-- Legacy Next.js application: local/reference use; not a supported deployment

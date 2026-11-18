@@ -1,105 +1,42 @@
-# Contributing to Dynasty Trade Analyzer
+# Contributing to Fantasy GM
 
-Thank you for your interest in contributing! This document provides guidelines and information for contributors.
+Fantasy GM is a Python 3.13 and Streamlit application. Production code lives
+in `streamlit_app.py` and `python_app/`; regression coverage lives in
+`tests_python/`.
 
-## 🚀 Getting Started
+## Local setup
 
-1. Fork the repository
-2. Clone your fork: `git clone <your-fork-url>`
-3. Create a branch: `git checkout -b feature/your-feature-name`
-4. Make your changes
-5. Test thoroughly
-6. Commit: `git commit -m "Add: your feature description"`
-7. Push: `git push origin feature/your-feature-name`
-8. Open a Pull Request
+1. Create and activate a virtual environment.
+2. Run `pip install -r requirements.txt`.
+3. Start the app with `streamlit run streamlit_app.py`.
 
-## 📁 Project Structure
+## Development guidelines
 
+- Keep provider access in `python_app/providers.py` and give every network call
+  a timeout, graceful failure state, and an appropriate cache policy.
+- Put league analysis in `python_app/analytics.py`; recommendation construction
+  and safety policy belong in `python_app/recommendations.py`.
+- Treat missing evidence as unknown, never as a zero or positive signal.
+- Preserve market, roster-safety, partner-fit, and availability gates when
+  adding new trade strategies.
+- Keep Streamlit session keys stable and test navigation changes.
+- Add focused regression coverage for every bug fix.
+
+## Validation
+
+Before opening a pull request, run:
+
+```bash
+python -m unittest discover -s tests_python
+python -m tests_python.recommendation_audit
+python -m compileall -q python_app streamlit_app.py
+pip check
 ```
-src/
-├── app/                    # Next.js pages (App Router)
-├── components/            # React components
-│   └── ui/               # shadcn/ui components
-├── lib/                   # Core business logic
-├── store/                 # Zustand state management
-└── types/                 # TypeScript type definitions
-```
 
-## 🛠️ Development Guidelines
+Also test light and dark modes at desktop and mobile widths when changing UI.
 
-### Code Style
-- Use TypeScript for all new code
-- Follow existing code formatting (Prettier/ESLint)
-- Use meaningful variable and function names
-- Add comments for complex logic
+## Pull requests
 
-### Component Guidelines
-- Use functional components with hooks
-- Keep components small and focused
-- Extract reusable logic into custom hooks
-- Use TypeScript interfaces for props
-
-### State Management
-- Use Zustand store for global state (`src/store/index.ts`)
-- Use React hooks for local component state
-- Persist important data to localStorage
-
-### API Integration
-- All API calls should be in `src/lib/` files
-- Handle errors gracefully
-- Add loading states
-- Cache responses when appropriate
-
-## 🧪 Testing
-
-Before submitting a PR:
-1. Test all affected features manually
-2. Verify no TypeScript errors: `npm run build`
-3. Check for console errors
-4. Test on different screen sizes
-
-## 📝 Commit Messages
-
-Use clear, descriptive commit messages:
-- `Add: new feature description`
-- `Fix: bug description`
-- `Update: what was updated`
-- `Refactor: what was refactored`
-- `Docs: documentation changes`
-
-## 🐛 Bug Reports
-
-When reporting bugs, include:
-- Steps to reproduce
-- Expected behavior
-- Actual behavior
-- Browser/OS information
-- Screenshots if applicable
-
-## 💡 Feature Requests
-
-For feature requests:
-- Describe the feature clearly
-- Explain the use case
-- Provide examples if possible
-- Consider implementation complexity
-
-## 🔍 Code Review Process
-
-All PRs will be reviewed for:
-- Code quality and style
-- Functionality
-- Performance impact
-- TypeScript type safety
-- User experience
-
-## 📚 Resources
-
-- [Next.js Documentation](https://nextjs.org/docs)
-- [TypeScript Handbook](https://www.typescriptlang.org/docs/)
-- [Tailwind CSS](https://tailwindcss.com/docs)
-- [Zustand](https://github.com/pmndrs/zustand)
-
-## ❓ Questions?
-
-Open an issue for questions or discussions!
+Describe the user-visible outcome, important model tradeoffs, validation run,
+and any data-source or cache changes. Include screenshots for UI work and sample
+recommendation output for engine changes.

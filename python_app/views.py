@@ -10,7 +10,7 @@ import streamlit as st
 
 from .models import DraftPick, League, Roster
 from .analytics import active_roster_players, assess_team_trade, backtest_projection_model, backtest_recommendation_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup, trade_market_range, tradable_roster_players
-from .recommendations import Recommendation, generate_multi_step_paths, generate_sell_offers, generate_target_offers, recommendation_search_notes, timed_generate_recommendations
+from .recommendations import Recommendation, generate_multi_step_paths, generate_sell_offers, generate_target_offers, generate_trade_ladders, recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
 from .quality import assess_league_readiness
@@ -47,7 +47,13 @@ def _clear_trade_partner_assets() -> None:
         st.session_state.pop(key, None)
 
 
-TRADE_FINDER_CACHE_VERSION = 31
+TRADE_FINDER_CACHE_VERSION = 34
+
+RISK_PROFILE_COPY = {
+    "Conservative": "Protects depth and market value; avoids meaningful overpays and fragile roster construction.",
+    "Balanced": "Allows measured overpays when the lineup gain and partner fit justify the cost.",
+    "Aggressive": "Searches a wider market and accepts greater depth or value risk for concentrated upside.",
+}
 _HOSTED_GENERATION_CACHE: dict[tuple[object, ...], object] = {}
 
 
@@ -300,7 +306,7 @@ def home(league: League) -> None:
     else:
         st.button(
             f"Find a {next_position} upgrade", type="primary", use_container_width=True,
-            on_click=_navigate_filtered, args=("Moves", "Ideas", "recommendation_position", next_position),
+            on_click=_navigate_filtered, args=("Moves", "Upgrade", "recommendation_position", next_position),
         )
     with st.expander("See the full action plan"):
         for number, action in enumerate(plan.actions, 1):
@@ -560,11 +566,12 @@ def diagnostics(league: League) -> None:
 
 def recommendations(league: League) -> None:
     league = _calibrated_trade_league(league)
-    _page_header("Trade strategy", "Trade Finder", "Compare safe, balanced, and aggressive ways to improve your roster.")
+    _page_header("Championship strategy", "Upgrade Center", "Build the best sequence of realistic trades—not just one isolated deal.")
     risk_profile = st.segmented_control(
         "Risk preference", ["Conservative", "Balanced", "Aggressive"], default="Balanced",
         help="Conservative protects depth; Aggressive prioritizes starter and playoff upside.",
     )
+    st.markdown(f'<div class="field-help">{html.escape(RISK_PROFILE_COPY[risk_profile])}</div>', unsafe_allow_html=True)
     position = st.pills("Target position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL", key="recommendation_position")
     show_experimental = st.toggle(
         "Show low-confidence experiments",
@@ -577,14 +584,36 @@ def recommendations(league: League) -> None:
     loading_slot = st.empty()
     loading_slot.markdown(
         '<div class="search-loading"><span class="search-spinner"></span><div>'
-        '<strong>Building realistic trade ideas…</strong>'
-        '<span>Screening market-balanced packages, then fully simulating the strongest finalists.</span>'
+        '<strong>Building your upgrade plan…</strong>'
+        '<span>Screening market-balanced packages and fully modeling the strongest direct deals.</span>'
         '</div></div>',
         unsafe_allow_html=True,
     )
     all_ideas, search_performance, _cache_hit = _cached_trade_finder(
         league, None if position == "ALL" else position, risk_profile, TRADE_FINDER_CACHE_VERSION,
     )
+    trade_ladders: list[object] = []
+    build_ladders = position == "ALL" and st.toggle(
+        "Build multi-step trade ladders",
+        value=False,
+        help="Optional second-stage search. Direct recommendations load without waiting for this additional work.",
+        key="build_trade_ladders",
+    )
+    if build_ladders:
+        ladder_loading = st.empty()
+        ladder_loading.markdown(
+            '<div class="search-loading"><span class="search-spinner"></span><div>'
+            '<strong>Building conditional trade ladders…</strong>'
+            '<span>Testing whether a safe first move can unlock a second upgrade.</span>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+        generated_ladders, _ladder_cache_hit = _cached_goal_directed_generation(
+            "trade-ladder-v2", league, "portfolio", risk_profile,
+            lambda: generate_trade_ladders(league, list(all_ideas), risk_profile=risk_profile),
+        )
+        trade_ladders = list(generated_ladders)
+        ladder_loading.empty()
     loading_slot.empty()
     ideas = [idea for idea in all_ideas if show_experimental or (idea.confidence != "D" and idea.score >= 55)]
     if not ideas:
@@ -597,6 +626,7 @@ def recommendations(league: League) -> None:
             for note in recommendation_search_notes(league, None if position == "ALL" else position):
                 st.write(f"• {note}")
         return
+    objective = "ALL"
     objectives = list(dict.fromkeys(idea.objective for idea in ideas))
     if len(objectives) > 1:
         objective = st.pills("Move objective", ["ALL", *objectives], default="ALL", key="recommendation_objective")
@@ -645,6 +675,8 @@ def recommendations(league: League) -> None:
                 st.write(f"**{count}** · {reason}")
         else:
             st.caption("No candidate rejection details were recorded.")
+    if objective == "ALL" and build_ladders:
+        _render_multi_step_paths(trade_ladders, portfolio=True)
     outgoing_assets = [
         (f"player:{player.id}", player.name)
         for idea in ideas for player in idea.send_players
@@ -797,27 +829,50 @@ def recommendations(league: League) -> None:
                     st.error(str(exc))
 
 
-def _render_multi_step_paths(paths: list[object]) -> None:
+def _render_multi_step_paths(paths: list[object], portfolio: bool = False) -> None:
     if not paths:
         return
-    _section("Two-step acquisition paths")
-    st.caption("Execute step two only after step one completes. Each first move is scored for whether it remains defensible if the target deal falls through.")
+    _section("Best trade ladders" if portfolio else "Two-step acquisition paths")
+    st.caption(
+        "Each ladder safely improves the roster in step one, then recycles an acquired asset into another upgrade. "
+        "Complete and refresh after each move—step two is a conditional path, not a simultaneous offer."
+        if portfolio else
+        "Execute step two only after step one completes. Each first move is scored for whether it remains defensible if the target deal falls through."
+    )
     for index, path in enumerate(paths, 1):
         with st.container(border=True):
-            heading, score = st.columns([3, 1])
-            with heading:
-                _asset_heading(f"{index}. ACQUIRE {path.intermediary.name}, THEN CONVERT", f"Execution risk: {path.execution_risk}")
-            _compact_value(score, "Path score", f"{path.score}/100")
             first_send = [player.name for player in path.first.send_players] + [pick.label for pick in path.first.send_picks]
             first_receive = [player.name for player in path.first.receive_players] + [pick.label for pick in path.first.receive_picks]
             second_send = [player.name for player in path.second.send_players] + [pick.label for pick in path.second.send_picks]
             second_receive = [player.name for player in path.second.receive_players] + [pick.label for pick in path.second.receive_picks]
-            st.markdown(f"**Step 1 · {path.first.partner.team_name}**")
-            st.write(f"Send {', '.join(first_send)} → Receive {', '.join(first_receive)}")
-            st.caption(f"Partner fit {path.first.evaluation.acceptance_score}/100 · standalone score {path.first.score}/100")
-            st.markdown(f"**Step 2 · {path.second.partner.team_name}**")
-            st.write(f"Send {', '.join(second_send)} → Receive {', '.join(second_receive)}")
-            st.caption(f"Partner fit {path.second.evaluation.acceptance_score}/100 · offer score {path.second.score}/100")
+            title = (
+                f"{index}. Improve, then recycle {path.intermediary.name}"
+                if portfolio else f"{index}. Acquire {path.intermediary.name}, then convert"
+            )
+            playoff_copy = f"{path.final_playoff_delta:+.1f} playoff PPG" if path.final_playoff_delta is not None else "Playoff impact unavailable"
+            st.markdown(
+                '<div class="ladder-callout">'
+                f'<div class="ladder-callout-copy"><strong>{html.escape(title)}</strong>'
+                f'Execution risk: {html.escape(path.execution_risk)} · Step one remains safe if the follow-up falls through</div>'
+                f'<div class="ladder-score">{path.score}/100</div></div>'
+                '<div class="ladder-map">'
+                '<div class="ladder-node"><div class="ladder-kicker">Current roster</div>'
+                f'<div class="ladder-title">Starting point</div><div class="ladder-meta">Preserve optionality</div></div>'
+                '<div class="ladder-arrow">→</div>'
+                '<div class="ladder-node action"><div class="ladder-kicker">Do now · Step 1</div>'
+                f'<div class="ladder-title">Receive {html.escape(", ".join(first_receive))}</div>'
+                f'<div class="ladder-meta">Send {html.escape(", ".join(first_send))}<br>{html.escape(path.first.partner.team_name)} · fit {path.first.evaluation.acceptance_score}/100</div></div>'
+                '<div class="ladder-arrow">→</div>'
+                '<div class="ladder-node conditional"><div class="ladder-kicker">Conditional · Step 2</div>'
+                f'<div class="ladder-title">Receive {html.escape(", ".join(second_receive))}</div>'
+                f'<div class="ladder-meta">Recycle {html.escape(", ".join(second_send))}<br>{html.escape(path.second.partner.team_name)} · fit {path.second.evaluation.acceptance_score}/100</div></div>'
+                '<div class="ladder-arrow">→</div>'
+                '<div class="ladder-node final"><div class="ladder-kicker">Final roster</div>'
+                f'<div class="ladder-title">{path.final_lineup_delta:+.1f} lineup PPG</div>'
+                f'<div class="ladder-meta">{html.escape(playoff_copy)}<br>Recalculate after step one</div></div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
             _stat_grid([
                 ("Final lineup", f"{path.final_lineup_delta:+.1f}"),
                 ("Final playoffs", f"{path.final_playoff_delta:+.1f}" if path.final_playoff_delta is not None else "—"),
@@ -914,6 +969,7 @@ def player_seeker(league: League) -> None:
         help="Conservative protects depth; Aggressive is more willing to pay for concentrated upside.",
         key="seeker_risk_profile",
     )
+    st.markdown(f'<div class="field-help">{html.escape(RISK_PROFILE_COPY[risk_profile])}</div>', unsafe_allow_html=True)
     if league.trade_deadline_week is not None and league.current_week > league.trade_deadline_week and any(roster.games_played for roster in league.rosters):
         st.info(f"Your week {league.trade_deadline_week} trade deadline has passed, so goal-directed trade paths are paused.")
         return
