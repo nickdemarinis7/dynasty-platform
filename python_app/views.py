@@ -8,8 +8,8 @@ import io
 
 import streamlit as st
 
-from .models import DraftPick, League, Roster
-from .analytics import active_roster_players, assess_team_trade, backtest_projection_model, backtest_recommendation_model, build_contexts, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup, trade_market_range, tradable_roster_players
+from .models import DraftPick, League, Player, Roster
+from .analytics import active_roster_players, assess_team_trade, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup, projection_profile, trade_market_range, tradable_roster_players
 from .recommendations import Recommendation, generate_multi_step_paths, generate_sell_offers, generate_target_offers, generate_trade_ladders, recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
@@ -22,6 +22,7 @@ from .counteroffers import generate_counteroffers
 from .journal import build_calibration_report, journal_partner_tendencies, trade_snapshot, waiver_snapshot
 from .diagnostics import build_diagnostic_report
 from .value_system import balance_label, format_value, pick_profile, value_profile
+from .scoring import score_stats
 
 
 def _load_recommendation(idea: object) -> None:
@@ -198,6 +199,56 @@ def _deal_package(sends: list[str], receives: list[str]) -> None:
     )
 
 
+def _interactive_deal_package(
+    send_players: tuple[Player, ...],
+    receive_players: tuple[Player, ...],
+    send_picks: tuple[DraftPick, ...],
+    receive_picks: tuple[DraftPick, ...],
+    key_prefix: str,
+) -> None:
+    """Render a trade package whose player names open their evidence profile."""
+    with st.container(border=True):
+        st.markdown('<div class="interactive-deal-marker"></div>', unsafe_allow_html=True)
+        send, arrow, receive = st.columns([1, .14, 1], vertical_alignment="center")
+        with send:
+            st.markdown('<div class="deal-send-marker"></div>', unsafe_allow_html=True)
+            st.caption("YOU SEND")
+            for player in send_players:
+                _, player_button, _ = st.columns([.12, .76, .12])
+                with player_button:
+                    st.button(
+                        player.name,
+                        icon=":material/person_search:",
+                        key=f"dealplayer_send_{key_prefix}_{player.id}",
+                        use_container_width=True,
+                        on_click=_open_player_card,
+                        args=(player.id, send_players, receive_players),
+                    )
+            for pick in send_picks:
+                st.markdown(f"**{pick.label}**")
+            if not send_players and not send_picks:
+                st.caption("Nothing")
+        arrow.markdown('<div class="interactive-deal-arrow">⇄</div>', unsafe_allow_html=True)
+        with receive:
+            st.markdown('<div class="deal-receive-marker"></div>', unsafe_allow_html=True)
+            st.caption("YOU RECEIVE")
+            for player in receive_players:
+                _, player_button, _ = st.columns([.12, .76, .12])
+                with player_button:
+                    st.button(
+                        player.name,
+                        icon=":material/person_search:",
+                        key=f"dealplayer_receive_{key_prefix}_{player.id}",
+                        use_container_width=True,
+                        on_click=_open_player_card,
+                        args=(player.id, send_players, receive_players),
+                    )
+            for pick in receive_picks:
+                st.markdown(f"**{pick.label}**")
+            if not receive_players and not receive_picks:
+                st.caption("Nothing")
+
+
 def _decision_strip(items: list[tuple[str, str]], muted: bool = False) -> None:
     content = "".join(
         f'<div class="decision-tile"><div class="decision-value">{html.escape(value)}</div>'
@@ -251,6 +302,263 @@ def _asset_slot_note(roster: Roster, player_id: str) -> str:
     if player_id in roster.taxi_player_ids:
         return " · Taxi"
     return ""
+
+
+def _player_owner(league: League, player_id: str) -> Roster | None:
+    return next((roster for roster in league.rosters if any(player.id == player_id for player in roster.players)), None)
+
+
+def _open_player_card(
+    player_id: str,
+    send_players: tuple[Player, ...] = (),
+    receive_players: tuple[Player, ...] = (),
+) -> None:
+    st.session_state.player_card_id = player_id
+    if send_players or receive_players:
+        st.session_state.player_card_trade_context = (send_players, receive_players)
+    else:
+        st.session_state.pop("player_card_trade_context", None)
+
+
+def _close_player_card() -> None:
+    st.session_state.pop("player_card_id", None)
+    st.session_state.pop("player_card_trade_context", None)
+
+
+@st.dialog("Player profile", width="medium")
+def _player_card(player: Player, league: League) -> None:
+    owner = _player_owner(league, player.id)
+    profile = projection_profile(player, league)
+    market = value_profile(player, league)
+    signal = league.player_signals.get(player.id, {})
+    role = league.player_roles.get(player.id, {})
+    status = player.injury_status or str(signal.get("status") or "Active")
+    owner_text = f"Rostered by {owner.team_name}" if owner else "Free agent"
+    slot = ""
+    if owner:
+        slot = _asset_slot_note(owner, player.id).removeprefix(" · ")
+
+    trade_context = st.session_state.get("player_card_trade_context")
+    impact_copy = ""
+    if trade_context:
+        send_players, receive_players = trade_context
+        my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+        before = optimize_lineup(active_roster_players(my_team), league)
+        send_ids = {asset.id for asset in send_players}
+        after_players = tuple(asset for asset in active_roster_players(my_team) if asset.id not in send_ids) + tuple(receive_players)
+        after = optimize_lineup(after_players, league)
+        before_ids = {asset.id for asset in before.starters}
+        after_ids = {asset.id for asset in after.starters}
+        if player.id in send_ids:
+            replacements = [asset.name for asset in after.starters if asset.id not in before_ids and asset.id not in {item.id for item in receive_players}]
+            impact_copy = "Starts for you now" if player.id in before_ids else "Depth asset for you now"
+            if replacements:
+                impact_copy += f" · If traded, {', '.join(replacements)} replaces him"
+        elif player.id in {asset.id for asset in receive_players}:
+            displaced = [asset.name for asset in before.starters if asset.id not in after_ids and asset.id not in send_ids]
+            impact_copy = "Would start for you" if player.id in after_ids else "Would add depth, not start immediately"
+            if displaced:
+                impact_copy += f" · Would displace {', '.join(displaced)}"
+
+    st.markdown(
+        f'<div class="player-profile-hero"><div><div class="app-kicker">{html.escape(player.position)} · {html.escape(player.team)}</div>'
+        f'<h2>{html.escape(player.name)}</h2><p>{html.escape(owner_text)}{f" · {html.escape(slot)}" if slot else ""} · '
+        f'Age {player.age or "—"}</p></div><div class="player-profile-status">{html.escape(status.upper())}</div></div>',
+        unsafe_allow_html=True,
+    )
+    _stat_grid([
+        ("Expected PPG", f"{profile.expected_points:.1f}"),
+        ("Season PPG", f"{profile.season_fppg:.1f}" if profile.season_fppg is not None else "—"),
+        ("Last 3 PPG", f"{profile.recent_fppg:.1f}" if profile.recent_fppg is not None else "—"),
+        ("Typical weekly range", f"{profile.floor:.1f}–{profile.ceiling:.1f}"),
+    ])
+    st.caption(
+        f"{profile.confidence} projection confidence · {profile.role_trend} recent role · "
+        f"{profile.availability_probability:.0%} modeled availability"
+    )
+    if impact_copy:
+        st.markdown(f'<div class="player-impact-note"><strong>Trade fit</strong>{html.escape(impact_copy)}</div>', unsafe_allow_html=True)
+    if profile.season_fppg and profile.recent_fppg is not None and profile.recent_fppg <= profile.season_fppg * .8:
+        decline = (1 - profile.recent_fppg / profile.season_fppg) * 100
+        st.warning(f"Recent scoring is {decline:.0f}% below the season baseline. Review recent usage and game context before relying on the projection.")
+
+    season_stats = league.player_stats.get(player.id, {})
+    stat_fields = {
+        "QB": (("Games", "gp"), ("Completions", "pass_cmp"), ("Attempts", "pass_att"), ("Pass yards", "pass_yd"), ("Pass TD", "pass_td"), ("Interceptions", "pass_int"), ("Rush yards", "rush_yd"), ("Rush TD", "rush_td")),
+        "RB": (("Games", "gp"), ("Carries", "rush_att"), ("Rush yards", "rush_yd"), ("Rush TD", "rush_td"), ("Targets", "rec_tgt"), ("Receptions", "rec"), ("Rec yards", "rec_yd"), ("Rec TD", "rec_td")),
+        "WR": (("Games", "gp"), ("Targets", "rec_tgt"), ("Receptions", "rec"), ("Rec yards", "rec_yd"), ("Rec TD", "rec_td"), ("Rush yards", "rush_yd"), ("Rush TD", "rush_td")),
+        "TE": (("Games", "gp"), ("Targets", "rec_tgt"), ("Receptions", "rec"), ("Rec yards", "rec_yd"), ("Rec TD", "rec_td")),
+    }
+
+    def display_stat(value: object) -> str:
+        number = float(value or 0)
+        return f"{number:,.0f}" if number.is_integer() else f"{number:,.1f}"
+
+    def has_target_data(stats: dict[str, float]) -> bool:
+        # Sleeper sometimes includes a zero-filled target key even when the
+        # stat feed has receptions. A target total is usable only when it
+        # carries positive evidence and cannot be lower than receptions.
+        if "rec_tgt" not in stats and "tgt" not in stats:
+            return False
+        targets = float(stats.get("rec_tgt", stats.get("tgt", 0)) or 0)
+        receptions = float(stats.get("rec") or 0)
+        return targets > 0 and targets >= receptions
+
+    def weekly_usage(stats: dict[str, float]) -> str:
+        if player.position == "QB":
+            return f'{display_stat(stats.get("pass_yd"))} pass yds · {display_stat(stats.get("pass_td"))} pass TD'
+        if player.position == "RB":
+            receiving = (
+                f'{display_stat(stats.get("rec_tgt", stats.get("tgt")))} targets'
+                if has_target_data(stats)
+                else f'{display_stat(stats.get("rec"))} receptions'
+            )
+            return f'{display_stat(stats.get("rush_att"))} carries · {receiving}'
+        if has_target_data(stats):
+            return f'{display_stat(stats.get("rec_tgt", stats.get("tgt")))} targets · {display_stat(stats.get("rec"))} receptions'
+        return f'{display_stat(stats.get("rec"))} receptions · {display_stat(stats.get("rec_yd"))} rec yds'
+
+    def stat_amount(stats: dict[str, float], field: str) -> float:
+        if field == "rec_tgt":
+            return float(stats.get("rec_tgt", stats.get("tgt", 0)) or 0)
+        return float(stats.get(field) or 0)
+
+    weekly_for_player = [
+        stats for _, players in sorted(league.weekly_player_stats.items())
+        if (stats := players.get(player.id)) is not None
+    ]
+
+    def opportunities(stats: dict[str, float]) -> float:
+        if player.position == "QB":
+            return stat_amount(stats, "pass_att")
+        if player.position == "RB":
+            receiving_volume = stat_amount(stats, "rec_tgt") if has_target_data(stats) else stat_amount(stats, "rec")
+            return stat_amount(stats, "rush_att") + receiving_volume
+        return stat_amount(stats, "rec_tgt") if has_target_data(stats) else stat_amount(stats, "rec")
+
+    games = max(stat_amount(season_stats, "gp"), 1)
+    recent_sample = weekly_for_player[-3:]
+    recent_opportunities = sum(opportunities(stats) for stats in recent_sample) / len(recent_sample) if recent_sample else 0
+    position_players = [asset for roster in league.rosters for asset in roster.players if asset.position == player.position]
+    ranked_position = sorted(
+        position_players,
+        key=lambda asset: calc_fppg(league.player_stats.get(asset.id, {}), asset, league),
+        reverse=True,
+    )
+    position_rank = next((rank for rank, asset in enumerate(ranked_position, 1) if asset.id == player.id), None)
+
+    usage_rows: list[tuple[str, str]] = []
+    if position_rank and profile.season_fppg is not None:
+        usage_rows.append(("Position rank", f"{player.position}{position_rank} by season PPG"))
+    snaps = stat_amount(season_stats, "off_snp")
+    team_snaps = stat_amount(season_stats, "tm_off_snp")
+    if team_snaps > 0:
+        usage_rows.append(("Snap share", f"{snaps / team_snaps:.0%}"))
+    target_evidence_available = has_target_data(season_stats) or any(has_target_data(stats) for stats in weekly_for_player)
+    usage_label = (
+        "Pass attempts/game" if player.position == "QB"
+        else "Opportunities/game" if target_evidence_available
+        else "Touches/game" if player.position == "RB"
+        else "Receptions/game"
+    )
+    usage_rows.append((usage_label, f"{opportunities(season_stats) / games:.1f}"))
+    if player.position in {"RB", "WR", "TE"} and not target_evidence_available:
+        usage_rows.append(("Target data", "Not provided by Sleeper"))
+    if recent_sample:
+        usage_rows.append(("Last 3 usage/game", f"{recent_opportunities:.1f}"))
+    if player.position == "QB" and stat_amount(season_stats, "pass_att") > 0:
+        usage_rows.append(("Completion rate", f'{stat_amount(season_stats, "pass_cmp") / stat_amount(season_stats, "pass_att"):.1%}'))
+    elif player.position == "RB":
+        touches = stat_amount(season_stats, "rush_att") + stat_amount(season_stats, "rec")
+        if touches > 0:
+            yards = stat_amount(season_stats, "rush_yd") + stat_amount(season_stats, "rec_yd")
+            usage_rows.append(("Yards/touch", f"{yards / touches:.1f}"))
+    elif target_evidence_available:
+        targets = stat_amount(season_stats, "rec_tgt")
+        if targets > 0:
+            usage_rows.append(("Catch rate", f'{stat_amount(season_stats, "rec") / targets:.1%}'))
+            usage_rows.append(("Yards/target", f'{stat_amount(season_stats, "rec_yd") / targets:.1f}'))
+
+    left, right = st.columns(2)
+    with left:
+        season_rows = [
+            (label, display_stat(stat_amount(season_stats, field)))
+            for label, field in stat_fields.get(player.position, ())
+            if field == "gp" or stat_amount(season_stats, field) != 0
+        ]
+        rows = "".join(f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>' for label, value in season_rows)
+        if rows:
+            st.markdown(f'<div class="player-detail-list"><h3>Season production</h3>{rows}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="player-detail-list"><h3>Season production</h3><div><span>No completed-game stats available</span></div></div>', unsafe_allow_html=True)
+    with right:
+        depth = role.get("depth_chart_order")
+        depth_position = role.get("depth_chart_position")
+        usage_rows.append(("Depth chart", f"{depth_position or player.position}{f' {depth}' if depth else ''}" if depth or depth_position else "Not listed"))
+        rows = "".join(f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>' for label, value in usage_rows)
+        st.markdown(f'<div class="player-detail-list"><h3>Usage & role</h3>{rows}</div>', unsafe_allow_html=True)
+
+    availability_rows = [("Game status", status.title())]
+    bye_week = signal.get("bye_week")
+    if bye_week:
+        availability_rows.append(("Bye week", str(bye_week)))
+    practice = str(signal.get("practice_description") or signal.get("practice_participation") or "").strip()
+    injury = str(signal.get("injury_notes") or signal.get("injury_body_part") or "").strip()
+    if practice:
+        availability_rows.append(("Practice", practice))
+    if injury:
+        availability_rows.append(("Latest update", injury))
+    if len(availability_rows) > 1 or status.lower() not in {"active", "inactive"}:
+        rows = "".join(f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>' for label, value in availability_rows)
+        st.markdown(f'<div class="player-detail-list player-news"><h3>News & availability</h3>{rows}</div>', unsafe_allow_html=True)
+    else:
+        st.caption("No recent injury or practice update is available from Sleeper.")
+    adds = int(signal.get("trending_adds_24h") or 0)
+    drops = int(signal.get("trending_drops_24h") or 0)
+    if adds or drops:
+        st.caption(f"Sleeper 24h activity · {adds:,} adds · {drops:,} drops")
+
+    weekly_lines = [
+        (week, stats, score_stats(stats, league.scoring_settings, player.position))
+        for week, players in sorted(league.weekly_player_stats.items(), reverse=True)
+        if (stats := players.get(player.id)) is not None
+    ][:5]
+    if weekly_lines:
+        with st.expander("Recent game log", expanded=True):
+            game_rows = "".join(
+                f'<div><span>Week {week}</span><strong>{points:.1f} pts · '
+                f'{html.escape(weekly_usage(stats))}</strong></div>'
+                for week, stats, points in weekly_lines
+            )
+            st.markdown(f'<div class="player-detail-list game-log">{game_rows}</div>', unsafe_allow_html=True)
+
+    with st.expander("Market value & projection methodology"):
+        st.write(f"**Blended market value:** {format_value(player.value) if league.values_status == 'live' else 'Unavailable'} · {market.tier}")
+        st.write(f"**Heuristic trade-value range:** {format_value(market.low)}–{format_value(market.high)}")
+        for source, source_value in league.market_source_values.get(player.id, {}).items():
+            st.caption(f"{source}: {format_value(source_value)}")
+        if market.source_count > 1:
+            st.caption(f"Provider disagreement: {market.source_disagreement:.0f}%")
+        for item in profile.evidence:
+            st.write(f"• {item}")
+        st.caption("Expected scoring and ranges are decision aids, not forecasts. Market value is a negotiation baseline, not a required price.")
+
+
+def _render_player_card_if_open(league: League) -> None:
+    player_id = st.session_state.get("player_card_id")
+    if not player_id:
+        return
+    players = {
+        player.id: player
+        for roster in league.rosters
+        for player in roster.players
+    }
+    players.update({player.id: player for player in league.free_agents})
+    player = players.get(player_id)
+    if player is None:
+        _close_player_card()
+        return
+    _player_card(player, league)
 
 
 def home(league: League) -> None:
@@ -371,15 +679,14 @@ def rosters(league: League) -> None:
     _section("Player inventory")
     position = st.pills("Filter by position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL")
     players = [player for player in selected.players if position == "ALL" or player.position == position]
-    _data_list([
-        (
-            player.name,
-            f"{player.position} · {player.team} · Age {player.age or '—'}{f' · {player.injury_status.upper()}' if player.injury_status else ''} · {value_profile(player, league).tier}",
-            format_value(player.value) if league.values_status == "live" else "—",
-            "Market",
+    for player in sorted(players, key=lambda item: item.value, reverse=True):
+        details, market, action = st.columns([5, 1.2, .8], vertical_alignment="center")
+        details.markdown(
+            f"**{player.name}**  \n{player.position} · {player.team} · Age {player.age or '—'}"
+            f"{f' · {player.injury_status.upper()}' if player.injury_status else ''} · {value_profile(player, league).tier}"
         )
-        for player in sorted(players, key=lambda item: item.value, reverse=True)
-    ])
+        _compact_value(market, "Market", format_value(player.value) if league.values_status == "live" else "—")
+        action.button(":material/person_search:", key=f"roster_player_{selected.team_id}_{player.id}", help=f"Open {player.name} profile", on_click=_open_player_card, args=(player.id,))
     if selected.draft_picks:
         with st.expander(f"Draft capital · {len(selected.draft_picks)} picks"):
             for pick in selected.draft_picks:
@@ -387,6 +694,7 @@ def rosters(league: League) -> None:
                 profile = pick_profile(pick, league)
                 leader = f" · led by {profile.top_prospects[0]}" if profile.top_prospects else ""
                 st.write(f"**{pick.label} · {profile.projection}**{owner_note} · {format_value(profile.adjusted_value)} · {profile.class_outlook}{leader} · range {format_value(profile.low)}–{format_value(profile.high)} · {profile.confidence.lower()} pick confidence")
+    _render_player_card_if_open(league)
 
 
 def rankings(league: League) -> None:
@@ -432,15 +740,17 @@ def values(league: League) -> None:
     st.caption("Secondary market and TE-premium data from [Stats Guy Fantasy](https://statsguyfantasy.com/).")
     st.caption("Asset tiers are relative to this league's rostered market—not projected lineup roles. Negotiation bands are heuristic ranges for trade discussion, not statistical confidence intervals.")
     _section("Market board")
-    _data_list([
-        (
-            f"#{rank} · {player.name}",
-            f"{player.position}{position_ranks.get(player.id, '—')} · {player.team} · Age {player.age or '—'} · {value_profile(player, league).tier} · negotiation band {format_value(value_profile(player, league).low)}–{format_value(value_profile(player, league).high)}{f' · source disagreement {value_profile(player, league).source_disagreement:.0f}%' if value_profile(player, league).source_count > 1 else ' · single source'}",
-            format_value(player.value) if league.values_status == "live" else "—",
-            "Market",
+    for rank, player in enumerate(sorted(filtered, key=lambda item: item.value, reverse=True), 1):
+        profile = value_profile(player, league)
+        details, market, action = st.columns([5, 1.2, .8], vertical_alignment="center")
+        details.markdown(
+            f"**#{rank} · {player.name}**  \n{player.position}{position_ranks.get(player.id, '—')} · {player.team} · "
+            f"Age {player.age or '—'} · {profile.tier} · range {format_value(profile.low)}–{format_value(profile.high)}"
+            f"{f' · source disagreement {profile.source_disagreement:.0f}%' if profile.source_count > 1 else ' · single source'}"
         )
-        for rank, player in enumerate(sorted(filtered, key=lambda item: item.value, reverse=True), 1)
-    ])
+        _compact_value(market, "Market", format_value(player.value) if league.values_status == "live" else "—")
+        action.button(":material/person_search:", key=f"market_player_{player.id}", help=f"Open {player.name} profile", on_click=_open_player_card, args=(player.id,))
+    _render_player_card_if_open(league)
 
 
 def projections(league: League) -> None:
@@ -466,10 +776,11 @@ def projections(league: League) -> None:
         _section("Weekly outlook")
         for item in profiles[:50]:
             with st.container(border=True):
-                heading, confidence = st.columns([3, 1])
+                heading, confidence, action = st.columns([3, 1, .45], vertical_alignment="center")
                 with heading:
                     _asset_heading(item.player.name, f"{item.player.position} · {item.player.team} · {item.role_trend} role")
                 _compact_value(confidence, "Confidence", item.confidence)
+                action.button(":material/person_search:", key=f"outlook_player_{item.player.id}", help=f"Open {item.player.name} profile", on_click=_open_player_card, args=(item.player.id,))
                 _stat_grid([
                     ("Expected", f"{item.expected_points:.1f}"),
                     ("Floor–ceiling", f"{item.floor:.1f}–{item.ceiling:.1f}"),
@@ -478,6 +789,7 @@ def projections(league: League) -> None:
                 with st.expander("Projection evidence"):
                     for evidence in item.evidence:
                         st.write(f"• {evidence}")
+        _render_player_card_if_open(league)
         return
     recommendation = st.pills("Signal", ["ALL", "MODEL WELL ABOVE MARKET", "MODEL ABOVE MARKET", "MARKET ALIGNED", "MARKET ABOVE MODEL", "MARKET WELL ABOVE MODEL", "LOW CONFIDENCE"], default="ALL")
     results = [item for item in compute_projections(league) if (position == "ALL" or item.player.position == position) and (recommendation == "ALL" or item.recommendation == recommendation) and (not query or query.lower() in item.player.name.lower() or query.lower() in item.player.team.lower())]
@@ -497,6 +809,8 @@ def projections(league: League) -> None:
                 with st.expander("Why"):
                     for signal_text in item.signals:
                         st.write(f"• {signal_text}")
+            st.button("Open player profile", key=f"signal_player_{item.player.id}", on_click=_open_player_card, args=(item.player.id,))
+    _render_player_card_if_open(league)
 
 
 def diagnostics(league: League) -> None:
@@ -726,7 +1040,10 @@ def recommendations(league: League) -> None:
             _compact_value(score, "Idea quality" if weak_exploratory else "Overall", f"{idea.score}/100")
             sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
             receives = [player.name for player in idea.receive_players] + [pick.label for pick in idea.receive_picks]
-            _deal_package(sends, receives)
+            package_key = f"finder_{idea.partner.team_id}_{idea.objective}_{'_'.join(player.id for player in idea.send_players)}_{'_'.join(player.id for player in idea.receive_players)}"
+            _interactive_deal_package(
+                idea.send_players, idea.receive_players, idea.send_picks, idea.receive_picks, package_key,
+            )
             playoff_gain = idea.evaluation.lineup_a.playoff_points_gained
             remaining_gain = idea.evaluation.lineup_a.remaining_season_points_gained
             fairness = idea.evaluation.fairness
@@ -827,6 +1144,7 @@ def recommendations(league: League) -> None:
                     st.success("Recommendation saved with its model snapshot.")
                 except StorageError as exc:
                     st.error(str(exc))
+    _render_player_card_if_open(league)
 
 
 def _render_multi_step_paths(paths: list[object], portfolio: bool = False) -> None:
@@ -929,7 +1247,10 @@ def _sell_seeker(league: League, my_team: Roster, risk_profile: str) -> None:
                 _asset_heading(f"{index}. {idea.partner.team_name}", idea.reason)
             _compact_value(score, "Overall" if endorsed else "Idea quality", f"{idea.score}/100")
             receives = [asset.name for asset in idea.receive_players] + [pick.label for pick in idea.receive_picks]
-            _deal_package([player.name], receives)
+            _interactive_deal_package(
+                idea.send_players, idea.receive_players, idea.send_picks, idea.receive_picks,
+                f"seller_{player.id}_{index}",
+            )
             if not endorsed:
                 _final_verdict(review_reason)
             _decision_strip([
@@ -957,6 +1278,7 @@ def _sell_seeker(league: League, my_team: Roster, risk_profile: str) -> None:
                     st.success("Sell option saved with its model snapshot.")
                 except StorageError as exc:
                     st.error(str(exc))
+    _render_player_card_if_open(league)
 
 
 def player_seeker(league: League) -> None:
@@ -1046,7 +1368,10 @@ def player_seeker(league: League) -> None:
             _compact_value(score, "Overall path" if endorsed else "Idea quality", f"{idea.score}/100")
             sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
             receives = [player.name for player in idea.receive_players] + [pick.label for pick in idea.receive_picks]
-            _deal_package(sends, receives)
+            _interactive_deal_package(
+                idea.send_players, idea.receive_players, idea.send_picks, idea.receive_picks,
+                f"seeker_{target.id}_{index}",
+            )
             result = idea.evaluation
             if not endorsed:
                 _final_verdict(review_reason, "Stretch path—not a recommendation")
@@ -1093,6 +1418,7 @@ def player_seeker(league: League) -> None:
                 except StorageError as exc:
                     st.error(str(exc))
     _render_multi_step_paths(multi_step_paths)
+    _render_player_card_if_open(league)
 
 
 def waivers(league: League) -> None:
