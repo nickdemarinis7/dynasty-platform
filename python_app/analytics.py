@@ -3,15 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 import random
+from statistics import median
 
 from .models import DraftPick, League, Player, Roster
 from .value_system import pick_profile, premium_value_cutoff, value_profile
+from .learning import calibrate_partner_probability
 from .decision_policy import DEPTH_MATERIAL_CHANGE, LINEUP_DECLINE_PPG, LINEUP_UPGRADE_PPG, MARKET_NOISE_PERCENT
 from .scoring import score_stats
 
 
 _OUTCOME_BASELINE_CACHE: dict[tuple[object, ...], tuple[float, float]] = {}
 _LINEUP_CACHE: dict[tuple[object, ...], Lineup] = {}
+_SUSTAINABILITY_CACHE: dict[tuple[object, ...], SustainabilityProfile] = {}
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,8 @@ class TradeResult:
     playoff_probability_after: float | None = None
     championship_probability_before: float | None = None
     championship_probability_after: float | None = None
+    partner_urgency_penalty: int = 0
+    partner_urgency_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +128,19 @@ class ProjectionProfile:
     role_trend: str
     availability_probability: float
     confidence: str
+    evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SustainabilityProfile:
+    actual_ppg: float | None
+    usage_expected_ppg: float | None
+    fpoe_per_game: float | None
+    fantasy_points_per_snap: float | None
+    ros_projection_delta: float | None
+    label: str
+    confidence: str
+    games: int
     evidence: tuple[str, ...]
 
 
@@ -193,6 +211,98 @@ class TradeMarketRange:
     upside_fairness: float
 
 
+def _sustainability_opportunities(player: Player, stats: dict[str, float]) -> float:
+    if player.position == "QB":
+        return float(stats.get("pass_att") or 0) + float(stats.get("rush_att") or 0) * .25
+    if player.position == "RB":
+        receiving = stats.get("rec_tgt", stats.get("tgt"))
+        if receiving is None:
+            receiving = stats.get("rec", 0)
+        return float(stats.get("rush_att") or 0) + float(receiving or 0)
+    if player.position in {"WR", "TE"}:
+        receiving = stats.get("rec_tgt", stats.get("tgt"))
+        return float(receiving if receiving is not None else stats.get("rec", 0) or 0)
+    return 0.0
+
+
+def production_sustainability(player: Player, league: League) -> SustainabilityProfile:
+    """Estimate whether scoring is supported by opportunity volume.
+
+    This is a league-relative expected-points model, not a provider xFP feed.
+    It learns the median points-per-opportunity rate at the player's position
+    from completed weekly stat lines, then compares that baseline with the
+    player's actual production. The result is intentionally bounded evidence.
+    """
+    cache_key = (
+        league.id, league.imported_at, league.current_week, league.scoring,
+        id(league.weekly_player_stats), id(league.regular_season_weekly_points), player.id,
+    )
+    cached = _SUSTAINABILITY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    players = {
+        asset.id: asset
+        for roster in league.rosters
+        for asset in roster.players
+    }
+    players.update({asset.id: asset for asset in league.free_agents})
+    positional_rates: list[float] = []
+    player_lines: list[tuple[dict[str, float], float, float]] = []
+    peer_totals: dict[str, list[float]] = {}
+    for _, weekly_players in sorted(league.weekly_player_stats.items()):
+        for player_id, stats in weekly_players.items():
+            asset = players.get(player_id)
+            if asset is None or asset.position != player.position:
+                continue
+            opportunities = _sustainability_opportunities(asset, stats)
+            if opportunities <= 0:
+                continue
+            points = score_stats(stats, league.scoring_settings, asset.position)
+            totals = peer_totals.setdefault(player_id, [0.0, 0.0])
+            totals[0] += points
+            totals[1] += opportunities
+            if player_id == player.id:
+                player_lines.append((stats, points, opportunities))
+    positional_rates = [points / opportunities for points, opportunities in peer_totals.values() if opportunities > 0]
+    games = len(player_lines)
+    if not player_lines or len(positional_rates) < 3:
+        result = SustainabilityProfile(None, None, None, None, None, "Insufficient data", "Low", games, ())
+        _SUSTAINABILITY_CACHE[cache_key] = result
+        return result
+
+    baseline_rate = median(positional_rates)
+    actual_ppg = sum(points for _, points, _ in player_lines) / games
+    opportunities_per_game = sum(opportunities for _, _, opportunities in player_lines) / games
+    expected_ppg = opportunities_per_game * baseline_rate
+    fpoe = actual_ppg - expected_ppg
+    total_snaps = sum(float(stats.get("off_snp") or stats.get("snap") or 0) for stats, _, _ in player_lines)
+    points_per_snap = sum(points for _, points, _ in player_lines) / total_snaps if total_snaps > 0 else None
+    future_points = [
+        float(points[player.id])
+        for week, points in league.regular_season_weekly_points.items()
+        if week > league.current_week and player.id in points
+    ]
+    ros_delta = (sum(future_points) / len(future_points) - expected_ppg) if future_points else None
+    material = max(1.5, expected_ppg * .12)
+    label = "Running hot" if fpoe >= material else "Buy-low production" if fpoe <= -material else "Usage-supported"
+    confidence = "High" if games >= 6 and len(positional_rates) >= 8 else "Medium" if games >= 3 else "Low"
+    evidence = (
+        f"{opportunities_per_game:.1f} opportunities per game",
+        f"Position baseline: {baseline_rate:.2f} fantasy points per opportunity",
+        f"Actual minus usage-expected scoring: {fpoe:+.1f} PPG",
+    )
+    result = SustainabilityProfile(
+        round(actual_ppg, 1), round(expected_ppg, 1), round(fpoe, 1),
+        round(points_per_snap, 3) if points_per_snap is not None else None,
+        round(ros_delta, 1) if ros_delta is not None else None,
+        label, confidence, games, evidence,
+    )
+    if len(_SUSTAINABILITY_CACHE) >= 2048:
+        _SUSTAINABILITY_CACHE.clear()
+    _SUSTAINABILITY_CACHE[cache_key] = result
+    return result
+
+
 def projection_profile(player: Player, league: League) -> ProjectionProfile:
     """Build a transparent weekly outlook from provider, recent, and season evidence."""
     weekly_lines = [
@@ -220,6 +330,17 @@ def projection_profile(player: Player, league: League) -> ProjectionProfile:
         evidence.append("Season scoring baseline")
     total_weight = sum(weight for _, weight in weighted)
     expected = sum(value * weight for value, weight in weighted) / total_weight if total_weight else 0.0
+    sustainability = production_sustainability(player, league)
+    if (
+        league.mode == "redraft"
+        and sustainability.fpoe_per_game is not None
+        and sustainability.confidence in {"High", "Medium"}
+    ):
+        adjustment = max(-2.0, min(2.0, -sustainability.fpoe_per_game * .20))
+        expected += adjustment
+        evidence.append(
+            f"Usage sustainability adjustment: {adjustment:+.1f} PPG ({sustainability.label.lower()})"
+        )
 
     if len(weekly_scores) >= 3:
         ordered = sorted(weekly_scores)
@@ -1235,12 +1356,62 @@ def evaluate_trade(
         preference_bonus += min(3.0, tendency["picks_acquired"])
     journal_resolved = float(tendency.get("journal_resolved", 0))
     journal_accepted = float(tendency.get("journal_accepted", 0))
-    # Beta(2, 2) shrinkage prevents a tiny journal sample from dominating.
-    journal_rate = (journal_accepted + 2) / (journal_resolved + 4)
-    journal_weight = min(16.0, journal_resolved * 3.0)
-    journal_bonus = (journal_rate - .5) * journal_weight
-    journal_bonus -= min(6.0, float(tendency.get("journal_partner_reject_feedback", 0)) * 1.5)
-    acceptance = round(max(0, min(100, 50 + opponent_market_edge + opponent_fit_edge * 2 + opponent_lineup * 2 + activity_bonus + preference_bonus + journal_bonus)))
+    urgency_penalty = 0
+    urgency_reasons: list[str] = []
+    partner_playoff_odds = context_b.playoff_probability
+    partner_on_bubble = (
+        league.current_week >= 5
+        and partner_playoff_odds is not None
+        and 25 <= partner_playoff_odds <= 80
+        and context_b.window in {"Win Now", "Competing", "Balanced"}
+    )
+    partner_chasing = (
+        team_b.games_played >= 4
+        and team_b.win_percentage < .55
+        and context_b.window in {"Win Now", "Competing"}
+        and (partner_playoff_odds is None or 15 <= partner_playoff_odds < 90)
+        and league.current_week >= 5
+        and league.current_week <= league.regular_season_end
+    )
+    partner_must_win = (
+        partner_on_bubble
+        or partner_chasing
+        or (
+            context_b.deadline_urgency >= 65
+            and context_b.window in {"Win Now", "Competing"}
+        )
+    )
+    if partner_must_win:
+        unavailable_incoming = [
+            player for player in a_gives
+            if projection_profile(player, league).availability_probability < .5
+        ]
+        if unavailable_incoming:
+            availability_cost = min(18, 8 + 4 * len(unavailable_incoming))
+            urgency_penalty += availability_cost
+            urgency_reasons.append(
+                "must-win partner would receive unavailable player"
+                + ("s" if len(unavailable_incoming) != 1 else "")
+                + ": " + ", ".join(player.name for player in unavailable_incoming)
+            )
+        if impact_b.points_gained < -1:
+            immediate_cost = min(14, round(abs(impact_b.points_gained) * 2))
+            urgency_penalty += immediate_cost
+            urgency_reasons.append(f"partner loses {abs(impact_b.points_gained):.1f} immediate lineup PPG")
+        if impact_b.remaining_season_points_gained is not None and impact_b.remaining_season_points_gained < -1:
+            horizon_cost = min(8, round(abs(impact_b.remaining_season_points_gained)))
+            urgency_penalty += horizon_cost
+            urgency_reasons.append(
+                f"partner loses {abs(impact_b.remaining_season_points_gained):.1f} weekly PPG over the remaining season"
+            )
+    urgency_penalty = min(28, urgency_penalty)
+    base_acceptance = max(0, min(100, 50 + opponent_market_edge + opponent_fit_edge * 2 + opponent_lineup * 2 + activity_bonus + preference_bonus - urgency_penalty))
+    acceptance = calibrate_partner_probability(
+        base_acceptance,
+        resolved=journal_resolved,
+        accepted=journal_accepted,
+        explicit_rejections=float(tendency.get("journal_partner_reject_feedback", 0)),
+    )
     if abs(fairness) < MARKET_NOISE_PERCENT:
         verdict = "Fair market value"
     elif fairness > 8:
@@ -1248,9 +1419,14 @@ def evaluate_trade(
     else:
         verdict = f"Favors {team_b.team_name}"
     outcome_odds = _trade_outcome_probabilities(team_a, team_b, a_gives, b_gives, league) if model_playoffs and model_outcomes else (None, None, None, None)
-    return TradeResult(
+    result = TradeResult(
         value_a, value_b, difference, fairness, impact_a, impact_b, verdict, fit_a, fit_b, acceptance,
         *outcome_odds,
+    )
+    return replace(
+        result,
+        partner_urgency_penalty=urgency_penalty,
+        partner_urgency_reason="; ".join(urgency_reasons) if urgency_reasons else None,
     )
 
 
@@ -1314,7 +1490,9 @@ def explain_trade(
     else:
         label = "Mostly lateral move"
 
-    if impact.coverage_warnings:
+    if result.partner_urgency_reason:
+        risk = "The other manager is under standings pressure, and " + result.partner_urgency_reason + "."
+    elif impact.coverage_warnings:
         risk = impact.coverage_warnings[0]
     elif impact.depth_change < 0:
         risk = "The package reduces roster resilience even if the starting lineup improves."

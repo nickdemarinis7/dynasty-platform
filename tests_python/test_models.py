@@ -1,13 +1,13 @@
 import unittest
 from dataclasses import replace
 
-from python_app.analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, projected_points, projection_profile, tradable_roster_players
+from python_app.analytics import active_roster_players, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projections, depth_profile, evaluate_trade, lineup_impact, optimize_lineup, production_sustainability, projected_points, projection_profile, tradable_roster_players
 from python_app.models import DevyProspect, DraftPick, League, Player, Roster
 from python_app.recommendations import generate_recommendations
 from python_app.strategy import build_team_plan
 from python_app.waivers import generate_waiver_recommendations
 from python_app.counteroffers import generate_counteroffers
-from python_app.value_system import balance_label, draft_class_outlooks, pick_profile, protected_player_ids, value_profile
+from python_app.value_system import balance_label, blend_market_values, draft_class_outlooks, pick_profile, protected_player_ids, value_profile
 
 
 class RosterModelTests(unittest.TestCase):
@@ -47,6 +47,32 @@ class RosterModelTests(unittest.TestCase):
         profile = value_profile(player, league)
         self.assertEqual(profile.source_count, 2)
         self.assertEqual(profile.source_disagreement, 40.0)
+
+    def test_source_disagreement_widens_value_range(self) -> None:
+        player = Player("p", "Player", "TE", "A", 24, 50)
+        roster = Roster("1", "A", "A", (player,))
+        agreed = replace(self._league((roster,)), market_source_values={"p": {"FantasyCalc": 50, "Stats Guy Fantasy": 50}})
+        disputed = replace(self._league((roster,)), market_source_values={"p": {"FantasyCalc": 30, "Stats Guy Fantasy": 70}})
+        agreed_profile = value_profile(player, agreed)
+        disputed_profile = value_profile(player, disputed)
+        self.assertGreater(disputed_profile.high - disputed_profile.low, agreed_profile.high - agreed_profile.low)
+
+    def test_market_blend_normalizes_secondary_curve_to_primary_scale(self) -> None:
+        primary = {str(index): float(index * 10) for index in range(1, 11)}
+        # Same ordering, radically different numeric scale.
+        secondary = {str(index): float(index * 100) for index in range(1, 11)}
+        positions = {str(index): "WR" for index in range(1, 11)}
+        blended = blend_market_values(primary, secondary, positions, team_count=12)
+        self.assertAlmostEqual(blended["10"], 100.0)
+        self.assertAlmostEqual(blended["5"], 50.0)
+
+    def test_unusual_league_sizes_weight_exact_format_source_more_heavily(self) -> None:
+        primary = {str(index): float(index * 10) for index in range(1, 11)}
+        secondary = {str(index): float(index * 10) for index in range(1, 10)} | {"10": 1.0}
+        positions = {str(index): "WR" for index in range(1, 11)}
+        standard = blend_market_values(primary, secondary, positions, team_count=12)
+        unusual = blend_market_values(primary, secondary, positions, team_count=18)
+        self.assertGreater(unusual["10"], standard["10"])
 
     def test_core_protection_is_relative_to_market_not_fixed_scale(self) -> None:
         core = Player("core", "Core", "WR", "A", 24, 57.4)
@@ -384,6 +410,44 @@ class RosterModelTests(unittest.TestCase):
         self.assertEqual(profile.confidence, "Low")
         self.assertGreaterEqual(profile.ceiling, profile.expected_points)
         self.assertLessEqual(profile.floor, profile.expected_points)
+
+    def test_sustainability_flags_scoring_above_usage_baseline(self) -> None:
+        hot = Player("hot", "Hot WR", "WR", "A", 25, 60)
+        peers = (Player("peer1", "Peer One", "WR", "B", 25, 40), Player("peer2", "Peer Two", "WR", "C", 25, 40))
+        roster = Roster("1", "A", "A", (hot, *peers))
+        weekly = {
+            week: {
+                "hot": {"rec_tgt": 8, "rec": 6, "rec_yd": 80, "rec_td": 1, "off_snp": 50},
+                "peer1": {"rec_tgt": 8, "rec": 5, "rec_yd": 55, "off_snp": 50},
+                "peer2": {"rec_tgt": 8, "rec": 5, "rec_yd": 50, "off_snp": 50},
+            }
+            for week in range(1, 7)
+        }
+        league = replace(self._league((roster,)), mode="redraft", weekly_player_stats=weekly)
+        result = production_sustainability(hot, league)
+        self.assertEqual(result.label, "Running hot")
+        self.assertGreater(result.fpoe_per_game, 1.5)
+        self.assertIsNotNone(result.fantasy_points_per_snap)
+        self.assertEqual(result.confidence, "Medium")
+
+    def test_redraft_projection_regresses_hot_scoring_more_than_dynasty(self) -> None:
+        hot = Player("hot", "Hot WR", "WR", "A", 25, 60)
+        peers = (Player("peer1", "Peer One", "WR", "B", 25, 40), Player("peer2", "Peer Two", "WR", "C", 25, 40))
+        roster = Roster("1", "A", "A", (hot, *peers))
+        weekly = {
+            week: {
+                "hot": {"rec_tgt": 8, "rec": 6, "rec_yd": 80, "rec_td": 1},
+                "peer1": {"rec_tgt": 8, "rec": 5, "rec_yd": 55},
+                "peer2": {"rec_tgt": 8, "rec": 5, "rec_yd": 50},
+            }
+            for week in range(1, 7)
+        }
+        stats = {"hot": {"gp": 6, "rec": 36, "rec_yd": 480, "rec_td": 6}}
+        base = replace(self._league((roster,)), weekly_player_stats=weekly, player_stats=stats)
+        redraft = projection_profile(hot, replace(base, mode="redraft"))
+        dynasty = projection_profile(hot, replace(base, mode="dynasty"))
+        self.assertLess(redraft.expected_points, dynasty.expected_points)
+        self.assertTrue(any("sustainability adjustment" in item.lower() for item in redraft.evidence))
 
     def test_projection_backtest_walks_forward_and_rewards_recent_trend(self) -> None:
         player = Player("walk", "Walk Forward WR", "WR", "A", 24, 50)

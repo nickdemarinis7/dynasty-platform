@@ -8,7 +8,7 @@ from python_app.auth import authentication_configured, require_login
 
 st.set_page_config(page_title="Fantasy GM", page_icon="🏈", layout="centered", initial_sidebar_state="collapsed")
 
-APP_STATE_SCHEMA_VERSION = 16
+APP_STATE_SCHEMA_VERSION = 17
 if st.session_state.get("_app_state_schema_version") != APP_STATE_SCHEMA_VERSION:
     st.session_state.clear()
     st.session_state._app_state_schema_version = APP_STATE_SCHEMA_VERSION
@@ -77,14 +77,23 @@ st.markdown("""
   .player-profile-hero p {color:var(--muted);font-size:.8rem;margin:0;}
   .player-profile-status {flex:0 0 auto;border:1px solid var(--line);background:var(--accent-soft);color:var(--ink);border-radius:999px;padding:.3rem .62rem;font-size:.62rem;font-weight:850;letter-spacing:.07em;}
   .player-impact-note {display:flex;justify-content:space-between;gap:1rem;background:#edf4e4;border-left:4px solid #7ca52c;padding:.62rem .72rem;margin:.35rem 0 .75rem;color:#172011;font-size:.78rem;}
+  .sustainability-note {display:flex;justify-content:space-between;gap:.75rem;align-items:center;border:1px solid var(--line);border-left:4px solid #7f8a7d;border-radius:10px;padding:.6rem .72rem;margin:.55rem 0;background:var(--panel);font-size:.74rem;}
+  .sustainability-note strong {color:var(--ink);white-space:nowrap;}.sustainability-note span {color:var(--muted);text-align:right;}
+  .sustainability-note.hot {border-left-color:#d18a28;background:var(--warning-soft);}.sustainability-note.cold {border-left-color:#3e99a2;background:var(--cyan-soft);}.sustainability-note.stable {border-left-color:var(--positive);}
   .player-detail-list h3 {font-size:.92rem;margin:0 0 .42rem;}
   .player-detail-list > div {display:flex;justify-content:space-between;align-items:center;gap:.7rem;padding:.36rem 0;border-bottom:1px solid rgba(100,114,92,.12);font-size:.78rem;}
   .player-detail-list > div:last-child {border-bottom:0;}
   .player-detail-list > div span {color:var(--muted);}
   .player-detail-list > div strong {color:var(--ink);text-align:right;}
   .player-detail-list .source-row {font-size:.72rem;}
+  .player-detail-list.game-log {max-height:430px;overflow-y:auto;padding-right:.35rem;scrollbar-gutter:stable;}
   .player-detail-list .market-disagreement.is-high {margin:.25rem 0;padding:.38rem .48rem;background:#fff2da;border:1px solid #e7c88f;border-radius:8px;}
   .player-detail-list .market-disagreement.is-high span,.player-detail-list .market-disagreement.is-high strong {color:#8c4e07;}
+  .player-news-list {display:grid;gap:.48rem;margin:.35rem 0 .6rem;}
+  .player-news-item {display:flex;flex-direction:column;gap:.18rem;padding:.62rem .72rem;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.52);color:var(--ink)!important;text-decoration:none!important;transition:border-color .15s ease,transform .15s ease,background .15s ease;}
+  .player-news-item strong {font-size:.79rem;line-height:1.35;}
+  .player-news-item span {color:var(--muted);font-size:.66rem;}
+  .player-news-item:hover {border-color:#8ca75a;background:var(--accent-soft);transform:translateY(-1px);}
   [data-testid="stDialog"],[data-testid="stDialog"] > div,[data-testid="stDialog"] [data-baseweb="modal"],[data-testid="stDialog"] [role="dialog"] {background:#f7f8f4;color:#10130f;}
   [data-testid="stDialog"] .stat-grid {grid-template-columns:repeat(4,minmax(0,1fr));}
   [data-testid="stDialog"] .stat-value {color:#10130f!important;}
@@ -92,6 +101,10 @@ st.markdown("""
   [data-testid="stDialog"] [data-testid="stExpander"] {background:#edf1eb;border-color:#cbd4c7;}
   [data-testid="stDialog"] [data-testid="stExpander"] summary,[data-testid="stDialog"] [data-testid="stExpander"] summary * {color:#172016!important;}
   [data-testid="stDialog"] button[aria-label="Close"],[data-testid="stDialog"] button[aria-label="Close"] svg {color:#253022!important;fill:#253022!important;opacity:1!important;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab-list"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tablist"] {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;background:#e7ece3;border:1px solid #cbd4c7;border-radius:12px;padding:4px;margin:.3rem 0 .85rem;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tab"] {justify-content:center;border-radius:8px;padding:.48rem .55rem;color:#596254;font-weight:760;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tab"][aria-selected="true"] {background:#fff;color:#172016;box-shadow:0 3px 10px rgba(20,30,16,.12);}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab-highlight"] {display:none;}
   .signal {display:inline-block;border:1px solid var(--ink);background:var(--accent);color:var(--ink);border-radius:2px;padding:.2rem .42rem;font-size:.6rem;font-weight:850;letter-spacing:.06em;}
   .field-help {color:var(--muted);font-size:.76rem;margin:-.2rem 0 .45rem;}
   .insight {border-left:4px solid var(--accent);background:linear-gradient(90deg,var(--accent-soft),rgba(255,255,255,.88) 72%);padding:.75rem .85rem;margin:.15rem 0 .75rem;font-size:.88rem;line-height:1.45;}
@@ -108,10 +121,13 @@ st.markdown("""
   .deal-side.receive .deal-label {color:#cffa76;}
   .deal-assets {font-size:.87rem;font-weight:760;line-height:1.45;overflow-wrap:anywhere;}
   .deal-arrow {display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:1.15rem;font-weight:900;}
-  .interactive-deal-marker,.deal-send-marker,.deal-receive-marker {display:none;}
-  div[data-testid="stVerticalBlockBorderWrapper"]:has(.interactive-deal-marker) {background:radial-gradient(circle at 100% 0,rgba(102,87,217,.17),transparent 46%),linear-gradient(135deg,#11150f,#18231d);border-color:rgba(255,255,255,.08);box-shadow:0 10px 26px rgba(27,36,21,.12);}
-  div[data-testid="stVerticalBlockBorderWrapper"]:has(.interactive-deal-marker) [data-testid="stCaptionContainer"] {color:#aeb7a8;font-size:.58rem;font-weight:850;letter-spacing:.09em;}
   .interactive-deal-arrow {display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:1.2rem;font-weight:900;min-height:3rem;}
+  [class*="st-key-recommendation_card_"] > div[data-testid="stVerticalBlockBorderWrapper"] > div {padding:1rem 1.05rem!important;}
+  [class*="st-key-recommendation_card_"] div[data-testid="stVerticalBlock"] {gap:.62rem!important;}
+  [class*="st-key-trade_package_"] {margin:-.1rem 0 .15rem!important;}
+  [class*="st-key-trade_package_"] > div[data-testid="stVerticalBlock"] {gap:.22rem!important;}
+  [class*="st-key-trade_package_"] div[data-testid="stHorizontalBlock"] {gap:.65rem!important;align-items:center!important;}
+  [class*="st-key-trade_package_"] [data-testid="stCaptionContainer"] {margin-bottom:0!important;}
   [class*="st-key-dealplayer_send_"] button,[class*="st-key-dealplayer_receive_"] button,[class*="st-key-dealplayer-send-"] button,[class*="st-key-dealplayer-receive-"] button {min-height:54px!important;justify-content:flex-start!important;padding:.65rem .85rem!important;background:linear-gradient(135deg,#252d26,#202721)!important;border:1px solid #4b584d!important;border-radius:12px!important;color:#f8fbf5!important;box-shadow:0 7px 18px rgba(0,0,0,.2)!important;font-size:1.02rem!important;font-weight:880!important;letter-spacing:-.015em!important;}
   [class*="st-key-dealplayer_send_"] button,[class*="st-key-dealplayer-send-"] button {border-left:4px solid #8e82eb!important;}
   [class*="st-key-dealplayer_receive_"] button,[class*="st-key-dealplayer-receive-"] button {border-left:4px solid var(--accent)!important;background:linear-gradient(135deg,#293624,#202b22)!important;}
@@ -150,11 +166,14 @@ st.markdown("""
   .ladder-score {flex:0 0 auto;font-size:1.05rem;font-weight:900;color:var(--ink);}
   .risk-callout {border-radius:10px;padding:.62rem .72rem;margin:.55rem 0 .75rem;background:var(--warning-soft);color:#6e410b;border:1px solid #f0d5a3;font-size:.78rem;line-height:1.42;}
   .risk-callout strong {color:#8d4e05;}
-  .home-status {display:flex;align-items:center;gap:.45rem;flex-wrap:wrap;margin:.15rem 0 .8rem;}
+  .home-dashboard-hero {padding:.75rem 0 .15rem;}
+  .home-dashboard-hero h1 {font-size:clamp(1.72rem,5vw,2.25rem);line-height:1.04;letter-spacing:-.035em;margin:.12rem 0 .28rem;}
+  .home-dashboard-hero > p {color:var(--muted);font-size:.8rem;margin:0 0 .75rem;}
+  .home-status {display:flex;align-items:center;gap:.45rem;flex-wrap:wrap;margin:0 0 .65rem;}
   .home-status-primary {display:inline-flex;align-items:center;gap:.42rem;background:var(--accent-soft);color:#294500;border:1px solid #c7df8b;border-radius:999px;padding:.34rem .65rem;font-size:.68rem;font-weight:850;text-transform:uppercase;letter-spacing:.07em;}
   .home-status-primary:before {content:"";width:.42rem;height:.42rem;background:var(--positive);border-radius:50%;box-shadow:0 0 0 3px rgba(22,120,74,.12);}
   .home-status-secondary {color:var(--muted);font-size:.72rem;font-weight:720;}
-  .gm-metrics {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-block:1px solid var(--line);margin:.45rem 0 1.15rem;}
+  .gm-metrics {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-block:1px solid var(--line);margin:0;}
   .gm-metric {padding:.8rem .72rem;border-right:1px solid var(--line);min-width:0;}
   .gm-metric:last-child {border-right:0;}
   .gm-metric-value {font-size:1.16rem;font-weight:880;line-height:1.1;color:var(--ink);}
@@ -162,15 +181,16 @@ st.markdown("""
   .gm-brief {position:relative;overflow:hidden;background:linear-gradient(135deg,var(--panel),#f2f7eb);border:1px solid var(--line);border-radius:16px;padding:1rem 1.05rem;margin:.45rem 0 .75rem;box-shadow:0 10px 28px rgba(30,40,24,.07);}
   .gm-brief:after {content:"";position:absolute;width:9rem;height:9rem;border-radius:50%;right:-5rem;top:-5rem;background:rgba(185,245,66,.19);}
   .gm-brief-kicker {color:var(--positive);font-size:.61rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase;margin-bottom:.32rem;}
-  .gm-brief-title {color:var(--ink);font-size:1.03rem;font-weight:880;margin-bottom:.3rem;}
+  .gm-brief-title {color:var(--ink);font-size:1.03rem;font-weight:880;line-height:1.42;max-width:46rem;}
   .gm-brief-copy {color:var(--muted);font-size:.81rem;line-height:1.48;max-width:37rem;}
-  .gm-brief-action {border-top:1px solid var(--line);margin-top:.72rem;padding-top:.7rem;color:var(--ink);font-size:.82rem;line-height:1.42;}
+  .gm-brief-action {display:flex;gap:.65rem;align-items:baseline;border-top:1px solid var(--line);margin-top:.72rem;padding-top:.7rem;color:var(--ink);font-size:.82rem;line-height:1.42;}
   .gm-brief-action strong {color:var(--positive);}
   .strategy-grid {display:grid;grid-template-columns:1fr 1fr;gap:.65rem;margin:.5rem 0 .75rem;}
   .strategy-panel {border:1px solid var(--line);border-radius:14px;padding:.82rem;min-width:0;}
   .strategy-panel.protect {background:linear-gradient(145deg,var(--violet-soft),var(--panel));}
   .strategy-panel.shop {background:linear-gradient(145deg,var(--cyan-soft),var(--panel));}
   .strategy-label {font-size:.59rem;font-weight:900;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.52rem;}
+  .strategy-copy {color:var(--muted);font-size:.7rem;line-height:1.35;margin:-.22rem 0 .58rem;}
   .player-chips {display:flex;flex-wrap:wrap;gap:.36rem;}
   .player-chip {display:inline-flex;background:rgba(255,255,255,.58);border:1px solid rgba(80,90,78,.16);border-radius:999px;padding:.28rem .5rem;color:var(--ink);font-size:.68rem;font-weight:740;line-height:1.2;}
   .data-list {border-top:1px solid var(--line);margin-top:.15rem;}
@@ -199,6 +219,7 @@ st.markdown("""
     .stat-label {font-size:.58rem;}
     .player-profile-hero {align-items:center;}
     .player-profile-hero h2 {font-size:1.35rem;}
+    .sustainability-note {display:block;}.sustainability-note strong {display:block;margin-bottom:.18rem;}.sustainability-note span {text-align:left;}
     [data-testid="stDialog"] .stat-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
     .deal-package {grid-template-columns:1fr;gap:.38rem;}
     .deal-arrow {height:22px;transform:rotate(90deg);}
@@ -209,6 +230,9 @@ st.markdown("""
     .gm-metrics {grid-template-columns:1fr 1fr;}
     .gm-metric:nth-child(2) {border-right:0;}
     .gm-metric:nth-child(-n+2) {border-bottom:1px solid var(--line);}
+    .home-dashboard-hero {padding-top:.45rem;}
+    .gm-brief-action {display:block;}
+    .gm-brief-action strong {display:block;margin-bottom:.18rem;}
     .strategy-grid {grid-template-columns:1fr;}
     .final-verdict {flex-direction:column;gap:.2rem;}
     .final-verdict strong {white-space:normal;}
@@ -311,8 +335,15 @@ DARK_THEME_CSS = """
   [data-testid="stDialog"] .player-detail-list > div {border-color:#354038;}
   [data-testid="stDialog"] .player-detail-list .market-disagreement.is-high {background:#3b2c17;border-color:#725323;}
   [data-testid="stDialog"] .player-detail-list .market-disagreement.is-high span,[data-testid="stDialog"] .player-detail-list .market-disagreement.is-high strong {color:#ffd18a!important;}
+  [data-testid="stDialog"] .player-news-item {background:#202920;border-color:#3b473c;color:#f2f6ed!important;}
+  [data-testid="stDialog"] .player-news-item span {color:#b8c2b4;}
+  [data-testid="stDialog"] .player-news-item:hover {background:#293624;border-color:#70933b;}
   [data-testid="stDialog"] button[aria-label="Close"],[data-testid="stDialog"] button[aria-label="Close"] svg {color:#f2f6ed!important;fill:#f2f6ed!important;opacity:1!important;}
   [data-testid="stDialog"] button[aria-label="Close"]:hover {background:#2d382e!important;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab-list"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tablist"] {background:#202920;border-color:#3b473c;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tab"] {color:#b8c2b4!important;background:transparent!important;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"],[data-testid="stDialog"] [data-testid="stTabs"] [role="tab"][aria-selected="true"] {background:#31451a!important;color:#e2ffad!important;box-shadow:inset 0 0 0 1px #5f7d31,0 3px 10px rgba(0,0,0,.22)!important;}
+  [data-testid="stDialog"] [data-testid="stTabs"] [data-baseweb="tab"]:hover,[data-testid="stDialog"] [data-testid="stTabs"] [role="tab"]:hover {background:#2a352b!important;color:#fff!important;}
   [data-testid="stDialog"] [data-testid="stExpander"] {background:#202920!important;border-color:#3b473c!important;}
   [data-testid="stDialog"] [data-testid="stExpander"] summary,[data-testid="stDialog"] [data-testid="stExpander"] summary * {color:#f2f6ed!important;background:transparent!important;}
   [data-testid="stDialog"] button:not([aria-label*="Close"]) {background:#202920!important;color:#f2f6ed!important;border-color:#435044!important;}
@@ -405,7 +436,8 @@ else:
         st.session_state.pop("league", None)
         for key in (
             "area", "view", "_trade_finder_cache", "_goal_directed_cache",
-            "_waiver_recommendation_cache",
+            "_waiver_recommendation_cache", "player_card_id", "player_card_route",
+            "player_card_trade_context",
         ):
             st.session_state.pop(key, None)
         st.rerun()
@@ -415,9 +447,9 @@ else:
         logout.button("Log out", on_click=st.logout)
     areas = {
         "Plan": {"Team plan": home, "Roster": rosters, "League": rankings},
-        "Moves": {"Upgrade": recommendations, "Target": player_seeker, "Waivers": waivers, "Evaluate": trade, "Journal": history},
+        "Moves": {"Upgrade": recommendations, "Check offer": trade, "Target": player_seeker, "Waivers": waivers, "Journal": history},
         "Market": {"Values": values, "Signals": projections, "Data": diagnostics},
-        "Draft": {"Draft room": draft},
+        "Draft": {"Draft assistant": draft},
     }
     if st.session_state.get("area") not in areas:
         st.session_state.area = "Plan"

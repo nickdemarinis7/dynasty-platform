@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 
 from .models import DevyProspect, DraftPick, League, Player, Roster, SourceHealth
 from .observability import record_event
+from .value_system import blend_market_values
 from .scoring import score_stats, unsupported_scoring_settings
 
 SLEEPER_BASE = "https://api.sleeper.app/v1"
@@ -358,6 +359,110 @@ def get_league_transactions(league_id: str, through_week: int) -> tuple[dict[str
     )
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_linked_league_trade_history(
+    previous_league_id: str | None,
+    max_seasons: int = 3,
+) -> tuple[dict[str, Any], ...]:
+    """Load completed trades from a bounded chain of prior Sleeper leagues.
+
+    Sleeper creates a new league id each season and links it through
+    ``previous_league_id``. Six-hour caching and a three-season cap preserve
+    hosted performance while providing a materially better manager sample.
+    """
+    history: list[dict[str, Any]] = []
+    league_id = str(previous_league_id or "")
+    visited: set[str] = set()
+    while league_id and league_id not in visited and len(history) < max(0, max_seasons):
+        visited.add(league_id)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                metadata_future = pool.submit(_get_json, f"{SLEEPER_BASE}/league/{league_id}")
+                rosters_future = pool.submit(_get_json, f"{SLEEPER_BASE}/league/{league_id}/rosters")
+                metadata = metadata_future.result()
+                rosters = rosters_future.result()
+            if not isinstance(metadata, dict):
+                break
+            trades = get_league_transactions(league_id, 18)
+            history.append({
+                "league_id": league_id,
+                "season": str(metadata.get("season") or ""),
+                "rosters": tuple(roster for roster in rosters if isinstance(roster, dict)) if isinstance(rosters, list) else (),
+                "trades": trades,
+            })
+            league_id = str(metadata.get("previous_league_id") or "")
+        except ProviderError:
+            break
+    return tuple(history)
+
+
+def build_manager_trade_tendencies(
+    current_rosters: list[dict[str, Any]],
+    current_transactions: tuple[dict[str, Any], ...],
+    linked_history: tuple[dict[str, Any], ...],
+    player_data: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    """Aggregate completed-trade preferences across stable Sleeper owners."""
+    current_owner_to_roster = {
+        str(roster.get("owner_id")): str(roster.get("roster_id"))
+        for roster in current_rosters if roster.get("owner_id") is not None
+    }
+    output: dict[str, dict[str, float]] = {
+        str(roster.get("roster_id")): {"trades": 0.0, "picks_acquired": 0.0, "history_seasons": 0.0}
+        for roster in current_rosters
+    }
+
+    def process(
+        transactions: tuple[dict[str, Any], ...],
+        roster_to_current: dict[str, str],
+        *,
+        historical: bool,
+    ) -> None:
+        active_current_rosters: set[str] = set()
+        for transaction in transactions:
+            involved = {str(item) for item in transaction.get("roster_ids") or []}
+            for historical_roster in involved:
+                current_roster = roster_to_current.get(historical_roster)
+                if not current_roster:
+                    continue
+                row = output[current_roster]
+                row["trades"] += 1
+                if historical:
+                    row["historical_trades"] = row.get("historical_trades", 0.0) + 1
+                    active_current_rosters.add(current_roster)
+            for player_id, receiving_roster in (transaction.get("adds") or {}).items():
+                current_roster = roster_to_current.get(str(receiving_roster))
+                position = str(player_data.get(str(player_id), {}).get("position") or "")
+                if current_roster and position in {"QB", "RB", "WR", "TE"}:
+                    key = f"{position.lower()}_acquired"
+                    output[current_roster][key] = output[current_roster].get(key, 0.0) + 1
+            for pick in transaction.get("draft_picks") or []:
+                if not isinstance(pick, dict):
+                    continue
+                receiving_roster = pick.get("owner_id")
+                current_roster = roster_to_current.get(str(receiving_roster))
+                if current_roster:
+                    output[current_roster]["picks_acquired"] += 1
+        if historical:
+            for current_roster in active_current_rosters:
+                output[current_roster]["history_seasons"] += 1
+
+    current_map = {str(roster.get("roster_id")): str(roster.get("roster_id")) for roster in current_rosters}
+    process(current_transactions, current_map, historical=False)
+    for season in linked_history:
+        historical_owner_to_roster = {
+            str(roster.get("owner_id")): str(roster.get("roster_id"))
+            for roster in season.get("rosters") or () if roster.get("owner_id") is not None
+        }
+        roster_to_current = {
+            historical_roster: current_owner_to_roster[owner_id]
+            for owner_id, historical_roster in historical_owner_to_roster.items()
+            if historical_roster and owner_id in current_owner_to_roster
+        }
+        process(tuple(season.get("trades") or ()), roster_to_current, historical=True)
+    return output
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def import_league(username: str, league_id: str) -> League:
     import_started = monotonic()
@@ -444,13 +549,13 @@ def import_league(username: str, league_id: str) -> League:
         }
         for player_id in source_ids
     }
-    values = {
-        player_id: round(
-            fantasycalc_values[player_id] * .60 + secondary_values[player_id] * .40, 2,
-        ) if player_id in fantasycalc_values and player_id in secondary_values
-        else fantasycalc_values.get(player_id, secondary_values.get(player_id, 0))
-        for player_id in source_ids
+    market_positions = {
+        str(player_id): str(raw.get("position") or ((raw.get("fantasy_positions") or [""])[0]))
+        for player_id, raw in player_data.items() if isinstance(raw, dict)
     }
+    values = blend_market_values(
+        fantasycalc_values, secondary_values, market_positions, team_count=team_count,
+    )
     values_status = "live" if values else "unavailable"
 
     player_teams = {
@@ -578,21 +683,14 @@ def import_league(username: str, league_id: str) -> League:
     scoring = "ppr" if reception >= 1 else "half_ppr" if reception >= 0.5 else "standard"
     state = get_nfl_state()
     current_week = int(state.get("week") or 1)
-    transactions = get_league_transactions(str(league_id), current_week)
-    manager_tendencies: dict[str, dict[str, float]] = {str(roster.get("roster_id")): {"trades": 0.0, "picks_acquired": 0.0} for roster in rosters_data}
-    for transaction in transactions:
-        for roster_id in transaction.get("roster_ids") or []:
-            tendency = manager_tendencies.setdefault(str(roster_id), {"trades": 0.0, "picks_acquired": 0.0})
-            tendency["trades"] += 1
-        for player_id, roster_id in (transaction.get("adds") or {}).items():
-            position = str(player_data.get(str(player_id), {}).get("position") or "")
-            if position in {"QB", "RB", "WR", "TE"}:
-                tendency = manager_tendencies.setdefault(str(roster_id), {"trades": 0.0, "picks_acquired": 0.0})
-                tendency[f"{position.lower()}_acquired"] = tendency.get(f"{position.lower()}_acquired", 0.0) + 1
-        for pick in transaction.get("draft_picks") or []:
-            if isinstance(pick, dict) and pick.get("owner_id") is not None:
-                tendency = manager_tendencies.setdefault(str(pick["owner_id"]), {"trades": 0.0, "picks_acquired": 0.0})
-                tendency["picks_acquired"] += 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        transactions_future = pool.submit(get_league_transactions, str(league_id), current_week)
+        history_future = pool.submit(get_linked_league_trade_history, league.get("previous_league_id"))
+        transactions = transactions_future.result()
+        linked_trade_history = history_future.result()
+    manager_tendencies = build_manager_trade_tendencies(
+        rosters_data, transactions, linked_trade_history, player_data,
+    )
     playoff_week_start = int(league_settings.get("playoff_week_start") or 15)
     regular_season_end = max(1, playoff_week_start - 1)
     playoff_teams = max(1, min(team_count, int(league_settings.get("playoff_teams") or min(6, team_count))))
@@ -634,7 +732,11 @@ def import_league(username: str, league_id: str) -> League:
         SourceHealth("Sleeper league", "ready", "League, roster, and ownership data loaded", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Sleeper standings", "ready" if standings_available else "limited", "Current records and points scored loaded" if standings_available else "No completed games yet; direction uses roster evidence"),
         SourceHealth("Sleeper schedule", "ready" if remaining_matchups or current_week > regular_season_end else "limited", f"Loaded {len(remaining_matchups)} remaining matchups" if remaining_matchups else "Remaining schedule unavailable"),
-        SourceHealth("Trade history", "ready" if transactions else "limited", f"Loaded {len(transactions)} completed league trades" if transactions else "No completed trades found this season"),
+        SourceHealth(
+            "Trade history", "ready" if transactions or linked_trade_history else "limited",
+            f"Loaded {len(transactions) + sum(len(item.get('trades') or ()) for item in linked_trade_history)} completed trades across {1 + len(linked_trade_history)} season{'s' if linked_trade_history else ''}"
+            if transactions or linked_trade_history else "No completed trades found in the available league history",
+        ),
         SourceHealth("FantasyCalc", "ready" if fantasycalc_values else "unavailable", "Current trade-derived market values loaded" if fantasycalc_values else "FantasyCalc values could not be loaded", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Stats Guy Fantasy", "ready" if secondary_values else "limited", f"Loaded {'TE-premium' if te_premium else 'standard'} consensus values" if secondary_values else "Secondary market consensus is unavailable", datetime.now(timezone.utc).isoformat()),
         SourceHealth("Sleeper stats", "ready" if len(stats_weeks) == expected_weeks else "limited", f"Loaded {len(stats_weeks)} of {expected_weeks} completed weeks"),

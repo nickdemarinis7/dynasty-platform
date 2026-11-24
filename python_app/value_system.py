@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import floor
 
 from .models import DraftPick, League, Player, Roster
 from .decision_policy import MARKET_MEANINGFUL_PERCENT, MARKET_NOISE_PERCENT, MARKET_SUBSTANTIAL_PERCENT
@@ -37,6 +38,71 @@ class DraftClassOutlook:
     confidence: str
     top_prospects: tuple[str, ...]
     prospect_count: int
+
+
+def _quantile(sorted_values: list[float], probability: float) -> float:
+    """Return a linearly interpolated quantile without a numpy dependency."""
+    if not sorted_values:
+        return 0.0
+    position = max(0.0, min(1.0, probability)) * (len(sorted_values) - 1)
+    lower = floor(position)
+    upper = min(len(sorted_values) - 1, lower + 1)
+    fraction = position - lower
+    return sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction
+
+
+def _percentile_position(value: float, sorted_values: list[float]) -> float:
+    if len(sorted_values) <= 1:
+        return .5
+    below = sum(item < value for item in sorted_values)
+    equal = sum(item == value for item in sorted_values)
+    return (below + max(0, equal - 1) / 2) / (len(sorted_values) - 1)
+
+
+def blend_market_values(
+    primary: dict[str, float],
+    secondary: dict[str, float],
+    positions: dict[str, str] | None = None,
+    *,
+    team_count: int = 12,
+) -> dict[str, float]:
+    """Normalize provider curves before producing a market consensus.
+
+    FantasyCalc is the anchor because its request includes the exact league
+    size and scoring format. The secondary curve is quantile-mapped onto that
+    scale by position where the overlap is large enough, then blended. This
+    avoids treating two similarly named but independently shaped value scales
+    as interchangeable raw numbers.
+    """
+    positions = positions or {}
+    overlap = set(primary) & set(secondary)
+    primary_weight = .75 if team_count <= 8 or team_count >= 16 else .65
+    secondary_weight = 1 - primary_weight
+    normalized_secondary: dict[str, float] = {}
+    position_groups = {positions.get(player_id, "ALL") for player_id in overlap} | {"ALL"}
+    for group in position_groups:
+        ids = [
+            player_id for player_id in overlap
+            if group == "ALL" or positions.get(player_id) == group
+        ]
+        if group != "ALL" and len(ids) < 8:
+            continue
+        primary_curve = sorted(primary[player_id] for player_id in ids)
+        secondary_curve = sorted(secondary[player_id] for player_id in ids)
+        for player_id in ids:
+            # A position-specific mapping supersedes the all-player fallback.
+            if group == "ALL" and player_id in normalized_secondary:
+                continue
+            rank = _percentile_position(secondary[player_id], secondary_curve)
+            normalized_secondary[player_id] = _quantile(primary_curve, rank)
+    output: dict[str, float] = {}
+    for player_id in set(primary) | set(secondary):
+        if player_id in primary and player_id in secondary:
+            secondary_value = normalized_secondary.get(player_id, secondary[player_id])
+            output[player_id] = round(primary[player_id] * primary_weight + secondary_value * secondary_weight, 2)
+        else:
+            output[player_id] = round(primary.get(player_id, secondary.get(player_id, 0.0)), 2)
+    return output
 
 
 def draft_class_outlooks(league: League) -> dict[int, DraftClassOutlook]:
@@ -104,12 +170,17 @@ def value_profile(player: Player, league: League) -> ValueProfile:
         tier = "Marginal asset"
     # A continuous curve avoids artificial range jumps when two adjacent
     # players happen to fall on opposite sides of a tier label.
-    uncertainty = .08 + (100 - rank) / 100 * .20
+    rank_uncertainty = .08 + (100 - rank) / 100 * .20
     sources = list(league.market_source_values.get(player.id, {}).values())
     disagreement = (
         (max(sources) - min(sources)) / max(sum(sources) / len(sources), 1) * 100
         if len(sources) >= 2 else 0.0
     )
+    # Provider spread is direct evidence that the market is uncertain. Widen
+    # the range gradually, but cap it so one stale source cannot make the
+    # profile unusable. Single-source players receive a small evidence penalty.
+    evidence_uncertainty = min(.16, disagreement / 100 * .35) if len(sources) >= 2 else .05
+    uncertainty = min(.42, rank_uncertainty + evidence_uncertainty)
     return ValueProfile(
         player.value,
         round(max(0, player.value * (1 - uncertainty)), 1),

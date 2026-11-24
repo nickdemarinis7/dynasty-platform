@@ -9,7 +9,7 @@ import io
 import streamlit as st
 
 from .models import DraftPick, League, Player, Roster
-from .analytics import active_roster_players, assess_team_trade, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup, projection_profile, trade_market_range, tradable_roster_players
+from .analytics import active_roster_players, assess_team_trade, backtest_projection_model, backtest_recommendation_model, build_contexts, calc_fppg, compute_projection_profiles, compute_projections, depth_profile, evaluate_trade, explain_trade, optimize_lineup, production_sustainability, projection_profile, trade_market_range, tradable_roster_players
 from .recommendations import Recommendation, generate_multi_step_paths, generate_sell_offers, generate_target_offers, generate_trade_ladders, recommendation_search_notes, timed_generate_recommendations
 from .draft import load_draft_snapshot
 from .providers import ProviderError
@@ -23,6 +23,7 @@ from .journal import build_calibration_report, journal_partner_tendencies, trade
 from .diagnostics import build_diagnostic_report
 from .value_system import balance_label, format_value, pick_profile, value_profile
 from .scoring import score_stats
+from .news import get_player_news
 
 
 def _load_recommendation(idea: object) -> None:
@@ -30,10 +31,11 @@ def _load_recommendation(idea: object) -> None:
         st.session_state.pop(key, None)
     st.session_state.trade_prefill = idea
     st.session_state.area = "Moves"
-    st.session_state.view = "Evaluate"
+    st.session_state.view = "Check offer"
 
 
 def _navigate(section: str, page: str) -> None:
+    _close_player_card()
     st.session_state.area = section
     st.session_state.view = page
 
@@ -48,7 +50,7 @@ def _clear_trade_partner_assets() -> None:
         st.session_state.pop(key, None)
 
 
-TRADE_FINDER_CACHE_VERSION = 35
+TRADE_FINDER_CACHE_VERSION = 38
 
 RISK_PROFILE_COPY = {
     "Conservative": "Protects depth and market value; avoids meaningful overpays and fragile roster construction.",
@@ -56,6 +58,11 @@ RISK_PROFILE_COPY = {
     "Aggressive": "Searches a wider market and accepts greater depth or value risk for concentrated upside.",
 }
 _HOSTED_GENERATION_CACHE: dict[tuple[object, ...], object] = {}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_player_news(player_name: str, team: str) -> tuple[object, ...]:
+    return get_player_news(player_name, team)
 
 
 def _shared_generation_cache(key: tuple[object, ...], builder: Callable[[], object]) -> tuple[object, bool]:
@@ -207,42 +214,35 @@ def _interactive_deal_package(
     key_prefix: str,
 ) -> None:
     """Render a trade package whose player names open their evidence profile."""
-    with st.container(border=True):
-        st.markdown('<div class="interactive-deal-marker"></div>', unsafe_allow_html=True)
+    with st.container(key=f"trade_package_{key_prefix}"):
         send, arrow, receive = st.columns([1, .14, 1], vertical_alignment="center")
         with send:
-            st.markdown('<div class="deal-send-marker"></div>', unsafe_allow_html=True)
             st.caption("YOU SEND")
             for player in send_players:
-                _, player_button, _ = st.columns([.12, .76, .12])
-                with player_button:
-                    st.button(
-                        player.name,
-                        icon=":material/person_search:",
-                        key=f"dealplayer_send_{key_prefix}_{player.id}",
-                        use_container_width=True,
-                        on_click=_open_player_card,
-                        args=(player.id, send_players, receive_players),
-                    )
+                st.button(
+                    player.name,
+                    icon=":material/person_search:",
+                    key=f"dealplayer_send_{key_prefix}_{player.id}",
+                    use_container_width=True,
+                    on_click=_open_player_card,
+                    args=(player.id, send_players, receive_players),
+                )
             for pick in send_picks:
                 st.markdown(f"**{pick.label}**")
             if not send_players and not send_picks:
                 st.caption("Nothing")
         arrow.markdown('<div class="interactive-deal-arrow">⇄</div>', unsafe_allow_html=True)
         with receive:
-            st.markdown('<div class="deal-receive-marker"></div>', unsafe_allow_html=True)
             st.caption("YOU RECEIVE")
             for player in receive_players:
-                _, player_button, _ = st.columns([.12, .76, .12])
-                with player_button:
-                    st.button(
-                        player.name,
-                        icon=":material/person_search:",
-                        key=f"dealplayer_receive_{key_prefix}_{player.id}",
-                        use_container_width=True,
-                        on_click=_open_player_card,
-                        args=(player.id, send_players, receive_players),
-                    )
+                st.button(
+                    player.name,
+                    icon=":material/person_search:",
+                    key=f"dealplayer_receive_{key_prefix}_{player.id}",
+                    use_container_width=True,
+                    on_click=_open_player_card,
+                    args=(player.id, send_players, receive_players),
+                )
             for pick in receive_picks:
                 st.markdown(f"**{pick.label}**")
             if not receive_players and not receive_picks:
@@ -285,6 +285,18 @@ def _idea_final_review(idea: Recommendation) -> tuple[bool, str]:
     return False, "; ".join(reasons) or "the overall recommendation case does not clear the final threshold"
 
 
+def _idea_rejected_by_final_review(idea: Recommendation) -> bool:
+    """Keep unsafe ideas out while allowing difficult-but-credible negotiations."""
+    title_delta = None
+    if idea.evaluation.championship_probability_before is not None:
+        title_delta = idea.evaluation.championship_probability_after - idea.evaluation.championship_probability_before
+    return (
+        idea.score < 55
+        or idea.evaluation.acceptance_score < 40
+        or (title_delta is not None and title_delta <= -5)
+    )
+
+
 def _final_verdict(message: str, title: str = "Pass on this version") -> None:
     st.markdown(
         f'<div class="final-verdict"><strong>{html.escape(title)}</strong><span>{html.escape(message.capitalize())}.</span></div>',
@@ -314,6 +326,9 @@ def _open_player_card(
     receive_players: tuple[Player, ...] = (),
 ) -> None:
     st.session_state.player_card_id = player_id
+    st.session_state.player_card_route = (
+        st.session_state.get("area"), st.session_state.get("view"),
+    )
     if send_players or receive_players:
         st.session_state.player_card_trade_context = (send_players, receive_players)
     else:
@@ -323,12 +338,14 @@ def _open_player_card(
 def _close_player_card() -> None:
     st.session_state.pop("player_card_id", None)
     st.session_state.pop("player_card_trade_context", None)
+    st.session_state.pop("player_card_route", None)
 
 
 @st.dialog("Player profile", width="medium")
 def _player_card(player: Player, league: League) -> None:
     owner = _player_owner(league, player.id)
     profile = projection_profile(player, league)
+    sustainability = production_sustainability(player, league)
     market = value_profile(player, league)
     signal = league.player_signals.get(player.id, {})
     role = league.player_roles.get(player.id, {})
@@ -366,21 +383,31 @@ def _player_card(player: Player, league: League) -> None:
         f'Age {player.age or "—"}</p></div><div class="player-profile-status">{html.escape(status.upper())}</div></div>',
         unsafe_allow_html=True,
     )
-    _stat_grid([
-        ("Expected PPG", f"{profile.expected_points:.1f}"),
-        ("Season PPG", f"{profile.season_fppg:.1f}" if profile.season_fppg is not None else "—"),
-        ("Last 3 PPG", f"{profile.recent_fppg:.1f}" if profile.recent_fppg is not None else "—"),
-        ("Typical weekly range", f"{profile.floor:.1f}–{profile.ceiling:.1f}"),
-    ])
-    st.caption(
-        f"{profile.confidence} projection confidence · {profile.role_trend} recent role · "
-        f"{profile.availability_probability:.0%} modeled availability"
-    )
-    if impact_copy:
-        st.markdown(f'<div class="player-impact-note"><strong>Trade fit</strong>{html.escape(impact_copy)}</div>', unsafe_allow_html=True)
-    if profile.season_fppg and profile.recent_fppg is not None and profile.recent_fppg <= profile.season_fppg * .8:
-        decline = (1 - profile.recent_fppg / profile.season_fppg) * 100
-        st.warning(f"Recent scoring is {decline:.0f}% below the season baseline. Review recent usage and game context before relying on the projection.")
+    overview_tab, game_log_tab, status_tab, more_tab = st.tabs(["Overview", "Game log", "Status & role", "More"])
+    with overview_tab:
+        _stat_grid([
+            ("Expected PPG", f"{profile.expected_points:.1f}"),
+            ("Season PPG", f"{profile.season_fppg:.1f}" if profile.season_fppg is not None else "—"),
+            ("Last 3 PPG", f"{profile.recent_fppg:.1f}" if profile.recent_fppg is not None else "—"),
+            ("Typical weekly range", f"{profile.floor:.1f}–{profile.ceiling:.1f}"),
+        ])
+        st.caption(
+            f"{profile.confidence} projection confidence · {profile.role_trend} recent role · "
+            f"{profile.availability_probability:.0%} modeled availability"
+        )
+        if sustainability.fpoe_per_game is not None:
+            tone = "hot" if sustainability.label == "Running hot" else "cold" if sustainability.label == "Buy-low production" else "stable"
+            st.markdown(
+                f'<div class="sustainability-note {tone}"><strong>{html.escape(sustainability.label)}</strong>'
+                f'<span>{sustainability.actual_ppg:.1f} actual PPG vs {sustainability.usage_expected_ppg:.1f} usage-expected '
+                f'({sustainability.fpoe_per_game:+.1f} FPOE/game)</span></div>',
+                unsafe_allow_html=True,
+            )
+        if impact_copy:
+            st.markdown(f'<div class="player-impact-note"><strong>Trade fit</strong>{html.escape(impact_copy)}</div>', unsafe_allow_html=True)
+        if profile.season_fppg and profile.recent_fppg is not None and profile.recent_fppg <= profile.season_fppg * .8:
+            decline = (1 - profile.recent_fppg / profile.season_fppg) * 100
+            st.warning(f"Recent scoring is {decline:.0f}% below the season baseline. Review recent usage and game context before relying on the projection.")
 
     season_stats = league.player_stats.get(player.id, {})
     stat_fields = {
@@ -466,6 +493,13 @@ def _player_card(player: Player, league: League) -> None:
         usage_rows.append(("Target data", "Not provided by Sleeper"))
     if recent_sample:
         usage_rows.append(("Last 3 usage/game", f"{recent_opportunities:.1f}"))
+    if sustainability.usage_expected_ppg is not None:
+        usage_rows.append(("Usage-expected PPG", f"{sustainability.usage_expected_ppg:.1f}"))
+        usage_rows.append(("FPOE/game", f"{sustainability.fpoe_per_game:+.1f}"))
+    if sustainability.fantasy_points_per_snap is not None:
+        usage_rows.append(("Fantasy points/snap", f"{sustainability.fantasy_points_per_snap:.3f}"))
+    if sustainability.ros_projection_delta is not None:
+        usage_rows.append(("Future projection vs usage", f"{sustainability.ros_projection_delta:+.1f} PPG"))
     if player.position == "QB" and stat_amount(season_stats, "pass_att") > 0:
         usage_rows.append(("Completion rate", f'{stat_amount(season_stats, "pass_cmp") / stat_amount(season_stats, "pass_att"):.1%}'))
     elif player.position == "RB":
@@ -479,7 +513,7 @@ def _player_card(player: Player, league: League) -> None:
             usage_rows.append(("Catch rate", f'{stat_amount(season_stats, "rec") / targets:.1%}'))
             usage_rows.append(("Yards/target", f'{stat_amount(season_stats, "rec_yd") / targets:.1f}'))
 
-    left, right = st.columns(2)
+    left, right = overview_tab.columns(2)
     with left:
         season_rows = [
             (label, display_stat(stat_amount(season_stats, field)))
@@ -508,31 +542,48 @@ def _player_card(player: Player, league: League) -> None:
         availability_rows.append(("Practice", practice))
     if injury:
         availability_rows.append(("Latest update", injury))
-    if len(availability_rows) > 1 or status.lower() not in {"active", "inactive"}:
-        rows = "".join(f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>' for label, value in availability_rows)
-        st.markdown(f'<div class="player-detail-list player-news"><h3>News & availability</h3>{rows}</div>', unsafe_allow_html=True)
-    else:
-        st.caption("No recent injury or practice update is available from Sleeper.")
+    rows = "".join(f'<div><span>{html.escape(label)}</span><strong>{html.escape(value)}</strong></div>' for label, value in availability_rows)
+    status_tab.markdown(f'<div class="player-detail-list player-news"><h3>Availability & role</h3>{rows}</div>', unsafe_allow_html=True)
+    if not practice and not injury:
+        status_tab.info("No current injury or practice designation is available from Sleeper.")
+    with status_tab:
+        with st.spinner("Loading latest player news…"):
+            news_items = _cached_player_news(player.name, player.team)
+        st.markdown("### Latest news")
+        if news_items:
+            news_html = "".join(
+                '<a class="player-news-item" target="_blank" rel="noopener noreferrer" '
+                f'href="{html.escape(item.url, quote=True)}"><strong>{html.escape(item.title)}</strong>'
+                f'<span>{html.escape(item.source)}{f" · {html.escape(item.published_at)}" if item.published_at else ""}</span></a>'
+                for item in news_items
+            )
+            st.markdown(f'<div class="player-news-list">{news_html}</div>', unsafe_allow_html=True)
+            st.caption("Headlines open at the original publisher. Availability and timing depend on the external feed.")
+        else:
+            st.info("No recent player-specific headlines were found, or the news feed is temporarily unavailable.")
     adds = int(signal.get("trending_adds_24h") or 0)
     drops = int(signal.get("trending_drops_24h") or 0)
     if adds or drops:
-        st.caption(f"Sleeper 24h activity · {adds:,} adds · {drops:,} drops")
+        status_tab.caption(f"Sleeper 24h activity · {adds:,} adds · {drops:,} drops")
+    status_tab.caption("Availability and role come from Sleeper; headlines come from FantasyPros when configured, otherwise Google News RSS.")
 
     weekly_lines = [
         (week, stats, score_stats(stats, league.scoring_settings, player.position))
         for week, players in sorted(league.weekly_player_stats.items(), reverse=True)
         if (stats := players.get(player.id)) is not None
-    ][:5]
+    ]
     if weekly_lines:
-        with st.expander("Recent game log", expanded=True):
-            game_rows = "".join(
-                f'<div><span>Week {week}</span><strong>{points:.1f} pts · '
-                f'{html.escape(weekly_usage(stats))}</strong></div>'
-                for week, stats, points in weekly_lines
-            )
-            st.markdown(f'<div class="player-detail-list game-log">{game_rows}</div>', unsafe_allow_html=True)
+        game_rows = "".join(
+            f'<div><span>Week {week}</span><strong>{points:.1f} pts · '
+            f'{html.escape(weekly_usage(stats))}</strong></div>'
+            for week, stats, points in weekly_lines
+        )
+        game_log_tab.markdown(f'<div class="player-detail-list game-log"><h3>Full season game log</h3>{game_rows}</div>', unsafe_allow_html=True)
+    else:
+        game_log_tab.info("No completed weekly game logs are available for this player.")
 
-    with st.expander("Market value & projection methodology"):
+    with more_tab:
+        st.markdown("### Market value & methodology")
         st.write(f"**Blended market value:** {format_value(player.value) if league.values_status == 'live' else 'Unavailable'} · {market.tier}")
         st.write(f"**Heuristic trade-value range:** {format_value(market.low)}–{format_value(market.high)}")
         for source, source_value in league.market_source_values.get(player.id, {}).items():
@@ -541,12 +592,27 @@ def _player_card(player: Player, league: League) -> None:
             st.caption(f"Provider disagreement: {market.source_disagreement:.0f}%")
         for item in profile.evidence:
             st.write(f"• {item}")
+        st.markdown("### Production sustainability")
+        st.caption(
+            "Usage-expected scoring is learned from completed weekly stat lines in this league format. "
+            "FPOE/game is actual scoring minus that opportunity-based baseline; it is supporting evidence, not a forecast."
+        )
+        if sustainability.evidence:
+            for item in sustainability.evidence:
+                st.write(f"• {item}")
+        else:
+            st.caption("Not enough completed weekly usage data is available yet.")
         st.caption("Expected scoring and ranges are decision aids, not forecasts. Market value is a negotiation baseline, not a required price.")
 
 
 def _render_player_card_if_open(league: League) -> None:
     player_id = st.session_state.get("player_card_id")
     if not player_id:
+        return
+    open_route = st.session_state.get("player_card_route")
+    current_route = (st.session_state.get("area"), st.session_state.get("view"))
+    if open_route != current_route:
+        _close_player_card()
         return
     players = {
         player.id: player
@@ -562,7 +628,6 @@ def _render_player_card_if_open(league: League) -> None:
 
 
 def home(league: League) -> None:
-    _page_header("Your league", league.name, f"{league.season} · {league.mode.title()} · {league.team_count} teams")
     my_team = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
     context = build_contexts(league)[my_team.team_id]
     readiness = assess_league_readiness(league)
@@ -570,13 +635,6 @@ def home(league: League) -> None:
     lineup = optimize_lineup(active_roster_players(my_team), league)
     biggest_need = max(context.position_needs, key=context.position_needs.get)
     status_label = readiness.title if readiness.level == "ready" else f"{readiness.title} · review inputs"
-    st.markdown(
-        '<div class="home-status">'
-        f'<span class="home-status-primary">{html.escape(status_label)}</span>'
-        f'<span class="home-status-secondary">{html.escape(context.contender_confidence)}</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
     record = my_team.record if my_team.games_played else "Preseason"
     playoff = f"{context.playoff_probability}%" if context.playoff_probability is not None else "—"
     metrics = [
@@ -590,32 +648,67 @@ def home(league: League) -> None:
         f'<div class="gm-metric-label">{html.escape(label)}</div></div>'
         for label, value in metrics
     )
-    st.markdown(f'<div class="gm-metrics">{metric_html}</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="home-dashboard-hero">'
+        '<div class="app-kicker">Your league</div>'
+        f'<h1>{html.escape(league.name)}</h1>'
+        f'<p>{html.escape(league.season)} · {html.escape(league.mode.title())} · {league.team_count} teams</p>'
+        '<div class="home-status">'
+        f'<span class="home-status-primary">{html.escape(status_label)}</span>'
+        f'<span class="home-status-secondary">{html.escape(context.contender_confidence)}</span>'
+        '</div>'
+        f'<div class="gm-metrics">{metric_html}</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     if league.values_status != "live":
         st.warning("FantasyCalc values are temporarily unavailable. Players remain visible, but value analysis is disabled rather than estimated.")
     next_position = context.critical_positions[0] if context.critical_positions else biggest_need
     needs_insurance = context.resilience_score < 60 or bool(context.critical_positions)
     next_action = plan.actions[0]
-    action_detail = "Open the waiver pool for an immediate depth fix." if needs_insurance else "Open a pre-filtered trade search for realistic upgrades."
+    if needs_insurance:
+        brief_title = (
+            f"Your contender profile is healthy. Add playable {next_position} depth before paying for another starter."
+        )
+    elif context.window in {"Win Now", "Competing"}:
+        brief_title = (
+            f"Your core is ready to compete. Pursue a {next_position} upgrade only when it improves the weekly lineup."
+        )
+    else:
+        brief_title = f"Strengthen {next_position} while preserving the assets that define your long-term window."
     _section("GM brief")
     st.markdown(
         '<div class="gm-brief">'
         f'<div class="gm-brief-kicker">{html.escape(plan.direction)}</div>'
-        f'<div class="gm-brief-title">{html.escape(plan.headline)}</div>'
-        f'<div class="gm-brief-action"><strong>Do this next</strong><br>{html.escape(next_action)} '
-        f'{html.escape(action_detail)}</div></div>',
+        f'<div class="gm-brief-title">{html.escape(brief_title)}</div>'
+        f'<div class="gm-brief-action"><strong>Next move</strong><span>{html.escape(next_action)}</span></div></div>',
         unsafe_allow_html=True,
     )
+    primary, secondary = st.columns([1.45, 1])
     if needs_insurance:
-        st.button(
+        primary.button(
             f"Find {next_position} waiver help", type="primary", use_container_width=True,
             on_click=_navigate_filtered, args=("Moves", "Waivers", "waiver_position", next_position),
         )
+        secondary.button(
+            f"Explore {next_position} trades", use_container_width=True,
+            on_click=_navigate_filtered, args=("Moves", "Upgrade", "recommendation_position", next_position),
+        )
     else:
-        st.button(
+        primary.button(
             f"Find a {next_position} upgrade", type="primary", use_container_width=True,
             on_click=_navigate_filtered, args=("Moves", "Upgrade", "recommendation_position", next_position),
         )
+        secondary.button(
+            f"Check {next_position} waivers", use_container_width=True,
+            on_click=_navigate_filtered, args=("Moves", "Waivers", "waiver_position", next_position),
+        )
+    st.button(
+        ":material/compare_arrows: Check a trade you've been offered",
+        use_container_width=True,
+        on_click=_navigate, args=("Moves", "Check offer"),
+        help="Enter both sides immediately—no recommendation search required.",
+    )
     with st.expander("See the full action plan"):
         for number, action in enumerate(plan.actions, 1):
             st.markdown(f"**{number}.** {action}")
@@ -629,12 +722,12 @@ def home(league: League) -> None:
         _section("Roster strategy")
         st.markdown(
             '<div class="strategy-grid">'
-            f'<div class="strategy-panel protect"><div class="strategy-label">Core to protect</div><div class="player-chips">{protect_chips}</div></div>'
-            f'<div class="strategy-panel shop"><div class="strategy-label">Test the market</div><div class="player-chips">{shop_chips}</div></div>'
+            f'<div class="strategy-panel protect"><div class="strategy-label">Core to protect</div><div class="strategy-copy">Build around these foundational assets.</div><div class="player-chips">{protect_chips}</div></div>'
+            f'<div class="strategy-panel shop"><div class="strategy-label">Test the market</div><div class="strategy-copy">Price-check these players; a move is optional.</div><div class="player-chips">{shop_chips}</div></div>'
             '</div>',
             unsafe_allow_html=True,
         )
-    st.button("Open roster room", use_container_width=True, on_click=_navigate, args=("Plan", "Roster"))
+    st.button("Review full roster", use_container_width=True, on_click=_navigate, args=("Plan", "Roster"))
     settings = " · ".join(filter(None, [league.scoring.upper(), "Superflex" if league.superflex else "1QB", "TE Premium" if league.te_premium else None]))
     schedule = f" · Schedule difficulty {context.schedule_difficulty}/100" if context.schedule_difficulty is not None else ""
     deadline = f" · {context.deadline_status}" if context.deadline_status != "No deadline" else ""
@@ -736,7 +829,10 @@ def values(league: League) -> None:
     ]
     market_source = next((source for source in league.source_health if source.source == "FantasyCalc"), None)
     freshness = f" · refreshed {market_source.observed_at}" if market_source and market_source.observed_at else ""
-    st.caption(f"{len(filtered)} rostered players · 60% FantasyCalc league-adjusted market + 40% Stats Guy Fantasy consensus{freshness}")
+    st.caption(
+        f"{len(filtered)} rostered players · normalized FantasyCalc + Stats Guy market consensus"
+        f" · exact-format source receives more weight in unusual league sizes{freshness}"
+    )
     st.caption("Secondary market and TE-premium data from [Stats Guy Fantasy](https://statsguyfantasy.com/).")
     st.caption("Asset tiers are relative to this league's rostered market—not projected lineup roles. Negotiation bands are heuristic ranges for trade discussion, not statistical confidence intervals.")
     _section("Market board")
@@ -929,10 +1025,27 @@ def recommendations(league: League) -> None:
         trade_ladders = list(generated_ladders)
         ladder_loading.empty()
     loading_slot.empty()
-    ideas = [idea for idea in all_ideas if show_experimental or (idea.confidence != "D" and idea.score >= 55)]
+    ideas = [
+        idea for idea in all_ideas
+        if show_experimental
+        or (
+            idea.confidence != "D"
+            and idea.score >= 55
+            and not _idea_rejected_by_final_review(idea)
+        )
+    ]
     if not ideas:
-        st.info("No package currently offers enough strategic upside for this risk profile. Holding is preferable to forcing a trade.")
-        st.caption(f"{search_performance.team_diagnosis or 'Team strategy'} · {search_performance.packages_evaluated} packages evaluated in {search_performance.elapsed_ms:,} ms")
+        st.info(
+            "No package cleared final review for this risk profile. Holding is preferable to forcing a trade; "
+            "enable low-confidence experiments only if you want to inspect the rejected near-misses."
+        )
+        st.caption(
+            f"{search_performance.team_diagnosis or 'Team strategy'} · "
+            f"{search_performance.packages_evaluated} packages screened · "
+            f"{search_performance.full_evaluations} fully simulated · "
+            f"{search_performance.viable_candidates} viable before final review · "
+            f"{search_performance.elapsed_ms:,} ms"
+        )
         with st.expander("Recommendation funnel"):
             for reason, count in search_performance.rejection_counts:
                 st.write(f"**{count}** · {reason}")
@@ -1005,20 +1118,13 @@ def recommendations(league: League) -> None:
     def rejected_by_final_review(idea: Recommendation) -> bool:
         if idea in actionable_ideas or idea in alternative_ideas:
             return False
-        title_delta = None
-        if idea.evaluation.championship_probability_before is not None:
-            title_delta = idea.evaluation.championship_probability_after - idea.evaluation.championship_probability_before
-        return (
-            idea.score < 60
-            or idea.evaluation.acceptance_score < 48
-            or (title_delta is not None and title_delta < 0)
-        )
+        return _idea_rejected_by_final_review(idea)
 
     every_visible_idea_rejected = bool(ideas) and all(rejected_by_final_review(idea) for idea in ideas)
     section_title = "Best available deals" if actionable else "Rejected by final review" if every_visible_idea_rejected else "Exploratory tradeoffs"
     _section(section_title)
-    for idea in ideas:
-        with st.container(border=True):
+    for idea_index, idea in enumerate(ideas):
+        with st.container(border=True, key=f"recommendation_card_{idea_index}"):
             is_actionable = idea in actionable_ideas
             is_alternative = idea in alternative_ideas
             championship_delta = None
@@ -1037,12 +1143,19 @@ def recommendations(league: League) -> None:
             heading, score = st.columns([3, 1])
             with heading:
                 _asset_heading(idea.partner.team_name, idea.reason)
-            _compact_value(score, "Idea quality" if weak_exploratory else "Overall", f"{idea.score}/100")
+            quality_label = "Strong idea" if idea.score >= 75 else "Good idea" if idea.score >= 60 else "Review carefully" if idea.score >= 50 else "Weak idea"
+            if weak_exploratory:
+                _compact_value(score, "Final review", "PASS")
+            else:
+                _compact_value(score, quality_label, f"{idea.score}/100")
             sends = [player.name for player in idea.send_players] + [pick.label for pick in idea.send_picks]
             receives = [player.name for player in idea.receive_players] + [pick.label for pick in idea.receive_picks]
             package_key = f"finder_{idea.partner.team_id}_{idea.objective}_{'_'.join(player.id for player in idea.send_players)}_{'_'.join(player.id for player in idea.receive_players)}"
             _interactive_deal_package(
                 idea.send_players, idea.receive_players, idea.send_picks, idea.receive_picks, package_key,
+            )
+            st.caption(
+                f"Package · Send {', '.join(sends) or 'nothing'} ⇄ Receive {', '.join(receives) or 'nothing'}"
             )
             playoff_gain = idea.evaluation.lineup_a.playoff_points_gained
             remaining_gain = idea.evaluation.lineup_a.remaining_season_points_gained
@@ -1055,11 +1168,11 @@ def recommendations(league: League) -> None:
             feasibility = "Strong" if idea.evaluation.acceptance_score >= 65 else "Workable" if idea.evaluation.acceptance_score >= 48 else "Difficult"
             if weak_exploratory:
                 failure_reasons = []
-                if championship_delta is not None and championship_delta < 0:
+                if championship_delta is not None and championship_delta <= -5:
                     failure_reasons.append("the season-outcome scenario moves backward")
-                if idea.evaluation.acceptance_score < 48:
+                if idea.evaluation.acceptance_score < 40:
                     failure_reasons.append("the partner fit is unlikely to support the offer")
-                if idea.score < 60:
+                if idea.score < 55:
                     failure_reasons.append("the evidence-adjusted case is too weak")
                 verdict_reason = "; ".join(failure_reasons) or "the final quality gates did not clear"
                 st.markdown(
@@ -1072,11 +1185,14 @@ def recommendations(league: League) -> None:
                 ("Market cost", market_case),
             ], muted=weak_exploratory)
             _stat_grid([
-                ("Current lineup", f"{idea.evaluation.lineup_a.points_gained:+.1f} PPG"),
-                ("Rest of season", f"{remaining_gain:+.1f} PPG" if remaining_gain is not None else "Unavailable"),
-                ("Playoff lineup", f"{playoff_gain:+.1f} PPG" if playoff_gain is not None else "Unavailable"),
+                ("This week", f"{idea.evaluation.lineup_a.points_gained:+.1f} PPG"),
+                ("ROS weekly average", f"{remaining_gain:+.1f} PPG" if remaining_gain is not None else "Unavailable"),
+                ("Playoff weekly average", f"{playoff_gain:+.1f} PPG" if playoff_gain is not None else "Unavailable"),
             ])
-            st.caption(f"Market: {market_balance} · Partner fit: {partner_fit} · Depth: {idea.evaluation.lineup_a.depth_change:+.0f} · Confidence range: {score_range}")
+            st.caption(
+                f"Deal context · {market_balance} market · {partner_fit.lower()} partner fit · "
+                f"{idea.evaluation.lineup_a.depth_change:+.0f} depth · {score_range} confidence"
+            )
             impact = idea.evaluation.lineup_a
             received_names = {player.name for player in idea.receive_players}
             incoming_starters = [name for name in impact.new_starters if name in received_names]
@@ -1084,16 +1200,28 @@ def recommendations(league: League) -> None:
             if incoming_starters:
                 starter_notes.append("Incoming starter: " + ", ".join(incoming_starters))
             if impact.outgoing_starters:
-                starter_notes.append("Leaves lineup: " + ", ".join(impact.outgoing_starters))
+                starter_notes.append("Sent-away starter: " + ", ".join(impact.outgoing_starters))
             if impact.internal_replacements:
-                starter_notes.append("Internal replacement: " + ", ".join(impact.internal_replacements))
+                starter_notes.append("Replacement entering lineup: " + ", ".join(impact.internal_replacements))
+            if impact.displaced_starters:
+                starter_notes.append("Moves to bench: " + ", ".join(impact.displaced_starters))
             if starter_notes:
-                st.caption(" · ".join(starter_notes))
+                st.caption("Lineup · " + " · ".join(starter_notes))
             if idea.evaluation.championship_probability_before is not None:
                 title_delta = championship_delta or 0
-                scenario_label = "meaningful positive signal" if title_delta >= 8 else "meaningful negative signal" if title_delta <= -8 else "no meaningful change within simulation noise"
+                playoff_delta = idea.evaluation.playoff_probability_after - idea.evaluation.playoff_probability_before
+                scenario_label = (
+                    "high-variance championship signal improves" if title_delta >= 5
+                    else "high-variance championship signal declines" if title_delta <= -5
+                    else "playoff qualification improves; championship signal remains flat" if playoff_delta >= 5
+                    else "playoff qualification declines; championship signal remains flat" if playoff_delta <= -5
+                    else "no material season-outcome movement"
+                )
                 playoff_text = "playoff odds already near-certain" if idea.evaluation.playoff_probability_before >= 95 else f"playoffs {idea.evaluation.playoff_probability_before:.0f}% → {idea.evaluation.playoff_probability_after:.0f}%"
-                st.caption(f"Season scenario: {scenario_label} · {playoff_text} · championship {idea.evaluation.championship_probability_before:.0f}% → {idea.evaluation.championship_probability_after:.0f}% · directional, not a forecast")
+                st.caption(
+                    f"Outlook · {playoff_text} · title {idea.evaluation.championship_probability_before:.0f}% → "
+                    f"{idea.evaluation.championship_probability_after:.0f}% · {scenario_label} · directional"
+                )
             if idea.cautions:
                 _risk_callout(idea.cautions[0], len(idea.cautions) - 1)
             elif idea.evaluation.lineup_a.depth_change < 0:
@@ -1217,7 +1345,7 @@ def _sell_seeker(league: League, my_team: Roster, risk_profile: str) -> None:
     player = roster_players[player_id]
     with st.spinner(f"Finding markets for {player.name}…"):
         generated, _cache_hit = _cached_goal_directed_generation(
-            "sell", league, player_id, risk_profile,
+            "sell-survival-v5", league, player_id, risk_profile,
             lambda: generate_sell_offers(league, player_id, risk_profile=risk_profile),
         )
         offers, performance = generated
@@ -1490,7 +1618,7 @@ def waivers(league: League) -> None:
 
 def trade(league: League) -> None:
     league = _calibrated_trade_league(league)
-    _page_header("Deal room", "Trade Simulator", "Build a package, then see market fairness, team fit, and starting-lineup impact.")
+    _page_header("Deal room", "Check an Offer", "Enter a trade you've received—or build one yourself—and get an immediate market and team-impact verdict.")
     if league.values_status != "live":
         st.warning("Trade analysis requires current market values. Refresh the league when FantasyCalc is available.")
         return
@@ -1598,6 +1726,11 @@ def trade(league: League) -> None:
         _stat_grid([(f"Your {context_a.window} fit", f"{result.fit_a:+.1f}"), (f"Their {context_b.window} fit", f"{result.fit_b:+.1f}"), ("Market balance", balance_label(result.fairness))])
         st.caption(f"Raw market difference: {result.fairness:+.1f}%. Treat small differences as noise inside the value range, not a precise edge.")
     st.progress(result.acceptance_score / 100, text=f"Partner-fit score for {team_b.team_name}: {result.acceptance_score}/100")
+    if result.partner_urgency_reason:
+        st.warning(
+            f"Partner urgency: {result.partner_urgency_reason.capitalize()}. "
+            f"This reduced partner fit by {result.partner_urgency_penalty} points."
+        )
     tendency = league.manager_tendencies.get(team_b.team_id, {})
     history = f" This manager has completed {int(tendency.get('trades', 0))} trades this season." if tendency else ""
     st.caption("Partner fit blends market value, roster direction, lineup impact, and observed league trade behavior. It is a decision aid, not an acceptance probability." + history)
@@ -1770,7 +1903,8 @@ def history(league: League) -> None:
 
 @st.fragment(run_every=15)
 def draft(league: League) -> None:
-    _page_header("Draft room", "Live Draft", "Best available players, roster needs, and your position in the Sleeper draft.")
+    _page_header("Draft room", "Draft Assistant", "A live companion for your Sleeper draft: see who is available, when you pick, and how each player fits your roster.")
+    st.info("This screen follows your selected Sleeper draft. It does not run a mock draft or grade future draft picks.")
     refresh = st.button("Refresh draft", use_container_width=True)
     del refresh
     try:
@@ -1782,6 +1916,7 @@ def draft(league: League) -> None:
     st.caption(f"{snapshot.season} · {snapshot.rounds} rounds · {snapshot.draft_type.title()} · {snapshot.status.replace('_', ' ').title()}")
     if snapshot.current_pick is None:
         st.success(f"Draft complete · {snapshot.picks_made}/{snapshot.total_picks} picks")
+        st.caption("The board now shows players who went undrafted and may still be available in your league.")
     else:
         with st.container(border=True):
             status, number = st.columns([3, 1])
@@ -1793,7 +1928,12 @@ def draft(league: League) -> None:
 
     position = st.pills("Position", ["ALL", "QB", "RB", "WR", "TE"], default="ALL", key="draft_position")
     available = [player for player in snapshot.available if position == "ALL" or player.position == position]
-    _section("Best available")
+    pool_description = "rookies" if snapshot.rookies_only else "players"
+    _section(f"Best available {pool_description}")
+    st.caption(
+        "Ranked by current market value with a small boost for positions your roster still needs. "
+        "Availability is based on the selected Sleeper draft."
+    )
     _data_list([
         (f"#{rank} · {player.name}", f"{player.position} · {player.team} · Age {player.age or '—'}{' · NEED' if player.need_score > 0 else ''}", player.value, "Value")
         for rank, player in enumerate(available[:30], 1)

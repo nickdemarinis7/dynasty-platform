@@ -45,7 +45,7 @@ class StreamlitSmokeTests(unittest.TestCase):
 
     def test_connected_home_renders_and_theme_toggle_is_deterministic(self) -> None:
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py"))
-        app.session_state["_app_state_schema_version"] = 16
+        app.session_state["_app_state_schema_version"] = 17
         app.session_state["league"] = _connected_league()
         app.session_state["username"] = "me"
         app.session_state["color_mode"] = "Dark"
@@ -58,7 +58,7 @@ class StreamlitSmokeTests(unittest.TestCase):
 
     def test_switch_league_preserves_explicit_theme(self) -> None:
         app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "streamlit_app.py"))
-        app.session_state["_app_state_schema_version"] = 16
+        app.session_state["_app_state_schema_version"] = 17
         app.session_state["league"] = _connected_league()
         app.session_state["username"] = "me"
         app.session_state["color_mode"] = "Dark"
@@ -77,15 +77,15 @@ class StreamlitSmokeTests(unittest.TestCase):
     def test_connected_primary_routes_render_without_exceptions(self) -> None:
         routes = (
             ("Plan", "Roster"), ("Plan", "League"),
-            ("Moves", "Target"), ("Moves", "Waivers"), ("Moves", "Evaluate"), ("Moves", "Journal"),
+            ("Moves", "Check offer"), ("Moves", "Target"), ("Moves", "Waivers"), ("Moves", "Journal"),
             ("Market", "Values"), ("Market", "Signals"), ("Market", "Data"),
-            ("Draft", "Draft room"),
+            ("Draft", "Draft assistant"),
         )
         app_path = str(Path(__file__).resolve().parents[1] / "streamlit_app.py")
         for area, view in routes:
             with self.subTest(area=area, view=view):
                 app = AppTest.from_file(app_path)
-                app.session_state["_app_state_schema_version"] = 16
+                app.session_state["_app_state_schema_version"] = 17
                 app.session_state["league"] = _connected_league()
                 app.session_state["username"] = "me"
                 app.session_state["color_mode"] = "Dark"

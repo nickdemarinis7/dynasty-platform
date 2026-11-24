@@ -1,9 +1,34 @@
 import unittest
 
-from python_app.providers import _league_mode, _parse_devy_prospects, _parse_secondary_market_values, _parse_trending_players, _parse_weekly_projection_stats
+from python_app.providers import _league_mode, _parse_devy_prospects, _parse_secondary_market_values, _parse_trending_players, _parse_weekly_projection_stats, build_manager_trade_tendencies
 
 
 class ProjectionProviderTests(unittest.TestCase):
+    def test_trade_tendencies_follow_owner_across_linked_seasons(self) -> None:
+        rosters = [{"roster_id": 1, "owner_id": "owner-a"}, {"roster_id": 2, "owner_id": "owner-b"}]
+        current = ({"roster_ids": [1, 2], "adds": {"wr": 2}, "draft_picks": []},)
+        history = ({
+            "season": "2025",
+            "rosters": ({"roster_id": 7, "owner_id": "owner-a"}, {"roster_id": 9, "owner_id": "owner-b"}),
+            "trades": ({"roster_ids": [7, 9], "adds": {"rb": 7}, "draft_picks": [{"owner_id": 9}]},),
+        },)
+        tendencies = build_manager_trade_tendencies(
+            rosters, current, history, {"wr": {"position": "WR"}, "rb": {"position": "RB"}},
+        )
+        self.assertEqual(tendencies["1"]["trades"], 2)
+        self.assertEqual(tendencies["1"]["rb_acquired"], 1)
+        self.assertEqual(tendencies["1"]["historical_trades"], 1)
+        self.assertEqual(tendencies["1"]["history_seasons"], 1)
+        self.assertEqual(tendencies["2"]["wr_acquired"], 1)
+        self.assertEqual(tendencies["2"]["picks_acquired"], 1)
+
+    def test_history_ignores_managers_not_in_current_league(self) -> None:
+        tendencies = build_manager_trade_tendencies(
+            [{"roster_id": 1, "owner_id": "owner-a"}], (),
+            ({"rosters": ({"roster_id": 4, "owner_id": "departed"},), "trades": ({"roster_ids": [4]},)},),
+            {},
+        )
+        self.assertEqual(tendencies["1"]["trades"], 0)
     def test_league_mode_accepts_numeric_strings_and_root_fallback(self) -> None:
         self.assertEqual(_league_mode({"settings": {"type": "2"}}), "dynasty")
         self.assertEqual(_league_mode({"type": 1}), "keeper")

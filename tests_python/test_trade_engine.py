@@ -65,7 +65,7 @@ class TradeEngineRegressionTests(unittest.TestCase):
         league = League(
             "rebalance", "Rebalance", "2026", "dynasty", 2, False, False, "half_ppr",
             (("RB", 1), ("WR", 1), ("FLEX", 1), ("BN", 3)), "1", (mine, other), "live",
-            weekly_points=weekly, playoff_weekly_points={15: weekly, 16: weekly},
+            weekly_points=weekly, playoff_weekly_points={15: weekly, 16: weekly}, current_week=1,
         )
         packages = _rebalance_packages(partner_wr, mine, other, league, build_contexts(league))
         self.assertTrue(any(
@@ -312,9 +312,79 @@ class TradeEngineRegressionTests(unittest.TestCase):
         self.assertTrue(all([player.id for player in offer.send_players] == ["waddle"] for offer in offers))
         self.assertEqual(len({offer.partner.team_id for offer in offers}), len(offers))
 
+    def test_sell_seeker_builds_survival_pivots_for_unavailable_star(self) -> None:
+        from tests_python.recommendation_audit import build_audit_league
+        league = build_audit_league()
+        mine = league.rosters[0]
+        injured_roster = replace(
+            mine,
+            players=tuple(
+                replace(player, injury_status="IR") if player.id == "waddle" else player
+                for player in mine.players
+            ),
+            reserve_player_ids=("waddle",),
+        )
+        league = replace(league, rosters=(injured_roster, *league.rosters[1:]))
+
+        offers, _ = generate_sell_offers(league, "waddle")
+
+        self.assertTrue(offers)
+        self.assertTrue(all(offer.objective == "Survival pivot" for offer in offers))
+        self.assertTrue(all(offer.receive_players for offer in offers))
+        self.assertTrue(all(
+            (player.injury_status or "").lower() not in {"out", "o", "ir", "pup", "nfi", "suspended", "sus"}
+            for offer in offers for player in offer.receive_players
+        ))
+        self.assertTrue(all(offer.evaluation.lineup_a.points_gained > 0 for offer in offers))
+        self.assertTrue(all(offer.score <= 88 for offer in offers))
+
+    def test_redraft_sell_seeker_finds_speculative_playoff_stash_buyers(self) -> None:
+        from tests_python.recommendation_audit import build_audit_league
+        league = replace(build_audit_league(), mode="redraft")
+        mine = league.rosters[0]
+        injured_roster = replace(
+            mine,
+            players=tuple(
+                replace(player, injury_status="IR") if player.id == "waddle" else player
+                for player in mine.players
+            ),
+            reserve_player_ids=("waddle",),
+        )
+        zeroed_playoff = {
+            week: {**points, "waddle": 0.0}
+            for week, points in league.playoff_weekly_points.items()
+        }
+        league = replace(
+            league,
+            rosters=(injured_roster, *league.rosters[1:]),
+            playoff_weekly_points=zeroed_playoff,
+        )
+
+        offers, _ = generate_sell_offers(league, "waddle")
+
+        self.assertTrue(offers)
+        self.assertTrue(all(offer.objective == "Survival pivot" for offer in offers))
+        self.assertTrue(any(
+            "Speculative playoff-stash market" in item
+            for offer in offers for item in offer.evidence
+        ))
+        self.assertTrue(any(
+            "playoff return is not confirmed" in item.lower()
+            for offer in offers for item in offer.cautions
+        ))
+
     def test_multi_step_path_requires_intermediary_and_safe_first_move(self) -> None:
         from tests_python.recommendation_audit import build_audit_league
-        paths = generate_multi_step_paths(build_audit_league(), "nabers", limit=2)
+        league = build_audit_league()
+        # Isolate path construction; must-win availability rejection has its
+        # own regression test below.
+        healthy_rosters = tuple(
+            replace(roster, players=tuple(replace(player, injury_status=None) for player in roster.players))
+            for roster in league.rosters
+        )
+        paths = generate_multi_step_paths(
+            replace(league, rosters=healthy_rosters, current_week=4), "nabers", limit=2,
+        )
         self.assertTrue(paths)
         for path in paths:
             self.assertIn(path.intermediary.id, {player.id for player in path.first.receive_players})
@@ -714,6 +784,98 @@ class TradeEngineRegressionTests(unittest.TestCase):
                 result, [self.a["rb"]], [injured_wr, injured_rb], [], self.league, injured_wr, context,
             ),
             "Multiple unavailable incoming players",
+        )
+
+    def test_must_win_partner_penalizes_unavailable_incoming_star(self) -> None:
+        unavailable_star = replace(self.a["wr"], value=70, injury_status="IR")
+        mine = replace(
+            self.team_a,
+            players=tuple(unavailable_star if player.id == self.a["wr"].id else player for player in self.team_a.players),
+        )
+        league = replace(self.league, current_week=10, rosters=(mine, self.team_b))
+        contexts = build_contexts(league)
+        pressured_contexts = {
+            **contexts,
+            self.team_b.team_id: replace(
+                contexts[self.team_b.team_id], playoff_probability=45, window="Competing",
+            ),
+        }
+        secure_contexts = {
+            **contexts,
+            self.team_b.team_id: replace(
+                contexts[self.team_b.team_id], playoff_probability=95, window="Young Core",
+            ),
+        }
+
+        pressured = evaluate_trade(
+            mine, self.team_b, [unavailable_star], [self.b["wr"]], league, contexts=pressured_contexts,
+        )
+        secure = evaluate_trade(
+            mine, self.team_b, [unavailable_star], [self.b["wr"]], league, contexts=secure_contexts,
+        )
+
+        self.assertGreaterEqual(pressured.partner_urgency_penalty, 12)
+        self.assertIn("unavailable player", pressured.partner_urgency_reason)
+        self.assertLess(pressured.acceptance_score, secure.acceptance_score)
+        self.assertEqual(secure.partner_urgency_penalty, 0)
+        pressured = replace(
+            pressured,
+            acceptance_score=max(40, pressured.acceptance_score),
+            lineup_a=replace(pressured.lineup_a, received_player_starts=True),
+        )
+        self.assertEqual(
+            _hard_gate_reason(
+                pressured, [unavailable_star], [self.b["wr"]], [],
+                league, None, contexts[mine.team_id],
+            ),
+            "Partner must-win timeline",
+        )
+
+    def test_must_win_partner_gate_rejects_material_lineup_loss(self) -> None:
+        result = evaluate_trade(
+            self.team_a, self.team_b, [self.a["rb"]], [self.b["wr"]], self.league,
+        )
+        pressured = replace(
+            result,
+            acceptance_score=max(40, result.acceptance_score),
+            partner_urgency_penalty=10,
+            partner_urgency_reason="Partner loses meaningful current and remaining-season production.",
+            lineup_a=replace(
+                result.lineup_a,
+                points_gained=3.0,
+                received_player_starts=True,
+            ),
+            lineup_b=replace(
+                result.lineup_b,
+                points_gained=-1.9,
+                remaining_season_points_gained=-4.9,
+            ),
+        )
+        context = build_contexts(self.league)[self.team_a.team_id]
+
+        self.assertEqual(
+            _hard_gate_reason(
+                pressured, [self.a["rb"]], [self.b["wr"]], [],
+                self.league, self.b["wr"], context,
+            ),
+            "Partner must-win timeline",
+        )
+
+        negotiable = replace(
+            pressured,
+            partner_urgency_reason="Partner loses modest modeled production.",
+            lineup_b=replace(
+                pressured.lineup_b,
+                points_gained=-1.3,
+                remaining_season_points_gained=-1.9,
+            ),
+        )
+        self.assertNotEqual(
+            _hard_gate_reason(
+                negotiable, [self.a["rb"]], [self.b["wr"]], [],
+                self.league, self.b["wr"], context,
+            ),
+            "Partner must-win timeline",
         )
 
     def test_contender_target_cannot_be_carried_by_secondary_starter(self) -> None:

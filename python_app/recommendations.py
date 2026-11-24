@@ -237,7 +237,7 @@ def _strategic_summary(result: TradeResult, context: TeamContext) -> str:
     playoff = result.lineup_a.playoff_points_gained or 0
     title_delta = (result.championship_probability_after or 0) - (result.championship_probability_before or 0)
     remaining = result.lineup_a.remaining_season_points_gained
-    if title_delta >= 8:
+    if title_delta >= 5:
         return f"The season scenario suggests meaningful championship upside while adding {current:+.1f} projected lineup points."
     if remaining is not None and remaining >= 2:
         return f"The move adds {remaining:+.1f} projected lineup points per week across the available remaining-season horizon."
@@ -884,6 +884,18 @@ def _hard_gate_reason(
         return "No starting-lineup role"
     if result.acceptance_score < 30:
         return "Partner viability"
+    if (
+        result.partner_urgency_penalty
+        and result.partner_urgency_reason
+        and "unavailable player" in result.partner_urgency_reason.lower()
+    ):
+        return "Partner must-win timeline"
+    partner_remaining = result.lineup_b.remaining_season_points_gained
+    if result.partner_urgency_penalty and (
+        result.lineup_b.points_gained <= -3.0
+        or (partner_remaining is not None and partner_remaining <= -4.0)
+    ):
+        return "Partner must-win timeline"
     if not (-25 <= result.fairness <= 25):
         return "Market imbalance"
     if result.lineup_a.points_gained < -1:
@@ -957,11 +969,21 @@ def _evidence(result: TradeResult, league: League, context: TeamContext, partner
         f"Projected playoff-lineup change: {result.lineup_a.playoff_points_gained:+.1f} PPG across weeks {', '.join(map(str, result.lineup_a.playoff_weeks_modeled))}" if result.lineup_a.playoff_points_gained is not None else "Playoff-week projections are not yet available",
         f"Roster resilience: {result.lineup_a.before_resilience} → {result.lineup_a.after_resilience} ({result.lineup_a.depth_change:+.0f})",
         f"Partner-fit heuristic: {result.acceptance_score}/100",
+        f"Partner urgency adjustment: -{result.partner_urgency_penalty} ({result.partner_urgency_reason})" if result.partner_urgency_penalty else "No partner-side urgency penalty applied",
         f"Simulated playoff odds: {result.playoff_probability_before:.1f}% → {result.playoff_probability_after:.1f}% · championship odds: {result.championship_probability_before:.1f}% → {result.championship_probability_after:.1f}%" if result.playoff_probability_before is not None and result.playoff_probability_after is not None and result.championship_probability_before is not None and result.championship_probability_after is not None else "Before-and-after season outcome simulation is unavailable",
     )
     cautions: list[str] = []
     if not league.weekly_points:
         cautions.append("Weekly projections are unavailable; lineup impact uses scored season averages.")
+    if result.partner_urgency_reason:
+        cautions.append("Partner urgency warning: " + result.partner_urgency_reason.capitalize() + ".")
+    if (
+        result.championship_probability_before is not None
+        and abs(result.championship_probability_after - result.championship_probability_before) >= 5
+    ):
+        cautions.append(
+            "The simulated championship swing is high variance; treat its direction as evidence, not its exact percentage."
+        )
     if result.acceptance_score < 50:
         cautions.append("The other roster receives a below-neutral fit; negotiation may require a different secondary asset.")
     if abs(result.fairness) > 12:
@@ -1090,6 +1112,13 @@ def generate_recommendations(
                         full_evaluations_used += 1
                         if _metrics is not None:
                             _metrics["full_evaluations"] += 1
+                        gate_reason = _hard_gate_reason(
+                            result, send_players, receive_players, send_picks,
+                            league, target, my_context,
+                        )
+                        if gate_reason:
+                            reject(gate_reason)
+                            continue
                         combined_role_penalty, role_warnings = _combined_role_risk(target, league)
                         if combined_role_penalty >= 18 and (
                             risk_profile != "Aggressive"
@@ -1193,6 +1222,17 @@ def generate_recommendations(
                     )
                     if _metrics is not None:
                         _metrics["full_evaluations"] += 1
+                    gate_reason = _hard_gate_reason(
+                        result, send_players, receive_players, (), league, target, my_context,
+                    )
+                    if gate_reason in {"Critical roster coverage", "Severe depth loss"} and (
+                        result.lineup_a.points_gained >= 1
+                        and result.lineup_a.depth_change >= -10
+                    ):
+                        gate_reason = None
+                    if gate_reason:
+                        reject(gate_reason)
+                        continue
                     if result.lineup_a.points_gained < .5 or result.lineup_b.points_gained < -2:
                         reject("Rebalance does not improve both roster shapes")
                         continue
@@ -1348,6 +1388,13 @@ def generate_recommendations(
                     result = evaluate_trade(my_team, partner, [], [target], league, [pick], [], contexts, model_outcomes=False)
                     if _metrics is not None:
                         _metrics["full_evaluations"] += 1
+                    gate_reason = _hard_gate_reason(
+                        result, (), (target,), (pick,), league, target, my_context,
+                        allow_nonstarting_target=True,
+                    )
+                    if gate_reason:
+                        reject(gate_reason)
+                        continue
                     combined_role_penalty, role_warnings = _combined_role_risk(target, league)
                     waiver_penalty, waiver_warning = _waiver_alternative_penalty(target, league)
                     if _rental_pick_blocked(target, pick, risk_profile, result, combined_role_penalty):
@@ -1670,6 +1717,16 @@ def generate_target_offers(
                 send_picks, list(receive_picks), contexts,
             )
             full_evaluated += 1
+            reason = _hard_gate_reason(
+                result, send_players, receive_players, send_picks, league, target, my_context,
+                allow_nonstarting_target=league.mode != "redraft" and (
+                    target.id in set(owner.reserve_player_ids) | set(owner.taxi_player_ids)
+                    or (target.injury_status or "").lower() in {"out", "o", "ir", "pup", "nfi", "suspended", "sus"}
+                ),
+            )
+            if reason:
+                rejections[reason] = rejections.get(reason, 0) + 1
+                continue
             combined_role_penalty, role_warnings = _combined_role_risk(target, league)
             if combined_role_penalty >= 18 and (
                 risk_profile != "Aggressive"
@@ -2024,6 +2081,54 @@ def generate_sell_offers(
     contexts = build_contexts(league)
     my_context = contexts[my_team.team_id]
     outlooks = {profile.player.id: profile for profile in compute_projection_profiles(league)}
+    target_profile = outlooks.get(target.id)
+    unavailable_statuses = {"out", "o", "ir", "pup", "nfi", "suspended", "sus", "doubtful", "d"}
+    target_unavailable = (
+        target.id in set(my_team.reserve_player_ids)
+        or (target.injury_status or "").lower() in unavailable_statuses
+        or (target_profile is not None and target_profile.availability_probability < .5)
+    )
+    target_playoff_projections = [
+        float(points.get(target.id, 0) or 0)
+        for _, points in sorted(league.playoff_weekly_points.items())
+    ]
+    target_playoff_ppg = (
+        sum(target_playoff_projections) / len(target_playoff_projections)
+        if target_playoff_projections else 0.0
+    )
+    target_signal = league.player_signals.get(target.id, {})
+    injury_note = " ".join(str(target_signal.get(key) or "") for key in (
+        "injury_notes", "practice_description",
+    )).lower()
+    season_ending = any(phrase in injury_note for phrase in (
+        "out for the season", "season-ending", "will miss the remainder of the season",
+        "not expected to return this season", "won't return this season", "will not return this season",
+    ))
+    speculative_playoff_stash = (
+        league.mode == "redraft"
+        and target_unavailable
+        and target.value >= 25
+        and league.current_week <= league.regular_season_end
+        and not season_ending
+    )
+    playoff_stash = target_unavailable and (
+        target_playoff_ppg >= 5.0 or speculative_playoff_stash
+    )
+    seller_under_pressure = (
+        league.current_week >= 5
+        and (
+            (
+                my_context.playoff_probability is not None
+                and 5 <= my_context.playoff_probability <= 85
+            )
+            or (
+                my_context.playoff_probability is None
+                and my_team.games_played >= 4
+                and my_team.win_percentage < .55
+            )
+        )
+    )
+    survival_sale = target_unavailable and seller_under_pressure
     evaluated = 0
     viable = 0
     rejections: dict[str, int] = {}
@@ -2032,24 +2137,97 @@ def generate_sell_offers(
     def reject(reason: str) -> None:
         rejections[reason] = rejections.get(reason, 0) + 1
 
+    def survival_partner_fit(result: TradeResult, patient_buyer: bool) -> TradeResult:
+        """Credit patient dynasty buyers for acquiring a discounted stash."""
+        if not survival_sale or not patient_buyer:
+            return result
+        market_discount = min(10, max(0, round(-result.fairness * .5)))
+        stash_fit = (
+            min(22, 14 + round(target_playoff_ppg * .5))
+            if league.mode == "redraft" and playoff_stash
+            else 10
+        )
+        return replace(
+            result,
+            acceptance_score=min(
+                100,
+                result.acceptance_score + market_discount + stash_fit,
+            ),
+        )
+
+    def sell_gate_reason(
+        result: TradeResult,
+        receive_players: list[Player],
+        primary: Player | None,
+        patient_buyer: bool,
+    ) -> str | None:
+        reason = _hard_gate_reason(
+            result, [target], receive_players, [], league, primary, my_context,
+        )
+        if (
+            reason == "Partner must-win timeline"
+            and survival_sale
+            and patient_buyer
+            and league.mode == "redraft"
+            and playoff_stash
+        ):
+            return None
+        return reason
+
     for partner in league.rosters:
         if partner.team_id == my_team.team_id:
             continue
+        partner_context = contexts[partner.team_id]
+        patient_buyer = (
+            (partner_context.playoff_probability or 0) >= 85
+            or partner_context.window in {"Young Core", "Rebuilding"}
+            or (partner.games_played >= 6 and partner.win_percentage >= .70)
+        )
+        if league.mode == "redraft":
+            patient_buyer = playoff_stash and (
+                (partner_context.playoff_probability or 0) >= 75
+                or (partner.games_played >= 6 and partner.win_percentage >= .65)
+            )
         for receive_players, receive_picks in _sell_return_packages(partner, target.value, league, my_context):
             evaluated += 1
+            if survival_sale:
+                # A survival sale must actually restore usable weekly scoring.
+                # Picks-only returns and unavailable incoming players defeat the purpose.
+                if not receive_players:
+                    reject("Survival return lacks immediate scoring")
+                    continue
+                if any(
+                    player.id in set(partner.reserve_player_ids)
+                    or (player.injury_status or "").lower() in unavailable_statuses
+                    or (
+                        outlooks.get(player.id) is not None
+                        and outlooks[player.id].availability_probability < .65
+                    )
+                    for player in receive_players
+                ):
+                    reject("Survival return includes unavailable player")
+                    continue
             result = evaluate_trade(
                 my_team, partner, [target], receive_players, league, [], receive_picks, contexts,
                 model_playoffs=False,
             )
+            result = survival_partner_fit(result, patient_buyer)
             primary = max(receive_players, key=lambda player: player.value, default=None)
-            reason = _hard_gate_reason(result, [target], receive_players, [], league, primary, my_context)
+            reason = sell_gate_reason(result, receive_players, primary, patient_buyer)
             if reason:
                 reject(reason)
                 continue
-            if result.acceptance_score < 42 or abs(result.fairness) > 18:
+            minimum_partner_fit = 34 if survival_sale and patient_buyer else 42
+            fairness_limit = 24 if survival_sale else 18
+            if result.acceptance_score < minimum_partner_fit or abs(result.fairness) > fairness_limit:
                 reject("Insufficient two-sided fit")
                 continue
             result = evaluate_trade(my_team, partner, [target], receive_players, league, [], receive_picks, contexts)
+            result = survival_partner_fit(result, patient_buyer)
+            reason = sell_gate_reason(result, receive_players, primary, patient_buyer)
+            if reason:
+                reject(reason)
+                continue
             role_penalty, role_warnings = _combined_role_risk(primary, league)
             if role_penalty >= 18 and risk_profile != "Aggressive":
                 reject("Unstable return asset")
@@ -2059,14 +2237,57 @@ def generate_sell_offers(
                 result, need, risk_profile=risk_profile, context=my_context,
                 send_players=[target], receive_players=receive_players, role_risk_penalty=role_penalty,
             )
+            if survival_sale:
+                immediate_recovery = max(0.0, result.lineup_a.points_gained)
+                ros_recovery = max(0.0, result.lineup_a.remaining_season_points_gained or 0.0)
+                survival_bonus = min(10, round(immediate_recovery + ros_recovery * .75))
+                patience_bonus = 3 if patient_buyer else 0
+                # Survival value is real, but the forced timing and dynasty
+                # haircut keep this from reading like a near-perfect trade.
+                haircut_over_noise = max(0.0, -result.fairness - 8.0)
+                survival_ceiling = max(80, 88 - round(haircut_over_noise * .30))
+                score = min(survival_ceiling, score + survival_bonus + patience_bonus)
+                team_score = min(100, team_score + survival_bonus)
+                breakdown = (
+                    *breakdown,
+                    ("Must-win availability recovery", survival_bonus),
+                    ("Patient buyer fit", patience_bonus),
+                )
             if score < 48:
                 reject("Insufficient strategic upside")
                 continue
             tier = "Strong exit" if score >= 70 else "Viable exit" if score >= 58 else "Exploratory exit"
             evidence, cautions = _evidence(result, league, my_context, partner)
+            if survival_sale:
+                evidence = (
+                    (
+                        f"Playoff-stash market: {target.name} carries {target_playoff_ppg:.1f} modeled playoff PPG, "
+                        "so playoff-secure teams can value the future ceiling while sending you scoring you can use now."
+                        if league.mode == "redraft" and target_playoff_ppg >= 5.0 else
+                        f"Speculative playoff-stash market: {target.name}'s season is not marked over, so secure teams may buy the return upside while sending you scoring you can use now."
+                        if league.mode == "redraft" and speculative_playoff_stash else
+                        "Survival lens: the return is available now and restores weekly scoring during the playoff chase."
+                    ),
+                    *evidence,
+                )
+                if league.mode == "redraft" and speculative_playoff_stash and target_playoff_ppg < 5.0:
+                    cautions = (
+                        "The playoff return is not confirmed by the projection feed; verify the latest medical timeline before proposing the deal.",
+                        *cautions,
+                    )
+                if league.mode == "dynasty":
+                    cautions = (
+                        "This intentionally trades some long-term asset insulation for points you can use before the fantasy playoffs.",
+                        *cautions,
+                    )
             for warning in reversed(role_warnings):
                 cautions = (warning + "; verify the latest status before offering.", *cautions)
-            assets: tuple[Player | DraftPick, ...] = (target, *receive_players, *receive_picks)
+            # The outgoing injury is the known reason for a survival pivot, not
+            # uncertainty in the assets the user would rely on after the trade.
+            assets: tuple[Player | DraftPick, ...] = (
+                (*receive_players, *receive_picks) if survival_sale
+                else (target, *receive_players, *receive_picks)
+            )
             confidence, confidence_reasons = _confidence(league, my_context, partner, assets, outlooks)
             score, confidence_adjustment = _evidence_adjusted_score(score, confidence)
             breakdown = (*breakdown, ("Evidence confidence", confidence_adjustment))
@@ -2075,8 +2296,13 @@ def generate_sell_offers(
             offers.append(Recommendation(
                 kind="SELL", partner=partner, send_players=(target,), send_picks=(),
                 receive_players=tuple(receive_players), receive_picks=tuple(receive_picks), evaluation=result,
-                score=score, reason=f"Moves {target.name} to {partner.team_name} for a return shaped around your roster needs. {_strategic_summary(result, my_context)}",
-                objective="Move selected player", tier=tier, team_value_score=team_score,
+                score=score, reason=(
+                    f"Survival pivot: converts unavailable {target.name} into active scoring from {partner.team_name} while you chase a playoff spot. "
+                    f"{_strategic_summary(result, my_context)}"
+                    if survival_sale else
+                    f"Moves {target.name} to {partner.team_name} for a return shaped around your roster needs. {_strategic_summary(result, my_context)}"
+                ),
+                objective="Survival pivot" if survival_sale else "Move selected player", tier=tier, team_value_score=team_score,
                 market_value_score=market_score, score_low=low, score_high=high,
                 evidence=evidence, cautions=cautions, confidence=confidence,
                 confidence_reasons=confidence_reasons, score_breakdown=breakdown,

@@ -9,7 +9,7 @@ from .analytics import TeamContext, TradeResult
 from .models import DraftPick, League, Player, Roster
 from .value_system import pick_profile
 
-MODEL_VERSION = "trade-engine-2026.11.12.18"
+MODEL_VERSION = "trade-engine-2026.11.19.1"
 
 
 @dataclass(frozen=True)
@@ -139,7 +139,7 @@ def trade_snapshot(
             "send_players": [_asset(player) for player in send_players], "send_picks": [_pick(pick, league) for pick in send_picks],
             "receive_players": [_asset(player) for player in receive_players], "receive_picks": [_pick(pick, league) for pick in receive_picks],
             "sends_label": ", ".join(sends) or "Nothing", "receives_label": ", ".join(receives) or "Nothing",
-            "prediction": {"fairness": result.fairness, "lineup_change": result.lineup_a.points_gained, "playoff_change": result.lineup_a.playoff_points_gained, "depth_change": result.lineup_a.depth_change, "partner_fit": result.acceptance_score, "verdict": result.verdict},
+            "prediction": {"fairness": result.fairness, "lineup_change": result.lineup_a.points_gained, "partner_lineup_change": result.lineup_b.points_gained, "rest_of_season_change": result.lineup_a.remaining_season_points_gained, "partner_rest_of_season_change": result.lineup_b.remaining_season_points_gained, "playoff_change": result.lineup_a.playoff_points_gained, "depth_change": result.lineup_a.depth_change, "partner_depth_change": result.lineup_b.depth_change, "partner_fit": result.acceptance_score, "partner_urgency_penalty": result.partner_urgency_penalty, "verdict": result.verdict},
             "confidence": confidence, "recommendation_score": score,
             "score_breakdown": [{"label": label, "contribution": value} for label, value in score_breakdown],
         },

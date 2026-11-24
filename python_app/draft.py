@@ -34,6 +34,7 @@ class DraftSnapshot:
     my_next_pick: int | None
     picks_until_my_turn: int | None
     upcoming_picks: tuple[int, ...]
+    rookies_only: bool
     available: tuple[DraftPlayer, ...]
     recent: tuple[dict[str, Any], ...]
 
@@ -64,6 +65,13 @@ def build_pick_order(draft: dict[str, Any]) -> list[int]:
                 raise ProviderError(f"Sleeper draft is missing the roster for slot {slot}")
             order.append(roster_id)
     return order
+
+
+def uses_rookie_only_pool(league: League) -> bool:
+    """Distinguish established dynasty rookie drafts from startups/redraft."""
+    rostered_players = sum(len(roster.players) for roster in league.rosters)
+    established_dynasty = rostered_players >= max(1, league.team_count) * 5
+    return league.mode in {"dynasty", "keeper"} and established_dynasty
 
 
 def load_draft_snapshot(league: League) -> DraftSnapshot:
@@ -110,6 +118,7 @@ def load_draft_snapshot(league: League) -> DraftSnapshot:
     values = market["players"]
     all_players = get_players()
     my_roster = next(roster for roster in league.rosters if roster.team_id == league.my_team_id)
+    rookies_only = uses_rookie_only_pool(league)
     counts = {position: sum(player.position == position for player in my_roster.players) for position in ("QB", "RB", "WR", "TE")}
     for pick in picks:
         if isinstance(pick, dict) and int(pick.get("roster_id") or -1) == my_id:
@@ -119,7 +128,9 @@ def load_draft_snapshot(league: League) -> DraftSnapshot:
     targets = {"QB": 3 if league.superflex else 2, "RB": 6, "WR": 7, "TE": 3}
     available: list[DraftPlayer] = []
     for player_id, raw in all_players.items():
-        if player_id in drafted_ids or not isinstance(raw, dict) or raw.get("years_exp") != 0:
+        if player_id in drafted_ids or not isinstance(raw, dict):
+            continue
+        if rookies_only and raw.get("years_exp") != 0:
             continue
         position = str(raw.get("position") or "")
         value = values.get(str(player_id), 0)
@@ -136,4 +147,4 @@ def load_draft_snapshot(league: League) -> DraftSnapshot:
         recent.append({"pick_no": int(pick.get("pick_no") or 0), "round": int(pick.get("round") or 0), "slot": int(pick.get("draft_slot") or 0), "name": f'{metadata.get("first_name", "")} {metadata.get("last_name", "")}'.strip(), "position": metadata.get("position") or "", "team_name": names.get(roster_id, f"Team {roster_id}"), "is_mine": roster_id == my_id})
 
     next_pick = upcoming[0] if upcoming else None
-    return DraftSnapshot(draft_id, str(draft.get("status") or "unknown"), str(draft.get("type") or "linear"), season, rounds, teams, len(order), picks_made, current, names.get(on_clock_id) if on_clock_id else None, on_clock_id == my_id, next_pick, next_pick - current if next_pick and current else None, upcoming, tuple(available[:60]), tuple(recent))
+    return DraftSnapshot(draft_id, str(draft.get("status") or "unknown"), str(draft.get("type") or "linear"), season, rounds, teams, len(order), picks_made, current, names.get(on_clock_id) if on_clock_id else None, on_clock_id == my_id, next_pick, next_pick - current if next_pick and current else None, upcoming, rookies_only, tuple(available[:60]), tuple(recent))

@@ -1,10 +1,26 @@
 import unittest
 
-from python_app.draft import build_pick_order, select_relevant_draft
+from python_app.draft import build_pick_order, select_relevant_draft, uses_rookie_only_pool
+from python_app.models import League, Player, Roster
 from python_app.providers import ProviderError
 
 
 class DraftTests(unittest.TestCase):
+    def test_redraft_uses_full_player_pool(self) -> None:
+        roster = Roster("1", "A", "A", (Player("v", "Veteran", "WR", "A", 27, 40),))
+        league = League("l", "L", "2026", "redraft", 1, False, False, "half_ppr", (("WR", 1),), "1", (roster,), "live")
+        self.assertFalse(uses_rookie_only_pool(league))
+
+    def test_established_dynasty_uses_rookie_pool(self) -> None:
+        players = tuple(Player(str(index), f"P{index}", "WR", "A", 25, 10) for index in range(6))
+        roster = Roster("1", "A", "A", players)
+        league = League("l", "L", "2026", "dynasty", 1, False, False, "half_ppr", (("WR", 1),), "1", (roster,), "live")
+        self.assertTrue(uses_rookie_only_pool(league))
+
+    def test_dynasty_startup_uses_full_player_pool(self) -> None:
+        roster = Roster("1", "A", "A")
+        league = League("l", "L", "2026", "dynasty", 1, False, False, "half_ppr", (("WR", 1),), "1", (roster,), "live")
+        self.assertFalse(uses_rookie_only_pool(league))
     def test_snake_order_reverses_even_rounds(self) -> None:
         draft = {
             "type": "snake",
